@@ -32,7 +32,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL" CACHE 
 # ---- Project ----
 
 project(
-	FakeThroughScope
+	MagnaScope
 	VERSION 0.10.3
 	LANGUAGES CXX
 )
@@ -82,7 +82,7 @@ set(Boost_USE_STATIC_LIBS ON)
 # ---- Dependencies ----
 
 if (NOT TARGET CommonLibF4)
-	add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../CommonLibF4" CommonLibF4)
+	message(FATAL_ERROR "MagnaScope uses the vendored multi-runtime CommonLibF4 xmake build. Run: xmake f -m releasedbg; xmake")
 endif ()
 
 # ---- Add source files ----
@@ -109,14 +109,10 @@ add_library(
 	.clang-format
 )
 
-#foreach(HLSL_FILE ${HLSL_FILES})
-# set_source_files_properties(${HLSL_FILE} PROPERTIES VS_SHADER_OBJECT_FILE_NAME "G:\\0p\\Steam\\steamapps\\common\\Fallout 4\\Data\\Shaders\\XiFeiLi\\%(Filename).cso" VS_SHADER_MODEL 5.0 VS_SHADER_ENTRYPOINT main)
-#endforeach()
-
 macro(set_hlsl_properties HLSL_FILE SHADER_TYPE)
   set_source_files_properties(${HLSL_FILE} 
   PROPERTIES VS_SHADER_OBJECT_FILE_NAME 
-  "G:/Games/FO4_SO/mods/Fake Through Scope testing fts/Shaders/XiFeiLi/%(Filename).cso" 
+  "${CMAKE_CURRENT_BINARY_DIR}/Shaders/MagnaScope/%(Filename).cso"
   VS_SHADER_TYPE ${SHADER_TYPE} VS_SHADER_MODEL 5.0 VS_SHADER_ENTRYPOINT main)
 endmacro()
 
@@ -220,12 +216,8 @@ if(true)
 	add_custom_command(
 		TARGET ${PROJECT_NAME}
 		POST_BUILD
-		#COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:${PROJECT_NAME}> "G:/Modding/MO2/mods/FTS/F4SE/Plugins/"
-		#COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_PDB_FILE:${PROJECT_NAME}> "G:/Modding/MO2/mods/FTS/F4SE/Plugins/"
 		COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:${PROJECT_NAME}> "${Fallout4Path}/Data/F4SE/Plugins/"
 		COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_PDB_FILE:${PROJECT_NAME}> "${Fallout4Path}/Data/F4SE/Plugins/"
-		COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:${PROJECT_NAME}> "G:/Games/FO4_SO/mods/Fake Through Scope testing fts/F4SE/Plugins/"
-		COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_PDB_FILE:${PROJECT_NAME}> "G:/Games/FO4_SO/mods/Fake Through Scope testing fts/F4SE/Plugins/"
 	)
 else ()
 	message(

@@ -21,7 +21,14 @@ float4 main(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0) : SV_Target
     static const float Xoffset = (0.5 - BUFFER_HEIGHT * rcp(BUFFER_WIDTH) * 0.5);
     adjTex.x += Xoffset;
 	
-    float2 mulTex = (adjTex - float2(0.5, 0.5)) * rcp((ScopeEffect_Zoom)) + float2(0.5, 0.5);
+    // Same fisheye model as the legacy shader; this path renders onto the
+    // weapon's lens mesh, so the radius is normalized to the half-height of
+    // the screen instead of a mask circle.
+    float2 fisheyeCentered = adjTex - float2(0.5, 0.5);
+    float rNorm = saturate(length(fisheyeCentered * float2(AspectRatio, 1.0)) * 2.0);
+    float fishEye = 1.0 + max(FishEyeStrength, 0.0) * pow(rNorm, max(FishEyePower, 0.5));
+
+    float2 mulTex = fisheyeCentered * rcp((ScopeEffect_Zoom)) * fishEye + float2(0.5, 0.5);
 	float4 color = tBACKBUFFER.Sample(gSamLinear, mulTex);
 	
     float2 ReticleCoord = (adjTex - Reticle_Offset);

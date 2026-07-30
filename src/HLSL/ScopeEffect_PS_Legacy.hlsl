@@ -1,126 +1,81 @@
 #include "Triangle.hlsli"
 
-sampler BackBuffer;
-
-float4 mainq(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0) : SV_Target 
+float4 main(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0) : SV_Target
 {
-	float2 pos = vpos.xy;
+	const float2 screenSize = float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+	const float referenceScale = BUFFER_HEIGHT / 1080.0;
 
-	float2 screenSize = float2(BUFFER_WIDTH,BUFFER_HEIGHT);
-	float2 standredSize = float2(1920,1080);
+	// FTS_ScreenPos is the projected mesh anchor in pixels. Old profiles that
+	// produce no usable anchor retain the historical screen-center behavior.
+	float2 projectedCenter = FTS_ScreenPos * PixelSize;
+	const bool validProjectedCenter =
+		all(projectedCenter > float2(0.001, 0.001)) &&
+		all(projectedCenter < float2(0.999, 0.999));
+	float2 scopeCenter = validProjectedCenter ? projectedCenter : float2(0.5, 0.5);
 
-	float2 diffSize = screenSize*rcp(standredSize);
-	float2 areaCenter = ScopeEffect_Size;
-	float2 ScreenCenter = screenSize * 0.5 - areaCenter + ScopeEffect_Offset;
+	const float4 viewDirection = normalize(mul(float4(eyeDirection, 1), CameraRotation));
+	float2 viewOffset = viewDirection.xy * rcp(max(camDepth, 0.01));
+	viewOffset.y *= -AspectRatio;
+	scopeCenter += viewOffset + ScopeEffect_Offset * PixelSize * referenceScale;
 
-	float dx = pos.x - areaCenter.x - ScreenCenter.x;
-	float dy = pos.y - areaCenter.y - ScreenCenter.y;
-	float r = (ScopeEffect_Size.x)  * 0.5 * diffSize.x;
-	bool isRender = dx * dx + dy * dy < r * r;
+	const float distanceWeapon = 0.5 * distance(CurrWeaponPos, CurrRootPos);
+	const float zMove = abs(sqrt(abs(BaseWeaponPos)) - distanceWeapon) + 1.0;
+	float zScale = lerp(1.0, rcp(zMove), EnableZMove * MovePercentage);
+	zScale = clamp(zScale, 0.5, 1.5);
 
-	return float4(0,1,1,1) * isRender;
-}
+	const float diameterPixels = max(ScopeEffect_Size.x, 1.0) * referenceScale * rcp(zScale);
+	const float radiusUV = diameterPixels * 0.5 / BUFFER_HEIGHT;
+	float2 centeredUV = texcoord - scopeCenter;
+	float2 circularDelta = centeredUV * float2(AspectRatio, 1.0);
+	const bool insideCircle = dot(circularDelta, circularDelta) < radiusUV * radiusUV;
+	const float2 halfExtents = float2(diameterPixels * 0.5 / BUFFER_WIDTH, radiusUV);
+	const bool insideRectangle = all(abs(centeredUV) <= halfExtents);
+	const bool isRender = isCircle ? insideCircle : insideRectangle;
 
-float4 main(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0) : SV_Target 
-{
-	float2 pos = texcoord / PixelSize;
+	const float zoom = max(ScopeEffect_Zoom, 1.0);
 
-	float2 screenSize = float2(BUFFER_WIDTH,BUFFER_HEIGHT);
-	float2 standredSize = float2(1920,1080);
-	float2 diffSize = screenSize*rcp(standredSize);
+	// MW2019-style fisheye: push the sample point outward as it approaches
+	// the lens edge, which optically compresses and bends the image there
+	// while the center of the lens stays flat. rNorm is 0 at the scope
+	// center and 1 at the edge of the circle.
+	const float rNorm = saturate(length(circularDelta) * rcp(max(radiusUV, 0.0001)));
+	const float fishEye = 1.0 + max(FishEyeStrength, 0.0) * pow(rNorm, max(FishEyePower, 0.5));
 
-	float baseFov = 90;
-	float fovDiff = 1;
+	float2 sourceCoord =
+		scopeCenter +
+		centeredUV * rcp(zoom) * fishEye +
+		ScopeEffect_OriPositionOffset * PixelSize * referenceScale;
+	sourceCoord = saturate(sourceCoord);
 
-	float4 color = tBACKBUFFER.Sample(gSamLinear, texcoord);
-	float2 corrected_texturecoords = aspect_ratio_correction(texcoord);
-	float2 texcoordCorrected = corrected_texturecoords;
-	float4 ViewDir = normalize(mul(float4(eyeDirection,1),CameraRotation));
+	float4 eyeVelocity = mul(float4(eyeDirectionLerp, 1), CameraRotation);
+	float2 parallaxCenter = scopeCenter + clampMagnitude(eyeVelocity.xy, 2) * PixelSize;
+	const float parallaxDistance = distance(
+		aspect_ratio_correction(texcoord),
+		aspect_ratio_correction(parallaxCenter));
+	const float centerDistance = distance(
+		aspect_ratio_correction(texcoord),
+		aspect_ratio_correction(scopeCenter));
 
-	float2 ScopeOffset = ViewDir.xy;
-	ScopeOffset *= rcp(camDepth);
-	ScopeOffset.y *= -AspectRatio;
-    float4 abseyeDirectionLerp = mul(float4(eyeDirectionLerp, 1), CameraRotation);
-    if (abseyeDirectionLerp.y < 0 && abseyeDirectionLerp.y >= -0.001)
-        abseyeDirectionLerp.y = -0.001;
-    else if (abseyeDirectionLerp.y >= 0 && abseyeDirectionLerp.y <= 0.001)
-        abseyeDirectionLerp.y = 0.001;
+	const float chromaticOffset = 0.008 * (1080.0 / BUFFER_HEIGHT);
+	float4 color = tBACKBUFFER.Sample(gSamLinear, sourceCoord);
+	color.r = tBACKBUFFER.Sample(
+		gSamLinear,
+		sourceCoord + float2(-chromaticOffset * centerDistance, 0)).r;
+	color.b = tBACKBUFFER.Sample(
+		gSamLinear,
+		sourceCoord + float2(chromaticOffset * centerDistance, 0)).b;
 
-	
-	float2 eye_velocity = clampMagnitude(abseyeDirectionLerp.xy , 2);
+	const float4 nightVision = EnableNV * NVGEffect(color, texcoord);
+	color = nightVision * nightVision.a + color * (1 - nightVision.a);
+	color.rgb *= getparallax(parallaxDistance, float2(referenceScale, referenceScale), 1.0);
 
-	float2 parallax_offset = float2(0.5f + eye_velocity.x , 0.5f - eye_velocity.y);
-	float distToParallax = distance(corrected_texturecoords, parallax_offset);
-	float2 scope_center = float2(0.5f, 0.5f) + ScopeOffset + ScopeEffect_Offset * PixelSize * diffSize;
-	float distToCenter = distance(corrected_texturecoords, scope_center);
+	const float2 reticleCoord =
+		float2(0.5, 0.5) +
+		centeredUV * float2(AspectRatio, 1.0) * 16.0 / max(ReticleSize, 0.01);
+	const float4 reticle = ReticleTex.Sample(gSamLinear, reticleCoord);
+	color = reticle * reticle.a + color * (1 - reticle.a);
 
-	float4 colorBackup = color;
-	float2 areaCenter = ScopeEffect_Size * 0.5 * rcp(fovDiff);
-	
-	float2 ScreenCenter = screenSize * 0.5 - areaCenter + ScopeOffset * rcp(PixelSize) + ScopeEffect_Offset * diffSize;
-	float distanceWeap = 0.5F * sqrt(
-	  pow(CurrWeaponPos.x - CurrRootPos.x, 2) 
-	+ pow(CurrWeaponPos.y - CurrRootPos.y, 2) 
-	+ pow(CurrWeaponPos.z - CurrRootPos.z, 2)
-	//pow(CurrWeaponPos.z - CurrRootPos.z, 2)
-	);
-
-	float zMove = abs(sqrt((BaseWeaponPos)) - distanceWeap) + 1;
-	float zMoveDiff = (1- EnableZMove * MovePercentage)+ EnableZMove * MovePercentage * rcp(zMove);
-	if(step (zMoveDiff,0.5) == 1) zMoveDiff = 0.5;
-	if(step(zMoveDiff,2) == 0) zMoveDiff = 1.5;
-
-	float dx = pos.x - areaCenter.x - ScreenCenter.x;
-	float dy = pos.y - areaCenter.y - ScreenCenter.y;
-	float r = (ScopeEffect_Size.x)  * 0.5 * diffSize.x * rcp(fovDiff) * rcp(zMoveDiff);
-
-	float2 destTopLeft = screenSize * 0.5 - ScopeEffect_Size * 0.5;
-    float2 destBottomRight = screenSize * 0.5 + ScopeEffect_Size * 0.5;
-	destTopLeft *= diffSize.x * rcp( fovDiff) * rcp(zMoveDiff);
-    destBottomRight *=diffSize.y * rcp( fovDiff) * rcp( zMoveDiff);
-
-
-	bool isRender = isCircle ? (dx * dx + dy * dy < r * r) : (pos.x >= destTopLeft.x && pos.y >= destTopLeft.y && pos.x <= destBottomRight.x && pos.y <= destBottomRight.y);
-	//bool isRender =  distance(texcoord,float2(0,0)) >= 0.15F;
-
-	float2 ReticlePos;
-	float2 ReticleCoord;
-
-	ReticlePos.x = (pos.x - ScreenCenter.x - areaCenter.x) * 16 *rcp(ReticleSize) * AspectRatio + ScreenCenter.x + areaCenter.x;
-	ReticlePos.y = (pos.y - ScreenCenter.y - areaCenter.y) * 16 *rcp(ReticleSize)  + ScreenCenter.y + areaCenter.y;
-	ReticleCoord = ReticlePos * PixelSize;
-
-	float4 ReticleColor = ReticleTex.Sample(gSamLinear,ReticleCoord);
-
-	float2 destPos = (pos.xy - ScreenCenter - areaCenter 
-	) *rcp(ScopeEffect_Zoom)
-	+ ScreenCenter 
-	+ ScopeEffect_OriPositionOffset * diffSize
-	+ areaCenter
-	;
-	
-    float2 destCoord = destPos * PixelSize;
-
-	float4 colorDest= tBACKBUFFER.Sample(gSamLinear,destCoord);
-
-	float power = 0.008 * rcp(diffSize.y);
-	color.xyz = lerp(colorBackup.xyz, colorDest.xyz, 1);
-
-	color.r = tBACKBUFFER.Sample(gSamLinear,mad(float2(-power,0),distToCenter,destCoord)).r;
-	color.b = tBACKBUFFER.Sample(gSamLinear,mad(float2(power,0),distToCenter,destCoord)).b;
-	color.g = tBACKBUFFER.Sample(gSamLinear,destCoord).g;
-	
-	float4 nColor =  EnableNV * NVGEffect(color,texcoord);
-	color = nColor * nColor.a + color * (1 - nColor.a);
-	color.rgb *=  (step(distToCenter, 2) * getparallax(distToParallax,diffSize,fovDiff));
-	color = ReticleColor * ReticleColor.a + color * (1-ReticleColor.a);
-	
-	//isRender
-	float4 colorFinal = color;
-	// * isRender;
-	//float4 colorFinal = color;
-	colorFinal.a*= (EnableMerge * isRender);
-
-	return colorFinal;
+	color.a *= EnableMerge * isRender;
+	return color;
 }
 

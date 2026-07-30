@@ -1,6 +1,7 @@
 #include "FTSData.h"
 
 #include <io.h>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 
@@ -9,6 +10,68 @@ using namespace std;
 //bool __fastcall GetInstanceKeywordStr(RE::TESObjectWEAP::InstanceData* a_instance, std::string* a_prefix);
 namespace ScopeData
 {
+	namespace
+	{
+		template <std::size_t N>
+		void ReadFloatArray(
+			const json& object,
+			std::string_view key,
+			float (&destination)[N],
+			const std::array<std::string_view, N>& componentNames)
+		{
+			const auto it = object.find(key);
+			if (it == object.end() || it->is_null()) {
+				return;
+			}
+
+			const json* value = std::addressof(*it);
+			if (value->is_array() && value->size() == 1 && value->front().is_array()) {
+				value = std::addressof(value->front());
+			}
+
+			if (value->is_object()) {
+				for (std::size_t index = 0; index < N; ++index) {
+					if (const auto component = value->find(componentNames[index]);
+						component != value->end() && component->is_number()) {
+						destination[index] = component->get<float>();
+					}
+				}
+			} else if (value->is_array()) {
+				for (std::size_t index = 0; index < std::min(N, value->size()); ++index) {
+					if ((*value)[index].is_number()) {
+						destination[index] = (*value)[index].get<float>();
+					}
+				}
+			}
+		}
+
+		void UpdateConfigValue(std::string_view key, const json& value)
+		{
+			const std::filesystem::path path = "Data\\F4SE\\Plugins\\FTSConfig.json";
+			json data = json::object();
+			try {
+				if (std::ifstream input(path); input) {
+					data = json::parse(input, nullptr, true, true);
+				}
+			} catch (const std::exception& error) {
+				logger::error("FTSConfig.json is invalid; rebuilding it: {}", error.what());
+			}
+
+			try {
+				data[std::string(key)] = value;
+				std::filesystem::create_directories(path.parent_path());
+				std::ofstream output(path, std::ios::trunc);
+				if (!output) {
+					throw std::runtime_error("file could not be opened");
+				}
+				output << data.dump(2) << '\n';
+			} catch (const std::exception& error) {
+				logger::error("Unable to update FTSConfig.json key {}: {}", key, error.what());
+			}
+		}
+
+	}
+
 	FTSData::FTSData(std::string pathO)
 	{
 		path = pathO;
@@ -46,50 +109,17 @@ namespace ScopeData
 		s.minZoom = j.value("MinZoom", 1.0F);
 		s.maxZoom = j.value("MaxZoom", 4.0F);
 
-		json defaultArrayOffset = { 0.0F, 0.0F };
-		json defaultArraySize = { 400.0F, 400.0F };
-		json defaultRectArray = { 235.0F, 260.0F, 775.0F, 760.0F };
-
-		if (j.contains("PositionOffset"))
-		{
-			auto positionOffsetJson = j.value("PositionOffset", defaultArrayOffset);
-			positionOffsetJson.at("x").get_to(s.PositionOffset[0]);
-			positionOffsetJson.at("y").get_to(s.PositionOffset[1]);
-		}
-		
-		if (j.contains("OriPositionOffset"))
-		{
-			auto oriPositionOffsetJson = j.value("OriPositionOffset", defaultArrayOffset);
-			oriPositionOffsetJson.at("x").get_to(s.OriPositionOffset[0]);
-			oriPositionOffsetJson.at("y").get_to(s.OriPositionOffset[1]);
-		}
-		
-		if (j.contains("OriPositionOffset")) 
-		{
-			auto sizeJson = j.value("Size", defaultArraySize);
-			sizeJson.at("x").get_to(s.Size[0]);
-			sizeJson.at("y").get_to(s.Size[1]);
-		}
-		
-		if (j.contains("OriSize"))
-		{
-			auto oriSizeJson = j.value("OriSize", defaultArraySize);
-			oriSizeJson.at("x").get_to(s.OriSize[0]);
-			oriSizeJson.at("y").get_to(s.OriSize[1]);
-		}
-
-		if (j.contains("rectSize"))
-		{
-			auto rectSizeJson = j.value("rectSize", defaultRectArray);
-
-			rectSizeJson.at("x").get_to(s.rectSize[0]);
-			rectSizeJson.at("y").get_to(s.rectSize[1]);
-			rectSizeJson.at("z").get_to(s.rectSize[2]);
-			rectSizeJson.at("w").get_to(s.rectSize[3]);
-		}
+		ReadFloatArray(j, "PositionOffset", s.PositionOffset, { "x", "y" });
+		ReadFloatArray(j, "OriPositionOffset", s.OriPositionOffset, { "x", "y" });
+		ReadFloatArray(j, "Size", s.Size, { "x", "y" });
+		ReadFloatArray(j, "OriSize", s.OriSize, { "x", "y" });
+		ReadFloatArray(j, "rectSize", s.rectSize, { "x", "y", "z", "w" });
+		ReadFloatArray(j, "reticle_Offset", s.reticle_Offset, { "x", "y" });
 		
 
 		s.ReticleSize = j.value("ReticleSize", 4.0F);
+		s.fishEyeStrength = j.value("FishEyeStrength", 0.0F);
+		s.fishEyePower = j.value("FishEyePower", 2.0F);
 		s.fovAdjust = j.value("fovAdjust", 0.0F);
 		s.parallax = j.value("Parallax", Parallax());
 	}
@@ -100,16 +130,25 @@ namespace ScopeData
 		f.animFlavorEditorID = j.value("AnimFlavorKeywordEditorID", "FTS_NONE");
 		f.additionalKeywordsStr = j.value("AdditionalKeywords", "");
 
+		f.additionalKeywords.clear();
 		std::stringstream ss(f.additionalKeywordsStr);
 		std::string token;
 		while (getline(ss, token, ','))
 		{
-			f.additionalKeywords.push_back(token);
+			const auto first = token.find_first_not_of(" \t\r\n");
+			if (first == std::string::npos) {
+				continue;
+			}
+			const auto last = token.find_last_not_of(" \t\r\n");
+			f.additionalKeywords.push_back(token.substr(first, last - first + 1));
 		}
 
 		f.legacyMode = j.value("LegacyMode", true);
 		f.version = j.value("Version", 1);
 		f.UsingSTS = j.value("UsingSTS", false);
+		f.autoProfile = j.value("AutoProfile", false);
+		f.sourcePlugin = j.value("SourcePlugin", "");
+		f.sourceFormID = j.value("SourceFormID", 0U);
 		f.scopeFrame = j.value("scopeFrame", 1);
 		f.ZoomNodePath = j.value("ReticleTexturePath", "");
 
@@ -160,9 +199,11 @@ namespace ScopeData
 			{ "Size", { { "x", s.Size[0] }, { "y", s.Size[1] } } },
 			{ "OriSize", { { "x", s.OriSize[0] }, { "y",s.OriSize[1] } } },
 			{ "rectSize", { { "x", s.rectSize[0] }, { "y", s.rectSize[1] }, { "z", s.rectSize[2] }, { "w", s.rectSize[3] } } },
-			{ "reticle_Offset", { s.reticle_Offset } },
+			{ "reticle_Offset", { { "x", s.reticle_Offset[0] }, { "y", s.reticle_Offset[1] } } },
 
 			{ "ReticleSize", s.ReticleSize },
+			{ "FishEyeStrength", s.fishEyeStrength },
+			{ "FishEyePower", s.fishEyePower },
 			{ "fovAdjust", s.fovAdjust },
 			//
 			{ "Parallax", s.parallax }
@@ -189,6 +230,9 @@ namespace ScopeData
 			{ "path", f.path },
 			{ "Version", f.version },
 			{ "UsingSTS", f.UsingSTS },
+			{ "AutoProfile", f.autoProfile },
+			{ "SourcePlugin", f.sourcePlugin },
+			{ "SourceFormID", f.sourceFormID },
 			{ "scopeFrame", f.scopeFrame },
 			{ "ReticleTexturePath", f.ZoomNodePath },
 			//
@@ -207,34 +251,62 @@ namespace ScopeData
 
 	void ScopeDataHandler::WriteCurrentFTSData()
 	{
-		if (currentData) 
-		{
-			std::string temp = currentData->path;
+		if (!currentData) {
+			return;
+		}
 
-			std::ifstream f(temp);
-			json j = *currentData;
+		if (currentData->autoProfile) {
+			WriteAutoProfile(currentData);
+			return;
+		}
 
-			std::ofstream o(temp);
-			o <<  j << std::endl;
-
-			f.close();
-			o.close();
+		try {
+			const std::filesystem::path outputPath(currentData->path);
+			if (outputPath.has_parent_path()) {
+				std::filesystem::create_directories(outputPath.parent_path());
+			}
+			std::ofstream output(outputPath, std::ios::trunc);
+			if (!output) {
+				logger::error("Unable to write scope profile {}", outputPath.string());
+				return;
+			}
+			output << json(*currentData).dump(2) << '\n';
+		} catch (const std::exception& error) {
+			logger::error("Unable to write scope profile {}: {}", currentData->path, error.what());
 		}
 	}
 
 	void ScopeDataHandler::ReloadFTSData(FTSData* data)
 	{
-		std::ifstream f(data->path);
+		if (!data) {
+			return;
+		}
 
-		json j = json::parse(f);
-		
-		j.get_to(*data);
+		try {
+			std::ifstream input(data->path);
+			if (!input) {
+				throw std::runtime_error("file could not be opened");
+			}
+			const auto parsed = json::parse(input, nullptr, true, true);
 
-		ScopeData::ScopeDataHandler::GetSingleton()->SetCurrentFTSData(data);
+			// Automatic profile files hold one entry per scope attachment;
+			// reload only this profile's own entry. If the entry is missing
+			// (never saved), keep the in-memory values instead of wiping them
+			// with defaults.
+			if (parsed.contains("Scopes") && parsed["Scopes"].is_object()) {
+				const auto entryKey = data->omodKey.empty() ? std::string("Default") : data->omodKey;
+				const auto& scopes = parsed["Scopes"];
+				if (const auto entry = scopes.find(entryKey); entry != scopes.end()) {
+					entry->get_to(*data);
+					data->autoProfile = true;
+				}
+				return;
+			}
 
-		ScopeData::ScopeDataHandler::GetSingleton()->UpdateFTSData(data->path);
-
-		f.close();
+			parsed.get_to(*data);
+		} catch (const std::exception& error) {
+			logger::error("Unable to reload scope profile {}: {}", data->path, error.what());
+		}
 	}
 
 	void ScopeDataHandler::ReloadCurrentFTSData()
@@ -265,22 +337,66 @@ namespace ScopeData
 		if (path.find("__folder_managed_by_vortex") != std::string::npos)
 			return false;
 
-		std::ifstream f(path);
+		try {
+			std::ifstream input(path);
+			if (!input) {
+				throw std::runtime_error("file could not be opened");
+			}
 
-		FTSData* tempdata = new FTSData(path);
+			const auto parsed = json::parse(input, nullptr, true, true);
 
-		ReloadFTSData(tempdata);
+			// Version 2 automatic profile file: one file per weapon, holding
+			// one entry per scope attachment under "Scopes", keyed by the
+			// sight's ZoomData form ("plugin:localFormID").
+			if (parsed.contains("Scopes") && parsed["Scopes"].is_object()) {
+				const auto filePlugin = parsed.value("SourcePlugin", "");
+				const auto fileFormID = parsed.value("SourceFormID", 0U);
+				bool loadedAny = false;
+				for (const auto& [omodKey, entry] : parsed["Scopes"].items()) {
+					auto data = std::make_unique<FTSData>(path);
+					entry.get_to(*data);
+					data->autoProfile = true;
+					if (data->sourcePlugin.empty()) {
+						data->sourcePlugin = filePlugin;
+					}
+					if (data->sourceFormID == 0) {
+						data->sourceFormID = fileFormID;
+					}
+					data->omodKey = omodKey;
+					if (data->sourcePlugin.empty() || data->sourceFormID == 0) {
+						logger::warn("Skipping auto profile entry {} in {}: missing weapon identity", omodKey, path);
+						continue;
+					}
+					autoProfileMap.insert_or_assign(
+						{ data->sourcePlugin, data->sourceFormID, omodKey },
+						data.get());
+					ownedData.push_back(std::move(data));
+					loadedAny = true;
+				}
+				return loadedAny;
+			}
 
-		ScopeDataMap.emplace(tempdata->keywordName.data(), tempdata);
+			auto data = std::make_unique<FTSData>(path);
+			parsed.get_to(*data);
 
-		//try {
-		//	
-		//} catch (nlohmann::detail::exception& e) {
-		//	reshade::log_message(4, e.what());
-		//	string strRet = "{\"result\":0}";
-		//}
-		
-		return true;
+			auto* dataPointer = data.get();
+			if (dataPointer->autoProfile && !dataPointer->sourcePlugin.empty() && dataPointer->sourceFormID != 0) {
+				// Legacy flat auto profile file (one weapon, one entry). Loads
+				// as the file-wide default entry; the next save rewrites the
+				// file in the per-scope container format.
+				dataPointer->omodKey = "Default";
+				autoProfileMap.insert_or_assign(
+					{ dataPointer->sourcePlugin, dataPointer->sourceFormID, dataPointer->omodKey },
+					dataPointer);
+			} else {
+				ScopeDataMap.emplace(dataPointer->keywordName, dataPointer);
+			}
+			ownedData.push_back(std::move(data));
+			return true;
+		} catch (const std::exception& error) {
+			logger::error("Skipping invalid scope profile {}: {}", path, error.what());
+			return false;
+		}
 	}
 
 	int ScopeDataHandler::GetEffectIndex()
@@ -290,19 +406,8 @@ namespace ScopeData
 
 	void ScopeDataHandler::SetEffectIndex(int renderIndex)
 	{
-
 		PassRenderIndex = renderIndex;
-
-		string path = "Data\\F4SE\\Plugins\\FTSConfig.json";
-		std::ifstream f(path);
-		json data = json::parse(f);
-
-		data["RenderPassIndex"] = PassRenderIndex;
-
-		std::ofstream o(path);
-		o << data << std::endl;
-		f.close();
-		o.close();
+		UpdateConfigValue("RenderPassIndex", PassRenderIndex);
 	}
 
 
@@ -319,22 +424,10 @@ namespace ScopeData
 
 	void ScopeDataHandler::SaveEnableRenderBeforeUI(bool flag)
 	{
-		//bEnableRenderBeforeUI = flag;
-
 		if (isUpscaler)
 			return;
-
-
-		string path = "Data\\F4SE\\Plugins\\FTSConfig.json";
-		std::ifstream f(path);
-		json data = json::parse(f);
-
-		data["EnableRenderBeforeUI"] = bEnableRenderBeforeUI;
-
-		std::ofstream o(path);
-		o << data << std::endl;
-		f.close();
-		o.close();
+		bEnableRenderBeforeUI = flag;
+		UpdateConfigValue("EnableRenderBeforeUI", bEnableRenderBeforeUI);
 	}
 
 	int ScopeDataHandler::GetBaseRenderCount()
@@ -345,17 +438,7 @@ namespace ScopeData
 	void ScopeDataHandler::SetBaseRenderCount(int renderIndex)
 	{
 		baseRenderCount = renderIndex;
-
-		string path = "Data\\F4SE\\Plugins\\FTSConfig.json";
-		std::ifstream f(path);
-		json data = json::parse(f);
-
-		data["BaseRenderCount"] = baseRenderCount;
-
-		std::ofstream o(path);
-		o << data << std::endl;
-		f.close();
-		o.close();
+		UpdateConfigValue("BaseRenderCount", baseRenderCount);
 	}
 
 	int ComboKeyToInt(std::string comboStr)
@@ -388,42 +471,46 @@ namespace ScopeData
 
 	void ScopeDataHandler::ReadDefaultScopeDataFile()
 	{
-		/*string path = "Data\\F4SE\\Plugins\\FTS.json";
-
-		ReadScopeData(path);*/
-
-		string path = "Data\\F4SE\\Plugins\\FTSConfig.json";
-		std::ifstream f(path);
-		json data = json::parse(f);
-		PassRenderIndex = data["RenderPassIndex"].is_null() ? 1 : (int)data["RenderPassIndex"];
-		bEnableRenderBeforeUI = data["EnableRenderBeforeUI"].is_null() ? 0 : (bool)(data["EnableRenderBeforeUI"]);
-		baseRenderCount = data["BaseRenderCount"].is_null() ? 10 : (int)data["BaseRenderCount"];
-		
-
-		//std::string comboStr = data["ComboNVKey"].is_null() ? "null" : (std::string)data["ComboNVKey"];
-		
-		if (!data["ComboNVKey"].is_null()) 
-		{
-			if (data["ComboNVKey"].is_string()) 
-				comboNVKey = ComboKeyToInt((std::string)data["ComboNVKey"]);
-
-			else if (data["ComboNVKey"].is_number_integer())
-				comboNVKey = (int)data["ComboNVKey"];
+		const std::filesystem::path path = "Data\\F4SE\\Plugins\\FTSConfig.json";
+		json data = json::object();
+		try {
+			if (std::ifstream input(path); input) {
+				data = json::parse(input, nullptr, true, true);
+			}
+		} catch (const std::exception& error) {
+			logger::error("FTSConfig.json is invalid; using safe defaults: {}", error.what());
 		}
-		else comboNVKey = 0;
 
+		PassRenderIndex = data.value("RenderPassIndex", 1);
+		bEnableRenderBeforeUI = data.value("EnableRenderBeforeUI", false);
+		baseRenderCount = data.value("BaseRenderCount", 10);
 
-		nvKey = data["NvKey"].is_null() ? 0 : (int)data["NvKey"];
-		guiKey = data["guiKey"].is_null() ? 117 : (int)data["guiKey"];
+		const auto combo = data.find("ComboNVKey");
+		if (combo != data.end() && combo->is_string()) {
+			comboNVKey = ComboKeyToInt(combo->get<std::string>());
+		} else if (combo != data.end() && combo->is_number_integer()) {
+			comboNVKey = combo->get<int>();
+		} else {
+			comboNVKey = -1;
+		}
 
-		if (data["guiKey"].is_null())
-			data["guiKey"] = 117;
+		nvKey = data.value("NvKey", 0);
+		guiKey = data.value("guiKey", 117);
 
-		std::ofstream o(path);
-		o << data << std::endl;
-		f.close();
-		o.close();
+		data["RenderPassIndex"] = PassRenderIndex;
+		data["EnableRenderBeforeUI"] = bEnableRenderBeforeUI;
+		data["BaseRenderCount"] = baseRenderCount;
+		data["ComboNVKey"] = comboNVKey;
+		data["NvKey"] = nvKey;
+		data["guiKey"] = guiKey;
 
+		try {
+			std::filesystem::create_directories(path.parent_path());
+			std::ofstream output(path, std::ios::trunc);
+			output << data.dump(2) << '\n';
+		} catch (const std::exception& error) {
+			logger::error("Unable to write FTSConfig.json defaults: {}", error.what());
+		}
 	}
 
 	const char* ScopeDataHandler::GetNVGComboKeyStr()
@@ -451,116 +538,262 @@ namespace ScopeData
 	void ScopeDataHandler::SetNVGHotKeyCombo(int comboKey)
 	{
 		comboNVKey = comboKey;
-
-
-		string path = "Data\\F4SE\\Plugins\\FTSConfig.json";
-		std::ifstream f(path);
-		json data = json::parse(f);
-
-		data["ComboNVKey"] = comboKey;
-
-		std::ofstream o(path);
-		o << data << std::endl;
-		f.close();
-		o.close();
-		
+		UpdateConfigValue("ComboNVKey", comboKey);
 	}
 
 	void ScopeDataHandler::SetNVGHotKeyMain(unsigned int mainkeycode)
 	{
-
 		nvKey = mainkeycode;
-
-		string path = "Data\\F4SE\\Plugins\\FTSConfig.json";
-		std::ifstream f(path);
-		json data = json::parse(f);
-
-		data["NvKey"] = nvKey;
-
-		std::ofstream o(path);
-		o << data << std::endl;
-		f.close();
-		o.close();
+		UpdateConfigValue("NvKey", nvKey);
 	}
 
 	void ScopeDataHandler::SetGuiKey(unsigned int mainkeycode)
 	{
 		guiKey = mainkeycode;
-
-		string path = "Data\\F4SE\\Plugins\\FTSConfig.json";
-		std::ifstream f(path);
-		json data = json::parse(f);
-		data["guiKey"] = guiKey;
-		std::ofstream o(path);
-		o << data << std::endl;
-		f.close();
-		o.close();
+		UpdateConfigValue("guiKey", guiKey);
 	}
 
 	void ScopeDataHandler::ReadCustomScopeDataFiles(std::string path)
 	{
-		intptr_t hFile = 0;
-		string p ="\\";
-		struct _finddata_t fileinfo;
-
-		if ((hFile = _findfirst(p.assign(path).append("\\*").c_str(), &fileinfo)) != -1) {
-			do {
-				if ((fileinfo.attrib & _A_SUBDIR)) {
-					if (strcmp(fileinfo.name, ".") != 0 && strcmp(fileinfo.name, "..") != 0)
-						ScopeDataHandler::ReadCustomScopeDataFiles(p.assign(path).append("\\").append(fileinfo.name));
-				} else {
-					files.push_back(p.assign(path).append("\\").append(fileinfo.name));
-					
-				}
-			} while (_findnext(hFile, &fileinfo) == 0);
-			_findclose(hFile);
+		files.clear();
+		const std::filesystem::path root(path);
+		if (!std::filesystem::exists(root)) {
+			logger::info("Scope profile directory {} does not exist", root.string());
+			return;
 		}
 
-		for (auto& i : files) {
-			ReadScopeData(i);
+		for (const auto& entry : std::filesystem::recursive_directory_iterator(
+				 root,
+				 std::filesystem::directory_options::skip_permission_denied)) {
+			if (!entry.is_regular_file() || entry.path().extension() != ".json") {
+				continue;
+			}
+			files.push_back(entry.path().string());
 		}
+
+		std::ranges::sort(files);
+		for (const auto& file : files) {
+			ReadScopeData(file);
+		}
+		logger::info(
+			"Loaded {} explicit and {} automatic scope profiles",
+			ScopeDataMap.size(),
+			autoProfileMap.size());
 	}
 
 	void ScopeDataHandler::ReloadZoomData(std::string path)
 	{
+		SetCurrentFTSData(nullptr);
+		ScopeDataMap.clear();
+		autoProfileMap.clear();
+		ownedData.clear();
 		ReadCustomScopeDataFiles(path);
 		ReadDefaultScopeDataFile();
 	
+	}
+
+	FTSData* ScopeDataHandler::GetOrCreateAutoProfile(
+		RE::TESObjectWEAP* weapon,
+		const RE::BGSZoomData::Data& zoomData,
+		std::string attachmentKey,
+		float defaultDiameter,
+		float defaultMagnification,
+		float zoomSpread)
+	{
+		if (!weapon) {
+			return nullptr;
+		}
+
+		const auto* sourceFile = weapon->GetFile(0);
+		const auto sourcePlugin = sourceFile ?
+			std::string(sourceFile->GetFilename()) :
+			std::string("Fallout4.esm");
+		const auto sourceFormID = sourceFile ? weapon->GetLocalFormID() : weapon->GetFormID();
+
+		// BGSZoomData is often generated instance data and can have FormID zero,
+		// which collapsed unrelated sights into one profile. The caller now
+		// supplies the stable, sorted set of attached OMOD identities.
+		const std::string omodKey =
+			attachmentKey.empty() ? std::string("Default") : std::move(attachmentKey);
+
+		const auto key = std::tuple{ sourcePlugin, sourceFormID, omodKey };
+		if (const auto existing = autoProfileMap.find(key); existing != autoProfileMap.end()) {
+			return existing->second;
+		}
+
+		// Builds before attachment enumeration used a generated BGSZoomData
+		// FormID, commonly "Fallout4.esm:00000000". Preserve a user's tuning
+		// when that is the sole legacy entry for this weapon, then save it
+		// under the stable OMOD signature on the next explicit save.
+		auto legacyEntry = autoProfileMap.end();
+		auto defaultEntry = autoProfileMap.end();
+		for (auto candidate = autoProfileMap.begin();
+			 candidate != autoProfileMap.end();
+			 ++candidate) {
+			const auto& [candidatePlugin, candidateFormID, candidateAttachment] =
+				candidate->first;
+			if (candidatePlugin != sourcePlugin ||
+				candidateFormID != sourceFormID) {
+				continue;
+			}
+			if (candidateAttachment.ends_with(":00000000")) {
+				// Prefer the later generated-form entry over the older flat
+				// "Default" migration because it contains the latest tuning.
+				if (legacyEntry != autoProfileMap.end()) {
+					legacyEntry = autoProfileMap.end();
+					break;
+				}
+				legacyEntry = candidate;
+			} else if (candidateAttachment == "Default") {
+				defaultEntry = candidate;
+			}
+		}
+		if (legacyEntry == autoProfileMap.end()) {
+			legacyEntry = defaultEntry;
+		}
+		if (legacyEntry != autoProfileMap.end()) {
+			auto* migrated = legacyEntry->second;
+			const auto oldAttachment = std::get<2>(legacyEntry->first);
+			autoProfileMap.erase(legacyEntry);
+			migrated->omodKey = omodKey;
+			migrated->keywordName =
+				std::format("AUTO_{:08X} [{}]", sourceFormID, omodKey);
+			autoProfileMap.emplace(key, migrated);
+			logger::info(
+				"Migrated automatic STS profile attachment identity from [{}] to [{}]",
+				oldAttachment,
+				omodKey);
+			return migrated;
+		}
+
+		std::string safePlugin = sourcePlugin;
+		std::ranges::replace_if(
+			safePlugin,
+			[](const char value) {
+				return value == '<' || value == '>' || value == ':' || value == '"' ||
+				       value == '/' || value == '\\' || value == '|' || value == '?' || value == '*';
+			},
+			'_');
+
+		const auto profilePath = std::filesystem::path("Data\\F4SE\\Plugins\\FTS\\Auto") /
+			std::format("{}_{:08X}.json", safePlugin, sourceFormID);
+		auto profile = std::make_unique<FTSData>(profilePath.string());
+		profile->keywordName = std::format("AUTO_{:08X} [{}]", sourceFormID, omodKey);
+		profile->omodKey = omodKey;
+		profile->legacyMode = true;
+		profile->UsingSTS = true;
+		profile->autoProfile = true;
+		profile->sourcePlugin = sourcePlugin;
+		profile->sourceFormID = sourceFormID;
+		profile->scopeFrame = 1;
+		// A null SRV samples transparent black in D3D11, so automatic STS
+		// profiles need no placeholder texture asset.
+		profile->ZoomNodePath.clear();
+
+		// Automatic profiles keep the weapon's own zoom untouched and layer
+		// the scope effect on top of it. Neutralizing the game zoom is not
+		// viable without per-scope camera retuning: STS sighted cameras sit
+		// at the eyepiece and only see black scope interior at unzoomed FOV.
+		// The overlay starts at the configured default magnification and the
+		// mouse wheel can push it up to magnification * spread while aiming.
+		profile->shaderData.minZoom = std::max(1.0F, defaultMagnification);
+		profile->shaderData.maxZoom =
+			profile->shaderData.minZoom * std::max(1.0F, zoomSpread);
+		// A touch of lens distortion by default makes the magnified circle
+		// read as glass instead of a flat cutout; fully adjustable per scope.
+		profile->shaderData.fishEyeStrength = 0.35F;
+		profile->shaderData.fishEyePower = 2.0F;
+		const float diameter = std::clamp(defaultDiameter, 64.0F, 2160.0F);
+		profile->shaderData.Size[0] = diameter;
+		profile->shaderData.Size[1] = diameter;
+		profile->shaderData.OriSize[0] = diameter;
+		profile->shaderData.OriSize[1] = diameter;
+		// Stock FTS parallax tuning: the fog reaches black slightly inside the
+		// mask edge, which produces the visible dark eye-relief ring at the
+		// rim of the circle and the moving scope shadow when the view drifts
+		// off the optical axis. These are the values shipped FTS profiles use.
+		profile->shaderData.parallax.radius = 2.65F;
+		profile->shaderData.parallax.relativeFogRadius = 9.0F;
+		profile->shaderData.parallax.scopeSwayAmount = 3.0F;
+		profile->shaderData.parallax.maxTravel = 1.0F;
+
+		// Automatic STS scopes replace the weapon's full-screen FOV zoom with
+		// lens-only magnification. Keep the authored camera offset so the
+		// manually aligned STS reticle remains in its intended position.
+		// Stage 2 verifies this override before any renderer is enabled.
+		profile->zoomDataOverwrite.enableZoomDateOverwrite = true;
+		profile->zoomDataOverwrite.fovMul = 1.0F;
+		profile->zoomDataOverwrite.x = zoomData.cameraOffset.x;
+		profile->zoomDataOverwrite.y = zoomData.cameraOffset.y;
+		profile->zoomDataOverwrite.z = zoomData.cameraOffset.z;
+
+		auto* result = profile.get();
+		ownedData.push_back(std::move(profile));
+		autoProfileMap.emplace(key, result);
+		logger::info(
+			"Synthesized STS auto profile for {}:{:08X} scope [{}] (weapon fovMult {:.2f}, overlay zoom up to {:.2f}x)",
+			sourcePlugin,
+			sourceFormID,
+			omodKey,
+			zoomData.fovMult,
+			result->shaderData.maxZoom);
+		return result;
+	}
+
+	bool ScopeDataHandler::WriteAutoProfile(FTSData* data)
+	{
+		if (!data || !data->autoProfile || data->path.empty()) {
+			return false;
+		}
+
+		try {
+			const std::filesystem::path outputPath(data->path);
+
+			// The file is shared by every scope attachment on this weapon, so
+			// merge into the existing content instead of overwriting it.
+			json fileJson = json::object();
+			if (std::ifstream input(outputPath); input) {
+				try {
+					fileJson = json::parse(input, nullptr, true, true);
+				} catch (const std::exception&) {
+					fileJson = json::object();
+				}
+			}
+			if (!fileJson.is_object() || !fileJson.contains("Scopes") || !fileJson["Scopes"].is_object()) {
+				// Also covers legacy flat files: their single entry becomes
+				// the "Default" entry of the new container format.
+				json scopes = json::object();
+				if (fileJson.is_object() && fileJson.value("AutoProfile", false)) {
+					scopes["Default"] = fileJson;
+				}
+				fileJson = json::object();
+				fileJson["Scopes"] = std::move(scopes);
+			}
+
+			fileJson["AutoProfileFile"] = 2;
+			fileJson["SourcePlugin"] = data->sourcePlugin;
+			fileJson["SourceFormID"] = data->sourceFormID;
+			const std::string entryKey = data->omodKey.empty() ? "Default" : data->omodKey;
+			fileJson["Scopes"][entryKey] = *data;
+
+			std::filesystem::create_directories(outputPath.parent_path());
+			std::ofstream output(outputPath, std::ios::trunc);
+			if (!output) {
+				throw std::runtime_error("file could not be opened");
+			}
+			output << fileJson.dump(2) << '\n';
+			logger::info("Saved STS auto profile {} entry [{}]", outputPath.string(), entryKey);
+			return true;
+		} catch (const std::exception& error) {
+			logger::error("Unable to save STS auto profile {}: {}", data->path, error.what());
+			return false;
+		}
 	}
 
 	std::multimap<std::string, FTSData*>* ScopeDataHandler::GetScopeDataMap()
 	{
 		return &ScopeDataMap;
 	}
-
-
-	void ScopeDataHandler::UpdateFTSData(std::string path)
-	{
-		std::ifstream f(path);
-		json j = json::parse(f);
-	
-		if (j["Version"].is_null() || (int)(j["Version"] == currentFTSDataVerion)) {
-			f.close();
-			return;
-		}
-
-
-		if ((int)(j["Version"] != currentFTSDataVerion)) {
-
-		}
-
-
-		j["Version"] = (int)currentFTSDataVerion;
-
-
-
-		std::ofstream o(path);
-		o << j << std::endl;
-		f.close();
-		o.close();
-	}
-
-
 
 	std::vector<std::string_view> splitSV(std::string_view strv, std::string_view delims)
 	{

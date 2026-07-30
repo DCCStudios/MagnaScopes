@@ -1,6 +1,7 @@
 #pragma once
-#include "RE/NetImmerse/NiMatrix3.hpp"
-#include "RE/NetImmerse/NiPoint.hpp"
+#include "RE/N/NiMatrix3.h"
+#include "RE/N/NiPoint3.h"
+#include "RE/N/NiPoint4.h"
 #include <cmath>
 #include <cstdint>
 #include <d3d11.h>

@@ -107,8 +107,9 @@
 
 
 #pragma warning(push)
-#include "F4SE/F4SE.hpp"
-#include "RE/Fallout.hpp"
+#include "F4SE/F4SE.h"
+#include "RE/Fallout.h"
+#include "REX/REX.h"
 
 #ifdef NDEBUG
 #	include <spdlog/sinks/basic_file_sink.h>
@@ -135,8 +136,67 @@ typedef double Float64;             //!< A 64-bit floating point value
 
 
 
-namespace logger = F4SE::log;
+namespace logger
+{
+	template <class... Args>
+	void trace(std::format_string<Args...> format, Args&&... args)
+	{
+		REX::Impl::Log(
+			std::source_location::current(),
+			REX::ELogLevel::Trace,
+			format,
+			std::forward<Args>(args)...);
+	}
+
+	template <class... Args>
+	void debug(std::format_string<Args...> format, Args&&... args)
+	{
+		REX::Impl::Log(
+			std::source_location::current(),
+			REX::ELogLevel::Debug,
+			format,
+			std::forward<Args>(args)...);
+	}
+
+	template <class... Args>
+	void info(std::format_string<Args...> format, Args&&... args)
+	{
+		REX::Impl::Log(
+			std::source_location::current(),
+			REX::ELogLevel::Info,
+			format,
+			std::forward<Args>(args)...);
+	}
+
+	template <class... Args>
+	void warn(std::format_string<Args...> format, Args&&... args)
+	{
+		REX::Impl::Log(
+			std::source_location::current(),
+			REX::ELogLevel::Warning,
+			format,
+			std::forward<Args>(args)...);
+	}
+
+	template <class... Args>
+	void error(std::format_string<Args...> format, Args&&... args)
+	{
+		REX::Impl::Log(
+			std::source_location::current(),
+			REX::ELogLevel::Error,
+			format,
+			std::forward<Args>(args)...);
+	}
+
+	template <class... Args>
+	void critical(std::format_string<Args...> format, Args&&... args)
+	{
+		REX::Impl::Log(
+			std::source_location::current(),
+			REX::ELogLevel::Critical,
+			format,
+			std::forward<Args>(args)...);
+	}
+}
 
 using namespace std::literals;
-
-#include "Version.h"

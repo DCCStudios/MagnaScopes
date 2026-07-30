@@ -1,11 +1,17 @@
 #pragma once
 
-#include "imgui.h"
-#include <imgui/imgui_impl_dx11.h>
-#include <imgui/imgui_impl_win32.h>
-#include <imgui_stdlib.h>
+#pragma warning(push)
+#pragma warning(disable: 4099)
+#include "../../F4SE-Menu-Framework-3/resources/F4SEMenuFramework.h"
+#pragma warning(pop)
 #include "FTSData.h"
 
+#include <atomic>
+
+// The consumer header exposes the framework-owned ImGui API through
+// ImGuiMCP. This alias keeps the customization code readable without linking
+// another Dear ImGui context into MagnaScope.
+namespace ImGui = ImGuiMCP;
 
 const char* const mainKey[] = {
 	"None",
@@ -179,6 +185,18 @@ const char* const mainKey[] = {
 
 namespace ImGuiImpl
 {
+	bool RegisterMenu();
+	void __stdcall RenderMenu();
+	void __stdcall RenderPopout();
+	// Drops the zoom preview snapshot without writing anything back to the
+	// weapon. For when the equipped instance was replaced mid-edit and the
+	// old instance may already be freed.
+	void AbandonZoomPreview();
+
+	// Forced-aim request from the menu (which renders on the D3D thread) to
+	// the game thread: 1 = start aiming, 0 = stop, -1 = nothing pending.
+	// HookedUpdate consumes it and drives the sighted state and idles.
+	extern std::atomic<int> pendingForcedAim;
 
 	class ImGuiImplClass
 	{
@@ -189,7 +207,6 @@ namespace ImGuiImpl
 
 	public:
 		
-		bool bCanRender = false;
 		bool bIsSaving = false;
 
 
@@ -213,6 +230,8 @@ namespace ImGuiImpl
 		float Size_UI[2];
 		float Size_rect_UI[4];
 		float OriSize_UI[2];
+		float fishEyeStrength_UI;
+		float fishEyePower_UI;
 		float radius_UI;
 		float relativeFogRadius_UI;
 		float scopeSwayAmount_UI;
@@ -227,7 +246,6 @@ namespace ImGuiImpl
 
 		int nvgComboKeyIndex = 0;
 		int nvgMainKeyIndex = 0;
-		int guiKeyIndex = 0;
 		bool bDisableWhileBolt = false;
 
 		void MapScopeShaderEffect();
@@ -235,14 +253,12 @@ namespace ImGuiImpl
 
 	public:
 		void RenderImgui();
-		bool EnableImGuiRender(bool, bool);
 		bool CheckAndInit();
 		void ReloadData();
 		void SaveData();
 		void MainMenuSection();
 		void ShaderDataSection();
 		void ParallaxDataSection();
-		void PlayerAim(bool);
 
 		void UpdateWeaponInstance(RE::TESObjectWEAP::InstanceData*);
 		void UpdateImGuiData();

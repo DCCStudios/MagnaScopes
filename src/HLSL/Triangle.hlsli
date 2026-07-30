@@ -67,7 +67,12 @@ cbuffer ScopeEffectData : register(b5)
 	row_major float4x4 projMat;
 
 	float4 ScopeEffect_Rect;
-	
+
+	// MW2019-style lens distortion: strength 0 disables it, power shapes
+	// how sharply the bend ramps toward the lens edge.
+	float FishEyeStrength;
+	float FishEyePower;
+	float2 padding6;
 };
 
 

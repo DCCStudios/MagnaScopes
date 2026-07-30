@@ -1,9 +1,8 @@
 #pragma once
 
 #include <nlohmann/json.hpp>
+#include <tuple>
 #include <unordered_set>
-
-#define currentFTSDataVerion 1
 
 using json = nlohmann::json;
 namespace ScopeData
@@ -64,6 +63,12 @@ namespace ScopeData
 		float ReticleSize = 4;
 		float reticle_Offset[2] = { 0.0f, 0.0f };
 
+		// MW2019-style lens distortion inside the magnified area. Strength 0
+		// disables it; power controls how sharply the bend ramps toward the
+		// edge of the lens (higher keeps the center flat).
+		float fishEyeStrength = 0.0F;
+		float fishEyePower = 2.0F;
+
 		float fovAdjust = 0;
 		Parallax parallax;
 	};
@@ -83,6 +88,14 @@ namespace ScopeData
 		bool containAlladditionalKeywords = true;
 
 		bool UsingSTS = false;
+		bool autoProfile = false;
+		std::string sourcePlugin;
+		std::uint32_t sourceFormID = 0;
+		// For automatic profiles: identifies the equipped attachment set inside
+		// the weapon's shared profile file. It is derived from the sorted OMOD
+		// FormIDs on the first-person weapon instance, not BGSZoomData (which is
+		// commonly a generated form with FormID zero).
+		std::string omodKey;
 		unsigned int scopeFrame = 1;
 		std::string ZoomNodePath;
 
@@ -113,6 +126,14 @@ namespace ScopeData
 
 		void SetCurrentFTSData(FTSData* data, bool containsAllAdditionkeyword = true);
 		FTSData* GetCurrentFTSData();
+		FTSData* GetOrCreateAutoProfile(
+			RE::TESObjectWEAP* weapon,
+			const RE::BGSZoomData::Data& zoomData,
+			std::string attachmentKey,
+			float defaultDiameter,
+			float defaultMagnification,
+			float zoomSpread);
+		bool WriteAutoProfile(FTSData* data);
 
 		int GetEffectIndex();
 		void SetEffectIndex(int);
@@ -128,7 +149,6 @@ namespace ScopeData
 		void SetGuiKey(unsigned int keycode);
 
 		void SetIsUpscaler(bool);
-		void UpdateFTSData(std::string path);
 		const char* GetNVGComboKeyStr();
 
 		//bool ZoomDataWrite(RE::TESObjectWEAP::InstanceData* GetSington);
@@ -161,6 +181,11 @@ namespace ScopeData
 		std::vector<std::string> files;
 		//CSimpleIniA iniForZoom;
 		std::multimap<std::string, FTSData*> ScopeDataMap;
+		// Keyed by weapon plugin, weapon local FormID, and scope OMOD key
+		// (see FTSData::omodKey), so each scope attachment on a weapon gets
+		// its own profile entry.
+		std::map<std::tuple<std::string, std::uint32_t, std::string>, FTSData*> autoProfileMap;
+		std::vector<std::unique_ptr<FTSData>> ownedData;
 		FTSData* currentData;
 		std::string currentPath;
 	};
