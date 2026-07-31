@@ -7,6 +7,7 @@
 #include "FTSData.h"
 
 #include <atomic>
+#include <cstdint>
 
 // The consumer header exposes the framework-owned ImGui API through
 // ImGuiMCP. This alias keeps the customization code readable without linking
@@ -185,6 +186,45 @@ const char* const mainKey[] = {
 
 namespace ImGuiImpl
 {
+	// Menu Framework invokes draw callbacks on the renderer thread. Only
+	// copied plain data crosses this bridge; live Fallout objects remain
+	// exclusively owned by the game-thread update hook.
+	struct EditorPreviewSnapshot
+	{
+		ScopeData::ZoomDataOverwrite zoomOverride{};
+		std::uint64_t selectionRevision = 0;
+		float magnification = 1.0F;
+		float imageDenoise = 0.0F;
+		float imageSharpen = 0.0F;
+		float fishEyeStrength = 0.0F;
+		float fishEyePower = 2.0F;
+		float edgeRefractionStrength = 0.0F;
+		float edgeRefractionWidth = 0.15F;
+		float edgeChromaticAberration = 0.0F;
+		float reticleMagnification = 1.0F;
+		float eyeBoxRadius = 2.0F;
+		float vignetteReach = 9.0F;
+		float vignetteSharpness = 3.0F;
+		float eyeBoxMaxTravel = 4.0F;
+		float sceneParallaxStrength = 0.0F;
+		float opticalLagStrength = 1.0F;
+		bool active = false;
+	};
+
+	struct AuthoredZoomSnapshot
+	{
+		ScopeData::ZoomDataOverwrite values{};
+		std::uint64_t selectionRevision = 0;
+		bool available = false;
+	};
+
+	enum class ProfileRequest : std::uint8_t
+	{
+		kNone,
+		kReselect,
+		kReload
+	};
+
 	bool RegisterMenu();
 	void __stdcall RenderMenu();
 	void __stdcall RenderPopout();
@@ -197,23 +237,47 @@ namespace ImGuiImpl
 	// the game thread: 1 = start aiming, 0 = stop, -1 = nothing pending.
 	// HookedUpdate consumes it and drives the sighted state and idles.
 	extern std::atomic<int> pendingForcedAim;
+	void PublishAuthoredZoomSnapshot(
+		const ScopeData::ZoomDataOverwrite* authoredValues,
+		std::uint64_t selectionRevision);
+	[[nodiscard]] AuthoredZoomSnapshot GetAuthoredZoomSnapshot();
+	void PublishEditorPreview(
+		const ScopeData::ZoomDataOverwrite& zoomOverride,
+		std::uint64_t selectionRevision,
+		float magnification,
+		float imageDenoise,
+		float imageSharpen,
+		float fishEyeStrength,
+		float fishEyePower,
+		float edgeRefractionStrength,
+		float edgeRefractionWidth,
+		float edgeChromaticAberration,
+		float reticleMagnification,
+		float eyeBoxRadius,
+		float vignetteReach,
+		float vignetteSharpness,
+		float eyeBoxMaxTravel,
+		float sceneParallaxStrength,
+		float opticalLagStrength);
+	[[nodiscard]] EditorPreviewSnapshot GetEditorPreviewSnapshot();
+	void ClearEditorPreview();
+	void RequestProfileAction(ProfileRequest request);
+	[[nodiscard]] ProfileRequest ConsumeProfileAction();
+	void RequestProfileSave(const ScopeData::FTSData& profile);
+	[[nodiscard]] std::unique_ptr<ScopeData::FTSData> ConsumeProfileSave();
 
 	class ImGuiImplClass
 	{
 	public:
 		ImGuiImplClass();
-		~ImGuiImplClass(){};
+		~ImGuiImplClass() {};
 		static ImGuiImplClass* GetSington();
 
 	public:
-		
-		bool bIsSaving = false;
-
+		std::atomic_bool bIsSaving{ false };
 
 		ScopeData::ZoomDataOverwrite Imgui_ZDO;
 		ScopeData::ZoomDataOverwrite ori_ZDO;
-		
-		RE::BGSZoomData::Data currOriZoomData;
 
 		bool bLegacyMode;
 		bool UsingSTS_UI;
@@ -232,10 +296,19 @@ namespace ImGuiImpl
 		float OriSize_UI[2];
 		float fishEyeStrength_UI;
 		float fishEyePower_UI;
+		float edgeRefractionStrength_UI;
+		float edgeRefractionWidth_UI;
+		float edgeChromaticAberration_UI;
+		float imageDenoise_UI;
+		float imageSharpen_UI;
+		float reticleMagnification_UI = 1.0F;
 		float radius_UI;
 		float relativeFogRadius_UI;
 		float scopeSwayAmount_UI;
 		float maxTravel_UI;
+		float sceneParallaxStrength_UI;
+		float opticalLagStrength_UI = 1.0F;
+		std::uint64_t selectionRevision_UI = 0;
 
 		bool bEnableFG;
 		bool bEnableZMove;
@@ -249,7 +322,6 @@ namespace ImGuiImpl
 		bool bDisableWhileBolt = false;
 
 		void MapScopeShaderEffect();
-		
 
 	public:
 		void RenderImgui();
@@ -265,4 +337,3 @@ namespace ImGuiImpl
 	};
 
 }
-

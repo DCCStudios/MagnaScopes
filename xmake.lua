@@ -25,7 +25,9 @@ add_requires("minhook")
 local shader_profiles = {
     AutoSTS_PS = "ps_5_0",
     ScopeGeometryFill_GS = "gs_5_0",
+    ScopeGeometryMagnify_PS = "ps_5_0",
     ScopeGeometryProbe_PS = "ps_5_0",
+    ReticleLayer_PS = "ps_5_0",
     ScopeEffect_PS = "ps_5_0",
     ScopeEffect_PS_Legacy = "ps_5_0",
     ScopeEffect_PS_Output = "ps_5_0",
@@ -46,6 +48,10 @@ target("MagnaScope")
     add_packages("nlohmann_json", "minhook")
     add_files("src/**.cpp")
     remove_files("src/MathUtils.cpp")
+    -- The retired Stage 5 auxiliary renderer hooked broad world-render
+    -- entry points. Keep its source for forensic reference, but do not link
+    -- it into the production DLL.
+    remove_files("src/WorldOnlyScopeRenderer.cpp")
     add_headerfiles("src/**.h")
     add_includedirs(
         "src",
@@ -186,6 +192,28 @@ target("ScopeGeometryFillShaderTest")
     set_kind("binary")
     set_languages("c++20")
     add_files("tests/ScopeGeometryFillShaderHarness.cpp")
+    add_defines("_UNICODE", "UNICODE", "NOMINMAX")
+    add_syslinks("d3d11", "d3dcompiler", "dxgi")
+    set_runtimes("MD")
+    set_targetdir("build/tests")
+
+target("DrawTimeEyeBoxTest")
+    set_default(false)
+    set_kind("binary")
+    set_languages("c++20")
+    add_files("tests/DrawTimeEyeBoxHarness.cpp")
+    add_includedirs("src")
+    set_runtimes("MD")
+    set_targetdir("build/tests")
+
+-- Executes the independent late reticle composite on D3D11 WARP. This
+-- verifies local pivot scaling, optical-effect isolation, and physical lens
+-- clipping without requiring Fallout 4 or a hardware GPU.
+target("ReticleLayerShaderTest")
+    set_default(false)
+    set_kind("binary")
+    set_languages("c++20")
+    add_files("tests/ReticleLayerShaderHarness.cpp")
     add_defines("_UNICODE", "UNICODE", "NOMINMAX")
     add_syslinks("d3d11", "d3dcompiler", "dxgi")
     set_runtimes("MD")

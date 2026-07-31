@@ -12,6 +12,18 @@
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/spdlog.h>
 
+// Some spdlog configurations include the Windows SDK after REX's macro
+// guards have finished. The SDK then redefines MAX_PATH and ERROR, which
+// would expand the qualified REX tokens below and break a clean build. Keep
+// these undefs local to the implementation file; the typed REX constants and
+// logging function remain the source of truth.
+#ifdef MAX_PATH
+#	undef MAX_PATH
+#endif
+#ifdef ERROR
+#	undef ERROR
+#endif
+
 namespace F4SE
 {
 	namespace Impl

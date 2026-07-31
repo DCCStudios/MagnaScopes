@@ -34,7 +34,12 @@ option("commonlib_xbyak", function()
 end)
 
 -- add packages
-add_requires("spdlog v1.16.0", { configs = { header_only = false, wchar = true, std_format = true } })
+-- Pin the exact CommonLib-tested release.  The leading "v" form is treated as
+-- a compatible-version request by current xmake and can silently resolve to a
+-- newer spdlog whose wide-string overload contract differs from this vendored
+-- CommonLib source.  A deterministic clean build matters more than accepting
+-- an unreviewed logging-library upgrade.
+add_requires("spdlog 1.16.0", { configs = { header_only = false, wchar = true, std_format = true } })
 
 -- add config packages
 if has_config("commonlib_ini") then add_requires("simpleini v4.25") end
@@ -50,7 +55,12 @@ target("commonlib-shared", function()
     set_default(os.scriptdir() == os.projectdir())
 
     -- add packages
-    add_packages("spdlog", { public = true })
+    -- Keep spdlog on the ordinary include path.  With the current MSVC/xmake
+    -- combination, the generated /external:I entry is not honored while
+    -- compiling this static dependency even though the package is present.
+    -- Treating the package as a normal include preserves the exact dependency
+    -- while making clean, from-source builds deterministic.
+    add_packages("spdlog", { public = true, system = false })
 
     -- add config packages
     if has_config("commonlib_ini") then

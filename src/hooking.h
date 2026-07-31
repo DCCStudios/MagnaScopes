@@ -1,24 +1,32 @@
 #pragma once
 
-#include <d3d11.h>
-#include <DirectXMath.h>
-#include <wrl/client.h>
 #include "FTSData.h"
+#include <DirectXMath.h>
 #include <REX/W32/COMPTR.h>
-
+#include <d3d11.h>
+#include <d3dcompiler.h>
+#include <array>
+#include <mutex>
+#include <vector>
+#include <wrl/client.h>
 
 #define D3D11_HOOK_API
-#define SAFE_RELEASE(p) { if ((p)) { (p)->Release(); (p) = nullptr; } }
+#define SAFE_RELEASE(p)     \
+	{                       \
+		if ((p)) {          \
+			(p)->Release(); \
+			(p) = nullptr;  \
+		}                   \
+	}
 #ifndef HR
-#	define HR(x)                                                 \
-		{                                                         \
-			HRESULT hr = (x);                                     \
-			if (FAILED(hr)) {                                     \
+#	define HR(x)                                                        \
+		{                                                                \
+			HRESULT hr = (x);                                            \
+			if (FAILED(hr)) {                                            \
 				logger::error("[-] {}, {}, {}", __FILE__, __LINE__, hr); \
-			}                                                     \
+			}                                                            \
 		}
 #endif
-
 
 template <class T>
 using ComPtr = REX::W32::ComPtr<T>;
@@ -29,7 +37,7 @@ extern ComPtr<ID3D11DeviceContext> g_Context;
 
 namespace Hook
 {
-	
+
 	HRESULT CreateShaderFromFile(
 		const WCHAR* csoFileNameInOut,
 		const WCHAR* hlslFileName,
@@ -52,31 +60,71 @@ namespace Hook
 			UINT StartIndexLocation,
 			INT BaseVertexLocation,
 			UINT StartInstanceLocation);
-		
 
 	private:
 		static std::once_flag flagOnce;
 
 	public:
-		
 		static D3D* GetSington();
 		void InitRenderDoc();
-	public:
 
+	public:
 		__declspec(align(16)) struct ConstBufferData
 		{
-			float width;
-			float height;
+			float width = 0.0F;
+			float height = 0.0F;
+			float scopeFadeMagnification = 1.0F;
+			float aimOffsetValid = 0.0F;
+
+			float aimOffsetX = 0.0F;
+			float aimOffsetY = 0.0F;
+			float imageDenoise = 0.0F;
+			float imageSharpen = 0.0F;
+
+			float fishEyeStrength = 0.0F;
+			float fishEyePower = 2.0F;
+			float lensRadiusX = 0.0F;
+			float lensRadiusY = 0.0F;
+
+			float aimCenterX = 0.0F;
+			float aimCenterY = 0.0F;
+			float reticleMagnification = 1.0F;
+			float activationProgress = 0.0F;
+
+			float edgeRefractionStrength = 0.0F;
+			float edgeRefractionWidth = 0.15F;
+			float edgeChromaticAberration = 0.0F;
+			float sceneParallaxStrength = 0.0F;
+
+			float eyeOffsetX = 0.0F;
+			float eyeOffsetY = 0.0F;
+			// Scales transient ScopeFade-local eye motion without changing
+			// the settled optical center. Zero disables the lag effect, one
+			// uses the measured motion, and larger values exaggerate it.
+			float opticalLagStrength = 1.0F;
+			float physicalEyeBoxValid = 0.0F;
+
+			float lensBasisXX = 0.0F;
+			float lensBasisXY = 0.0F;
+			float lensBasisZX = 0.0F;
+			float lensBasisZY = 0.0F;
+
+			float eyeBoxRadius = 2.0F;
+			float vignetteReach = 9.0F;
+			float vignetteSharpness = 3.0F;
+			float eyeBoxMaxTravel = 4.0F;
 		};
+		static_assert(
+			sizeof(ConstBufferData) == 128,
+			"ScopeFade constant buffer must match Triangle.hlsli");
 
 	public:
-
 		struct ScopeEffectShaderData
 		{
 			float camDepth = 1;
 			float GameFov = 90;
 			float ScopeEffect_Zoom = 1.5F;
-			float parallax_Radius = 2.0F ;
+			float parallax_Radius = 2.0F;
 
 			float parallax_relativeFogRadius = 8.0F;
 			float parallax_scopeSwayAmount = 2.0F;
@@ -98,10 +146,10 @@ namespace Hook
 			XMFLOAT2 ScopeEffect_OriSize = { 0, 0 };
 			XMFLOAT2 ScopeEffect_Offset = { 0, 0 };
 
-			XMFLOAT3 eyeDirection = {0,0,0};
+			XMFLOAT3 eyeDirection = { 0, 0, 0 };
 			float targetAdjustFov = 0;
 
-			XMFLOAT3 eyeDirectionLerp = {0,0,0};
+			XMFLOAT3 eyeDirectionLerp = { 0, 0, 0 };
 			float padding2 = 0;
 			XMFLOAT3 eyeTranslationLerp = { 0, 0, 0 };
 			float padding3 = 0;
@@ -114,7 +162,7 @@ namespace Hook
 			XMFLOAT2 FTS_ScreenPos = { 0, 0 };
 			XMFLOAT2 reticle_Offset = { 0, 0 };
 
-			XMFLOAT4X4 projMat;	
+			XMFLOAT4X4 projMat;
 			XMFLOAT4 rect;
 
 			// Mirrors the FishEye block appended to the HLSL cbuffer.
@@ -163,7 +211,41 @@ namespace Hook
 			// The mask center follows the optical plane raw. Only size and alpha
 			// use this ease value, which prevents both corner pop-in and trailing.
 			float activationProgress = 0.0F;
+			// Physical eye-box telemetry is measured in ScopeFade-local space
+			// after Fallout has updated the first-person rig. X and Y correspond
+			// to ScopeFade's local X and Z axes respectively, normalized by the
+			// authored aperture radius. They therefore remain meaningful when
+			// another plugin adds inertia above only part of the weapon tree.
+			float eyeOffsetX = 0.0F;
+			float eyeOffsetY = 0.0F;
+			// Signed change in camera-to-lens distance relative to the settled
+			// ADS calibration, also normalized by aperture radius.
+			float eyeReliefDelta = 0.0F;
+			// Screen-pixel displacement produced by one local aperture radius
+			// along ScopeFade X and Z. These basis vectors preserve tilted or
+			// off-center authored optics instead of assuming screen axes.
+			float lensBasisXX = 0.0F;
+			float lensBasisXY = 0.0F;
+			float lensBasisZX = 0.0F;
+			float lensBasisZY = 0.0F;
+			// Continuous [0,1] weight used to form the physical shadow without
+			// a one-frame pop when ADS calibration becomes usable.
+			float physicalEyeBoxBlend = 0.0F;
+			bool physicalEyeBoxReady = false;
 			bool trackingReady = false;
+		};
+
+		struct PhysicalEyeBoxSample
+		{
+			float eyeOffsetX = 0.0F;
+			float eyeOffsetY = 0.0F;
+			float eyeReliefDelta = 0.0F;
+			float lensBasisXX = 0.0F;
+			float lensBasisXY = 0.0F;
+			float lensBasisZX = 0.0F;
+			float lensBasisZY = 0.0F;
+			float blend = 0.0F;
+			bool valid = false;
 		};
 
 		struct ScreenSphereProjection
@@ -175,7 +257,6 @@ namespace Hook
 		};
 
 	public:
-
 		D3D11_HOOK_API void ImplHookDX11_Init(HMODULE hModule, void* hwnd);
 		bool InstallVerificationTAAHook();
 		void EnableRender(bool flag)
@@ -197,7 +278,8 @@ namespace Hook
 			float radiusX,
 			float radiusY,
 			bool automaticSTS,
-			float activationProgress);
+			float activationProgress,
+			const PhysicalEyeBoxSample& physicalEyeBox);
 		void InvalidateLensProjection();
 		[[nodiscard]] LensProjectionSnapshot GetLensProjectionSnapshot() const;
 		// Publish the exact renderer buffers owned by STS's required
@@ -206,7 +288,7 @@ namespace Hook
 		// on the render thread.
 		void PublishAutomaticSTSGeometry(
 			RE::NiAVObject* renderSurface,
-			RE::NiAVObject* reticleSurface,
+			const std::vector<RE::NiAVObject*>& reticleSurfaces,
 			RE::NiAVObject* aimingHousingSurface);
 		void InvalidateAutomaticSTSGeometry();
 		// Publish the player's gun state from the game thread. Stage 4 draw
@@ -224,7 +306,11 @@ namespace Hook
 		void AdjustZoomDelta(float delta);
 		void SetZoom(float zoom);
 		void ScreenTextureMod();
-		void RenderToReticleTexture();
+		// Returns true only when this call accounts for a visible composite.
+		// Explicit legacy profiles may use the fullscreen path. Automatic STS
+		// profiles replay only the exact authored ScopeFade geometry and fail
+		// closed if that draw was not captured.
+		bool RenderToReticleTexture();
 		void RenderToReticleTextureNew(UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation);
 		void MapScopeEffectBuffer(ScopeEffectShaderData);
 
@@ -274,6 +360,69 @@ namespace Hook
 			ID3D11Device* captureDevice = nullptr,
 			ID3D11DeviceContext* captureContext = nullptr);
 		bool InitGeometryProbeEffect();
+		bool EnsureGeometryProbeDeviceResources(ID3D11Device* device);
+		bool PrepareScopeFadeSceneSource(
+			ID3D11DeviceContext* context,
+			ID3D11RenderTargetView* renderTarget,
+			ID3D11ShaderResourceView* preferredWorldSource = nullptr);
+		// Records the exact STS ScopeFade draw while Fallout is rendering the
+		// first-person weapon. Once capture succeeds, the caller suppresses the
+		// authored lens-color draw so the coherent late source does not contain
+		// glass that would be sampled and drawn a second time. This matches
+		// Fake Through Scope's aperture ownership contract.
+		bool CaptureAutomaticSTSScopeFadeReplay(
+			ID3D11DeviceContext* context,
+			UINT indexCount,
+			UINT startIndexLocation,
+			INT baseVertexLocation,
+			ID3D11Buffer* vertexBuffer,
+			UINT vertexStride,
+			UINT vertexOffset,
+			ID3D11Buffer* indexBuffer,
+			DXGI_FORMAT indexFormat,
+			UINT indexOffset);
+		// Replays the captured ScopeFade aperture at a verified late color
+		// anchor. The scene source already contains a coherent weapon and world,
+		// so increasing magnification cannot expose a depth-only weapon
+		// silhouette or unresolved deferred-lighting pixels.
+		bool ReplayAutomaticSTSScopeFade(
+			ID3D11ShaderResourceView* sceneSource,
+			ID3D11RenderTargetView* compositeTarget);
+		// Records the exact authored STS reticle pipeline without drawing it
+		// into the scene source. Replaying that draw after ScopeFade keeps a 1x
+		// reticle independent from scene magnification and preserves black
+		// markings that cannot be reconstructed from an RGBA coverage layer.
+		bool CaptureAutomaticSTSReticleReplay(
+			ID3D11DeviceContext* context,
+			UINT indexCount,
+			UINT startIndexLocation,
+			INT baseVertexLocation);
+		bool ReplayAutomaticSTSReticle(
+			ID3D11RenderTargetView* compositeTarget);
+		void ClearAutomaticSTSReticleReplay() noexcept;
+		// Draws the authored STS reticle into a private transparent layer at
+		// its original pipeline position. The coherent late scene therefore
+		// remains reticle-free, while the layer can be composited after the
+		// magnified ScopeFade replay without magnifying the reticle.
+		bool BeginAutomaticSTSReticleLayerCapture(
+			ID3D11DeviceContext* context,
+			ID3D11RenderTargetView* sourceTarget,
+			ID3D11DepthStencilView* sourceDepth,
+			bool whiteBackground);
+		bool ApplyAutomaticSTSReticleColorSuppression(
+			ID3D11DeviceContext* context);
+		// Serializes the complete black/white capture transaction against late
+		// composition, Present cleanup, resize, and device-resource teardown.
+		// Callers must hold this lock across both authored draws and Complete.
+		std::unique_lock<std::mutex>
+			LockAutomaticSTSReticleLayerCapture();
+		void CompleteAutomaticSTSReticleLayerCapture(
+			bool captured,
+			std::uint64_t frameGeneration) noexcept;
+		bool CompositeAutomaticSTSReticleLayer(
+			ID3D11RenderTargetView* compositeTarget);
+		void ClearAutomaticSTSReticleLayer() noexcept;
+		void ClearAutomaticSTSScopeFadeReplay() noexcept;
 
 		struct VSConstantBufferSlot
 		{
@@ -291,7 +440,7 @@ namespace Hook
 			ID3D11Buffer* const* vertexBuffers,
 			const UINT* strides,
 			const UINT* offsets,
-			UINT numVertexBuffers,ID3D11RenderTargetView* backBufferRTV);
+			UINT numVertexBuffers, ID3D11RenderTargetView* backBufferRTV);
 
 		void LoadAimTexture(const std::string& path);
 		template <typename T>
@@ -317,20 +466,39 @@ namespace Hook
 		void SetFinishAimAnim(bool flag);
 		void SetInterfaceTextRefresh(bool flag);
 		void QueryRender(bool flag) { bQueryRender = flag; }
-		bool GetRenderState() { return bQueryRender ; }
+		bool GetRenderState() { return bQueryRender; }
 		void SetIsInGame(bool flag) { bIsInGame = flag; }
 		GameConstBuffer* GetGameConstBuffer() { return &gameConstBuffer; }
 
 	public:
 		static bool bLegacyMode;
 		static bool isEnableScopeEffect;
-		static bool bEnableEditMode;
-		static bool bRefreshChar;
+		static std::atomic_bool bEnableEditMode;
+		static std::atomic_bool bRefreshChar;
 		// While the customization menu is in edit mode these bound the mouse
 		// wheel zoom instead of the saved profile values, so the menu's
 		// magnification sliders preview live before the profile is saved.
 		static float editZoomMin;
 		static float editZoomMax;
+		// Copied scalar consumed by the exact ScopeFade replacement shader.
+		// This avoids sharing game objects with the renderer thread.
+		static std::atomic<float> scopeFadeMagnification;
+		static std::atomic<float> scopeImageDenoise;
+		static std::atomic<float> scopeImageSharpen;
+		static std::atomic<float> scopeFishEyeStrength;
+		static std::atomic<float> scopeFishEyePower;
+		static std::atomic<float> scopeEdgeRefractionStrength;
+		static std::atomic<float> scopeEdgeRefractionWidth;
+		static std::atomic<float> scopeEdgeChromaticAberration;
+		// Independent STS reticle vertex scale. 1 preserves the authored mesh
+		// size regardless of scene magnification.
+		static std::atomic<float> scopeReticleMagnification;
+		static std::atomic<float> scopeEyeBoxRadius;
+		static std::atomic<float> scopeVignetteReach;
+		static std::atomic<float> scopeVignetteSharpness;
+		static std::atomic<float> scopeEyeBoxMaxTravel;
+		static std::atomic<float> scopeSceneParallaxStrength;
+		static std::atomic<float> scopeOpticalLagStrength;
 		static std::atomic_bool isEnableRender;
 		static bool frameworkRenderAnchor;
 		static std::atomic<float> projectedLensX;
@@ -343,7 +511,21 @@ namespace Hook
 		static std::atomic<float> projectedSourceWidth;
 		static std::atomic<float> projectedSourceHeight;
 		static std::atomic_bool projectedAutomaticSTS;
+		static std::atomic<float> projectedEyeOffsetX;
+		static std::atomic<float> projectedEyeOffsetY;
+		static std::atomic<float> projectedEyeReliefDelta;
+		static std::atomic<float> projectedLensBasisXX;
+		static std::atomic<float> projectedLensBasisXY;
+		static std::atomic<float> projectedLensBasisZX;
+		static std::atomic<float> projectedLensBasisZY;
+		static std::atomic<float> projectedPhysicalEyeBoxBlend;
+		static std::atomic_bool projectedPhysicalEyeBoxReady;
 		static std::atomic_bool projectedTrackingReady;
+		// Odd while a game-thread publication is in progress and even when a
+		// complete lens/eye snapshot is available. The render thread retries
+		// if the value changes, preventing recoil from tearing center, basis,
+		// and eye displacement across different frames.
+		static std::atomic_uint64_t projectedLensSequence;
 		static std::atomic<std::uintptr_t> automaticSTSVertexBuffer;
 		static std::atomic<std::uintptr_t> automaticSTSIndexBuffer;
 		static std::atomic_uint32_t automaticSTSIndexCount;
@@ -354,10 +536,38 @@ namespace Hook
 		static std::atomic<std::uintptr_t> automaticSTSReticleVertexBuffer;
 		static std::atomic<std::uintptr_t> automaticSTSReticleIndexBuffer;
 		static std::atomic_uint32_t automaticSTSReticleIndexCount;
+		static std::atomic_uint32_t automaticSTSReticleVertexCount;
 		static std::atomic_uint32_t automaticSTSReticleVertexStride;
 		static std::atomic_uint32_t automaticSTSReticleVertexDataOffset;
 		static std::atomic_uint32_t automaticSTSReticleIndexDataOffset;
+		static std::atomic_uint64_t automaticSTSReticleVertexDescriptor;
+		// Changes whenever the selected reticle identity or packed layout
+		// changes. Render-thread caches use this generation rather than
+		// retaining any scene-graph pointer across equip/reload boundaries.
+		static std::atomic_uint64_t automaticSTSReticleGeometryGeneration;
 		static std::atomic_bool automaticSTSReticleGeometryReady;
+		// An STS reticle is a subtree, not necessarily one Reticle:0 shape.
+		// Each entry is published as opaque D3D identity so DrawIndexed can
+		// remove every authored reticle subdraw from the scene capture and
+		// reconstruct the complete group exactly once after magnification.
+		// Atomic fields plus the odd/even sequence avoid render-thread scene
+		// pointers, locks, and torn equipment-change snapshots.
+		static constexpr std::size_t kMaxAutomaticSTSReticleGeometries = 32U;
+		struct AutomaticSTSReticleGeometryIdentity
+		{
+			std::atomic<std::uintptr_t> vertexBuffer{ 0U };
+			std::atomic<std::uintptr_t> indexBuffer{ 0U };
+			std::atomic_uint32_t indexCount{ 0U };
+			std::atomic_uint32_t vertexStride{ 0U };
+			std::atomic_uint32_t vertexDataOffset{ 0U };
+			std::atomic_uint32_t indexDataOffset{ 0U };
+		};
+		static std::array<
+			AutomaticSTSReticleGeometryIdentity,
+			kMaxAutomaticSTSReticleGeometries>
+			automaticSTSReticleGeometries;
+		static std::atomic_uint32_t automaticSTSReticleGeometryCount;
+		static std::atomic_uint64_t automaticSTSReticleSetSequence;
 		static std::atomic<std::uintptr_t> automaticSTSHousingVertexBuffer;
 		static std::atomic<std::uintptr_t> automaticSTSHousingIndexBuffer;
 		static std::atomic_uint32_t automaticSTSHousingIndexCount;
@@ -366,6 +576,10 @@ namespace Hook
 		static std::atomic_uint32_t automaticSTSHousingIndexDataOffset;
 		static std::atomic_bool automaticSTSHousingGeometryReady;
 		static std::atomic_uint32_t automaticSTSScopeFadeDrawsThisFrame;
+		// Published at Present from the exact ScopeFade draw count. The game
+		// thread uses this previous-frame fact to begin optical blending only
+		// after the ScopeAiming branch is genuinely visible.
+		static std::atomic_bool automaticSTSScopeFadeVisibleLastFrame;
 		static std::atomic_uint32_t automaticSTSReticleDrawsThisFrame;
 		static std::atomic_uint32_t automaticSTSHousingDrawsThisFrame;
 		static std::atomic_uint32_t
@@ -374,6 +588,13 @@ namespace Hook
 			automaticSTSReticleInstancedDrawsThisFrame;
 		static std::atomic_uint32_t
 			automaticSTSHousingInstancedDrawsThisFrame;
+		// Geometry metadata being ready does not prove that Fallout submitted
+		// that geometry with DrawIndexed in the current frame. In particular,
+		// DrawIndexedInstanced is observed for diagnostics but is deliberately
+		// not shader-replaced. Only the exact replacement path sets this flag,
+		// so a missing or unsupported draw falls back to the fullscreen pass.
+		static std::atomic_bool
+			automaticSTSExactScopeFadeReplacementThisFrame;
 		static std::atomic_uint32_t automaticSTSDrawOrdinalThisFrame;
 		static std::atomic_uint32_t automaticSTSLastScopeFadeOrdinal;
 		static std::atomic_uint32_t automaticSTSLastReticleOrdinal;
@@ -407,17 +628,145 @@ namespace Hook
 		ComPtr<ID3D11PixelShader> m_pPixelShader_Legacy;
 		ComPtr<ID3D11PixelShader> m_pPixelShader_AutoSTS;
 		ComPtr<ID3D11GeometryShader> m_pGeometryShader_STSGeometryFill;
+		ComPtr<ID3D11PixelShader> m_pPixelShader_STSGeometryMagnify;
 		ComPtr<ID3D11PixelShader> m_pPixelShader_STSGeometryProbe;
 		ComPtr<ID3D11PixelShader> m_outPutPixelShader_Legacy;
 		ComPtr<ID3D11VertexShader> m_pVertexShader_Legacy;
+		// Compiled ScopeFade bytecode is device independent. Keeping it alive
+		// lets the exact DrawIndexed hook instantiate device children on the
+		// device returned by that draw context, which is required when ENB or
+		// another proxy exposes a different device interface than Fallout's
+		// renderer singleton.
+		ComPtr<ID3DBlob> mScopeFadeProbePixelBytecode;
+		ComPtr<ID3DBlob> mScopeFadeMagnifyPixelBytecode;
+		ComPtr<ID3DBlob> mScopeFadeFillGeometryBytecode;
+		ComPtr<ID3DBlob> mReticleLayerPixelBytecode;
+		ComPtr<ID3D11Device> mScopeFadeResourceDevice;
+		std::atomic_uint64_t mScopeFadeResourceGeneration{ 1U };
+		ComPtr<ID3D11Buffer> mScopeFadeResolutionBuffer;
+		ComPtr<ID3D11SamplerState> mScopeFadeSampler;
+		// DrawIndexed can be reached through render wrappers that expose
+		// different device interfaces over time. Serialize the exact
+		// ScopeFade substitution so a device-resource rebind cannot race a
+		// draw that is still using the previous device children.
+		std::mutex mScopeFadeGeometryMutex;
 
-		ComPtr<ID3D11Texture2D> m_pDepthStencilBuffer; 
+		struct AutomaticSTSScopeFadeReplay
+		{
+			std::uint64_t generation = 0U;
+			std::uint64_t resourceGeneration = 0U;
+			ComPtr<ID3D11VertexShader> vertexShader;
+			ComPtr<ID3D11InputLayout> inputLayout;
+			ComPtr<ID3D11Buffer> vertexBuffer;
+			ComPtr<ID3D11Buffer> indexBuffer;
+			std::array<ComPtr<ID3D11Buffer>, 3> vertexConstantBuffers;
+			UINT vertexStride = 0;
+			UINT vertexOffset = 0;
+			DXGI_FORMAT indexFormat = DXGI_FORMAT_UNKNOWN;
+			UINT indexOffset = 0;
+			UINT indexCount = 0;
+			UINT startIndexLocation = 0;
+			INT baseVertexLocation = 0;
+			D3D11_PRIMITIVE_TOPOLOGY topology =
+				D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+			bool ready = false;
+		};
+		AutomaticSTSScopeFadeReplay mAutomaticSTSScopeFadeReplay;
+
+		struct AutomaticSTSReticleReplay
+		{
+			std::uint64_t generation = 0U;
+			std::uint64_t resourceGeneration = 0U;
+			ComPtr<ID3D11VertexShader> vertexShader;
+			ComPtr<ID3D11GeometryShader> geometryShader;
+			ComPtr<ID3D11PixelShader> pixelShader;
+			ComPtr<ID3D11InputLayout> inputLayout;
+			ComPtr<ID3D11Buffer> vertexBuffer;
+			ComPtr<ID3D11Buffer> indexBuffer;
+			std::array<ComPtr<ID3D11Buffer>, 14> vertexConstantBuffers;
+			std::array<ComPtr<ID3D11Buffer>, 14> pixelConstantBuffers;
+			std::array<ComPtr<ID3D11ShaderResourceView>, 16>
+				vertexShaderResources;
+			std::array<ComPtr<ID3D11ShaderResourceView>, 16>
+				pixelShaderResources;
+			std::array<ComPtr<ID3D11SamplerState>, 16> vertexSamplers;
+			std::array<ComPtr<ID3D11SamplerState>, 16> pixelSamplers;
+			ComPtr<ID3D11RasterizerState> rasterizerState;
+			ComPtr<ID3D11BlendState> blendState;
+			ComPtr<ID3D11DepthStencilState> depthDisabledState;
+			std::array<D3D11_VIEWPORT,
+				D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE>
+				viewports{};
+			std::array<D3D11_RECT,
+				D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE>
+				scissorRects{};
+			UINT viewportCount = 0U;
+			UINT scissorCount = 0U;
+			std::array<float, 4> blendFactor{};
+			UINT sampleMask = 0xFFFFFFFFU;
+			UINT vertexStride = 0U;
+			UINT vertexOffset = 0U;
+			DXGI_FORMAT indexFormat = DXGI_FORMAT_UNKNOWN;
+			UINT indexOffset = 0U;
+			UINT indexCount = 0U;
+			UINT startIndexLocation = 0U;
+			INT baseVertexLocation = 0;
+			D3D11_PRIMITIVE_TOPOLOGY topology =
+				D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+			bool ready = false;
+		};
+		AutomaticSTSReticleReplay mAutomaticSTSReticleReplay;
+		std::mutex mAutomaticSTSReticleReplayMutex;
+
+		// The paired reticle layers contain the authored reticle draw over
+		// black and white backgrounds. Their difference describes how the
+		// original authored blend attenuates the destination, so the late
+		// composite can reproduce transparent black backing, black line work,
+		// and emissive dots without guessing the reticle texture's alpha mode.
+		// Both layers are recreated with the active render-target dimensions
+		// and format, and are valid for exactly one presented frame.
+		ComPtr<ID3D11Texture2D> mAutomaticSTSReticleLayerTexture;
+		ComPtr<ID3D11RenderTargetView> mAutomaticSTSReticleLayerRTV;
+		ComPtr<ID3D11ShaderResourceView> mAutomaticSTSReticleLayerSRV;
+		ComPtr<ID3D11Texture2D> mAutomaticSTSReticleLayerWhiteTexture;
+		ComPtr<ID3D11RenderTargetView> mAutomaticSTSReticleLayerWhiteRTV;
+		ComPtr<ID3D11ShaderResourceView> mAutomaticSTSReticleLayerWhiteSRV;
+		ComPtr<ID3D11PixelShader> m_pPixelShader_STSReticleLayer;
+		ComPtr<ID3D11BlendState> mAutomaticSTSReticleLayerCompositeBlend;
+		// After private black/white capture, replay the authored draw once with
+		// color target zero disabled. That retains its depth, stencil, and any
+		// auxiliary MRT side effects while preventing the reticle from entering
+		// the scene image that receives optical magnification.
+		ComPtr<ID3D11BlendState> mAutomaticSTSReticleSuppressionSourceBlend;
+		ComPtr<ID3D11BlendState> mAutomaticSTSReticleColorSuppressionBlend;
+		bool mAutomaticSTSReticleSuppressionSourceWasNull = false;
+		// Reticle shaders are captured twice against black and white. Replaying
+		// either authored draw against the live depth buffer must not consume or
+		// mutate depth/stencil state before the game's ordinary frame continues.
+		// Cache a write-disabled clone of the authored state while preserving all
+		// of its comparison functions and the caller's stencil reference.
+		ComPtr<ID3D11DepthStencilState>
+			mAutomaticSTSReticleLayerAuthoredDepthState;
+		ComPtr<ID3D11DepthStencilState>
+			mAutomaticSTSReticleLayerReadOnlyDepthState;
+		bool mAutomaticSTSReticleLayerAuthoredDepthWasNull = false;
+		std::mutex mAutomaticSTSReticleLayerMutex;
+		std::uint64_t mAutomaticSTSReticleLayerCaptureGeneration = 0U;
+		std::uint64_t mAutomaticSTSReticleLayerGeneration = 0U;
+		std::uint64_t mAutomaticSTSReticleLayerResourceGeneration = 0U;
+		bool mAutomaticSTSReticleLayerReady = false;
+
+		ComPtr<ID3D11Texture2D> m_pDepthStencilBuffer;
 		ComPtr<ID3D11RenderTargetView> m_pRenderTargetView;
 		ComPtr<ID3D11DepthStencilView> m_pDepthStencilView;
-		ComPtr<ID3D11SamplerState> m_pSamplerState; 
+		ComPtr<ID3D11SamplerState> m_pSamplerState;
 
-		ComPtr<ID3D11BlendState> BSAlphaToCoverage; 
-		ComPtr<ID3D11BlendState> BSTransparent; 
+		ComPtr<ID3D11BlendState> BSAlphaToCoverage;
+		ComPtr<ID3D11BlendState> BSTransparent;
+		// Exact ScopeFade replacement writes RGB without blending it over the
+		// already-rendered 1x destination, while leaving destination alpha
+		// untouched for ENB/upscaler metadata.
+		ComPtr<ID3D11BlendState> BSScopeFadeReplaceRGB;
 
 		ComPtr<ID3D11Texture2D> mTextDDS;
 		ComPtr<ID3D11Resource> mTextDDS_Res;
@@ -425,12 +774,16 @@ namespace Hook
 		ComPtr<ID3D11Texture2D> mBackBuffer;
 		ComPtr<ID3D11ShaderResourceView> mTextDDS_SRV;
 		ComPtr<ID3D11ShaderResourceView> mShaderResourceView;
-
+		// A private copy of the color target as it exists immediately before
+		// ScopeFade draws. The copy prevents the D3D11 read/write hazard that
+		// would occur if the geometry pixel shader sampled the active RTV.
+		ComPtr<ID3D11Texture2D> mScopeFadeSceneTexture;
+		ComPtr<ID3D11ShaderResourceView> mScopeFadeSceneSRV;
 
 		ScopeEffectShaderData scopeData;
 		GameConstBuffer gameConstBuffer;
 		ConstBufferData constBufferData;
-		
+
 		ComPtr<ID3D11Texture2D> mRTRenderTargetTexture;
 		ComPtr<ID3D11RenderTargetView> mRTRenderTargetView;
 		ComPtr<ID3D11ShaderResourceView> mRTShaderResourceView;

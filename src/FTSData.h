@@ -25,7 +25,7 @@ namespace ScopeData
 		float radius = 2;
 		float relativeFogRadius = 9;
 		float scopeSwayAmount = 3;
-		float maxTravel = 1;
+		float maxTravel = 4;
 	};
 
 	struct ZoomDataOverwrite
@@ -53,7 +53,7 @@ namespace ScopeData
 		float minZoom = 1.0F;
 		float maxZoom = 4.0F;
 
-		float PositionOffset[2] = {0.0F,0.0F};
+		float PositionOffset[2] = { 0.0F, 0.0F };
 		float OriPositionOffset[2] = { 0.0F, 0.0F };
 
 		float Size[2] = { 200.0F, 0.0F };
@@ -68,12 +68,37 @@ namespace ScopeData
 		// edge of the lens (higher keeps the center flat).
 		float fishEyeStrength = 0.0F;
 		float fishEyePower = 2.0F;
+		// Optional edge-only lens refraction. Strength controls the geometric
+		// displacement at the rim; width controls how far the effect reaches
+		// toward the optical center.
+		float edgeRefractionStrength = 0.0F;
+		float edgeRefractionWidth = 0.15F;
+		float edgeChromaticAberration = 0.0F;
+		// Moves the sampled scene beneath the fixed physical aperture as the
+		// eye leaves the optical axis. This is expressed in aperture radii and
+		// is separate from the exit-pupil shadow travel.
+		float sceneParallaxStrength = 0.0F;
+		// Multiplies transient ScopeFade-local eye motion before it drives the
+		// exit pupil and scene counter-shift. It does not change the settled
+		// center, so ordinary camera pitch/yaw cannot permanently offset the
+		// optic.
+		float opticalLagStrength = 1.0F;
+
+		// Optional single-pass cleanup for the automatic STS scene sample.
+		// Denoise is an edge-aware spatial blend, not temporal reconstruction;
+		// sharpen restores local contrast after magnification. Both default to
+		// zero so legacy FTS JSON retains its authored image unchanged.
+		float imageDenoise = 0.0F;
+		float imageSharpen = 0.0F;
+
+		// Independent local scale for the STS-authored 3D reticle. 1 preserves
+		// its authored size; this value never inherits scene magnification.
+		float reticleMagnification = 1.0F;
 
 		float fovAdjust = 0;
 		Parallax parallax;
 	};
 
-	
 	class FTSData
 	{
 	public:
@@ -107,15 +132,11 @@ namespace ScopeData
 		//void ReloadFTSData();
 	};
 
-
-
 	class ScopeDataHandler
 	{
 	public:
-
-
 		static ScopeDataHandler* GetSingleton();
-		
+
 		void ReloadFTSData(FTSData*);
 		void ReadDefaultScopeDataFile();
 		void ReadCustomScopeDataFiles(std::string path);
@@ -157,7 +178,6 @@ namespace ScopeData
 		std::multimap<std::string, FTSData*>* GetScopeDataMap();
 
 	private:
-		
 		bool ReadScopeData(std::string path);
 		ScopeDataHandler() = default;
 		ScopeDataHandler(const ScopeDataHandler&) = delete;
@@ -176,7 +196,7 @@ namespace ScopeData
 	private:
 		int baseRenderCount = 0;
 		int PassRenderIndex = 1;
-		
+
 		bool isUpscaler = false;
 		std::vector<std::string> files;
 		//CSimpleIniA iniForZoom;

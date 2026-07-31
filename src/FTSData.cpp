@@ -1,8 +1,9 @@
 #include "FTSData.h"
 
-#include <io.h>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <io.h>
 #include <iostream>
 
 using namespace std;
@@ -115,11 +116,24 @@ namespace ScopeData
 		ReadFloatArray(j, "OriSize", s.OriSize, { "x", "y" });
 		ReadFloatArray(j, "rectSize", s.rectSize, { "x", "y", "z", "w" });
 		ReadFloatArray(j, "reticle_Offset", s.reticle_Offset, { "x", "y" });
-		
 
 		s.ReticleSize = j.value("ReticleSize", 4.0F);
 		s.fishEyeStrength = j.value("FishEyeStrength", 0.0F);
 		s.fishEyePower = j.value("FishEyePower", 2.0F);
+		s.edgeRefractionStrength =
+			j.value("EdgeRefractionStrength", 0.0F);
+		s.edgeRefractionWidth =
+			j.value("EdgeRefractionWidth", 0.15F);
+		s.edgeChromaticAberration =
+			j.value("EdgeChromaticAberration", 0.0F);
+		s.sceneParallaxStrength =
+			j.value("SceneParallaxStrength", 0.0F);
+		s.opticalLagStrength =
+			j.value("OpticalLagStrength", 1.0F);
+		s.imageDenoise = j.value("ImageDenoise", 0.0F);
+		s.imageSharpen = j.value("ImageSharpen", 0.0F);
+		s.reticleMagnification =
+			j.value("ReticleMagnification", 1.0F);
 		s.fovAdjust = j.value("fovAdjust", 0.0F);
 		s.parallax = j.value("Parallax", Parallax());
 	}
@@ -133,8 +147,7 @@ namespace ScopeData
 		f.additionalKeywords.clear();
 		std::stringstream ss(f.additionalKeywordsStr);
 		std::string token;
-		while (getline(ss, token, ','))
-		{
+		while (getline(ss, token, ',')) {
 			const auto first = token.find_first_not_of(" \t\r\n");
 			if (first == std::string::npos) {
 				continue;
@@ -197,13 +210,21 @@ namespace ScopeData
 			{ "PositionOffset", { { "x", s.PositionOffset[0] }, { "y", s.PositionOffset[1] } } },
 			{ "OriPositionOffset", { { "x", s.OriPositionOffset[0] }, { "y", s.OriPositionOffset[1] } } },
 			{ "Size", { { "x", s.Size[0] }, { "y", s.Size[1] } } },
-			{ "OriSize", { { "x", s.OriSize[0] }, { "y",s.OriSize[1] } } },
+			{ "OriSize", { { "x", s.OriSize[0] }, { "y", s.OriSize[1] } } },
 			{ "rectSize", { { "x", s.rectSize[0] }, { "y", s.rectSize[1] }, { "z", s.rectSize[2] }, { "w", s.rectSize[3] } } },
 			{ "reticle_Offset", { { "x", s.reticle_Offset[0] }, { "y", s.reticle_Offset[1] } } },
 
 			{ "ReticleSize", s.ReticleSize },
 			{ "FishEyeStrength", s.fishEyeStrength },
 			{ "FishEyePower", s.fishEyePower },
+			{ "EdgeRefractionStrength", s.edgeRefractionStrength },
+			{ "EdgeRefractionWidth", s.edgeRefractionWidth },
+			{ "EdgeChromaticAberration", s.edgeChromaticAberration },
+			{ "SceneParallaxStrength", s.sceneParallaxStrength },
+			{ "OpticalLagStrength", s.opticalLagStrength },
+			{ "ImageDenoise", s.imageDenoise },
+			{ "ImageSharpen", s.imageSharpen },
+			{ "ReticleMagnification", s.reticleMagnification },
 			{ "fovAdjust", s.fovAdjust },
 			//
 			{ "Parallax", s.parallax }
@@ -214,8 +235,7 @@ namespace ScopeData
 	void to_json(json& j, const FTSData& f)
 	{
 		std::ostringstream oss;
-		for (int i = 0; i < f.additionalKeywords.size(); i++)
-		{
+		for (int i = 0; i < f.additionalKeywords.size(); i++) {
 			oss << f.additionalKeywords[i];
 			if (i < f.additionalKeywords.size() - 1)
 				oss << ",";
@@ -241,12 +261,10 @@ namespace ScopeData
 		};
 	}
 
-#	pragma endregion
-
+#pragma endregion
 
 	void ScopeDataHandler::TestingJson()
 	{
-		
 	}
 
 	void ScopeDataHandler::WriteCurrentFTSData()
@@ -311,10 +329,9 @@ namespace ScopeData
 
 	void ScopeDataHandler::ReloadCurrentFTSData()
 	{
-
 	}
 
-	void ScopeDataHandler::SetCurrentFTSData(FTSData* data,bool containsAllAdditionkeyword)
+	void ScopeDataHandler::SetCurrentFTSData(FTSData* data, bool containsAllAdditionkeyword)
 	{
 		currentData = data;
 		if (data)
@@ -325,7 +342,7 @@ namespace ScopeData
 	{
 		return currentData;
 	}
-	
+
 	ScopeDataHandler* ScopeDataHandler::GetSingleton()
 	{
 		static ScopeDataHandler singleton;
@@ -344,6 +361,30 @@ namespace ScopeData
 			}
 
 			const auto parsed = json::parse(input, nullptr, true, true);
+			const auto applyAutomaticOpticsDefaults =
+				[](const json& entry, FTSData& data) {
+					const auto shaderEntry = entry.find("ShaderData");
+					if (shaderEntry == entry.end() ||
+						!shaderEntry->is_object()) {
+						return;
+					}
+					// Earlier generated profiles predate scene parallax. A
+					// missing key must gain the automatic-profile default;
+					// an authored zero remains an intentional opt-out.
+					if (!shaderEntry->contains(
+							"SceneParallaxStrength")) {
+						data.shaderData.sceneParallaxStrength = 1.0F;
+					}
+					if (!std::isfinite(
+							data.shaderData.opticalLagStrength)) {
+						data.shaderData.opticalLagStrength = 1.0F;
+					}
+					data.shaderData.opticalLagStrength =
+						std::clamp(
+							data.shaderData.opticalLagStrength,
+							0.0F,
+							4.0F);
+				};
 
 			// Version 2 automatic profile file: one file per weapon, holding
 			// one entry per scope attachment under "Scopes", keyed by the
@@ -356,6 +397,7 @@ namespace ScopeData
 					auto data = std::make_unique<FTSData>(path);
 					entry.get_to(*data);
 					data->autoProfile = true;
+					applyAutomaticOpticsDefaults(entry, *data);
 					if (data->sourcePlugin.empty()) {
 						data->sourcePlugin = filePlugin;
 					}
@@ -381,6 +423,7 @@ namespace ScopeData
 
 			auto* dataPointer = data.get();
 			if (dataPointer->autoProfile && !dataPointer->sourcePlugin.empty() && dataPointer->sourceFormID != 0) {
+				applyAutomaticOpticsDefaults(parsed, *dataPointer);
 				// Legacy flat auto profile file (one weapon, one entry). Loads
 				// as the file-wide default entry; the next save rewrites the
 				// file in the per-scope container format.
@@ -410,7 +453,6 @@ namespace ScopeData
 		UpdateConfigValue("RenderPassIndex", PassRenderIndex);
 	}
 
-
 	void ScopeDataHandler::SetIsUpscaler(bool flag)
 	{
 		isUpscaler = flag;
@@ -418,7 +460,6 @@ namespace ScopeData
 
 	bool* ScopeDataHandler::GetEnableRenderThroughUI()
 	{
-		
 		return &isUpscaler;
 	}
 
@@ -515,10 +556,9 @@ namespace ScopeData
 
 	const char* ScopeDataHandler::GetNVGComboKeyStr()
 	{
-
 		const char* comboNVKeya;
 
-		if (this->comboNVKey == 160 )
+		if (this->comboNVKey == 160)
 			comboNVKeya = "Shift";
 		else if (this->comboNVKey == 161)
 			comboNVKeya = "RShift";
@@ -589,7 +629,6 @@ namespace ScopeData
 		ownedData.clear();
 		ReadCustomScopeDataFiles(path);
 		ReadDefaultScopeDataFile();
-	
 	}
 
 	FTSData* ScopeDataHandler::GetOrCreateAutoProfile(
@@ -606,8 +645,8 @@ namespace ScopeData
 
 		const auto* sourceFile = weapon->GetFile(0);
 		const auto sourcePlugin = sourceFile ?
-			std::string(sourceFile->GetFilename()) :
-			std::string("Fallout4.esm");
+		                              std::string(sourceFile->GetFilename()) :
+		                              std::string("Fallout4.esm");
 		const auto sourceFormID = sourceFile ? weapon->GetLocalFormID() : weapon->GetFormID();
 
 		// BGSZoomData is often generated instance data and can have FormID zero,
@@ -618,7 +657,24 @@ namespace ScopeData
 
 		const auto key = std::tuple{ sourcePlugin, sourceFormID, omodKey };
 		if (const auto existing = autoProfileMap.find(key); existing != autoProfileMap.end()) {
-			return existing->second;
+			auto* profile = existing->second;
+			// Upgrade only the exact former generated tuple. Values that differ
+			// are user-authored and must remain untouched.
+			if (profile &&
+				std::abs(profile->shaderData.parallax.radius - 2.65F) < 0.0001F &&
+				std::abs(profile->shaderData.parallax.relativeFogRadius - 9.0F) < 0.0001F &&
+				std::abs(profile->shaderData.parallax.scopeSwayAmount - 3.0F) < 0.0001F &&
+				std::abs(profile->shaderData.parallax.maxTravel - 1.0F) < 0.0001F) {
+				profile->shaderData.parallax.radius = 2.0F;
+				profile->shaderData.parallax.maxTravel = 4.0F;
+				if (profile->shaderData.sceneParallaxStrength == 0.0F) {
+					profile->shaderData.sceneParallaxStrength = 0.5F;
+				}
+				logger::info(
+					"Upgraded former automatic eye-box defaults for [{}]",
+					omodKey);
+			}
+			return profile;
 		}
 
 		// Builds before attachment enumeration used a generated BGSZoomData
@@ -628,8 +684,8 @@ namespace ScopeData
 		auto legacyEntry = autoProfileMap.end();
 		auto defaultEntry = autoProfileMap.end();
 		for (auto candidate = autoProfileMap.begin();
-			 candidate != autoProfileMap.end();
-			 ++candidate) {
+			candidate != autoProfileMap.end();
+			++candidate) {
 			const auto& [candidatePlugin, candidateFormID, candidateAttachment] =
 				candidate->first;
 			if (candidatePlugin != sourcePlugin ||
@@ -663,6 +719,17 @@ namespace ScopeData
 				"Migrated automatic STS profile attachment identity from [{}] to [{}]",
 				oldAttachment,
 				omodKey);
+			if (migrated &&
+				std::abs(migrated->shaderData.parallax.radius - 2.65F) < 0.0001F &&
+				std::abs(migrated->shaderData.parallax.relativeFogRadius - 9.0F) < 0.0001F &&
+				std::abs(migrated->shaderData.parallax.scopeSwayAmount - 3.0F) < 0.0001F &&
+				std::abs(migrated->shaderData.parallax.maxTravel - 1.0F) < 0.0001F) {
+				migrated->shaderData.parallax.radius = 2.0F;
+				migrated->shaderData.parallax.maxTravel = 4.0F;
+				if (migrated->shaderData.sceneParallaxStrength == 0.0F) {
+					migrated->shaderData.sceneParallaxStrength = 0.5F;
+				}
+			}
 			return migrated;
 		}
 
@@ -671,12 +738,12 @@ namespace ScopeData
 			safePlugin,
 			[](const char value) {
 				return value == '<' || value == '>' || value == ':' || value == '"' ||
-				       value == '/' || value == '\\' || value == '|' || value == '?' || value == '*';
+			           value == '/' || value == '\\' || value == '|' || value == '?' || value == '*';
 			},
 			'_');
 
 		const auto profilePath = std::filesystem::path("Data\\F4SE\\Plugins\\FTS\\Auto") /
-			std::format("{}_{:08X}.json", safePlugin, sourceFormID);
+		                         std::format("{}_{:08X}.json", safePlugin, sourceFormID);
 		auto profile = std::make_unique<FTSData>(profilePath.string());
 		profile->keywordName = std::format("AUTO_{:08X} [{}]", sourceFormID, omodKey);
 		profile->omodKey = omodKey;
@@ -699,10 +766,20 @@ namespace ScopeData
 		profile->shaderData.minZoom = std::max(1.0F, defaultMagnification);
 		profile->shaderData.maxZoom =
 			profile->shaderData.minZoom * std::max(1.0F, zoomSpread);
-		// A touch of lens distortion by default makes the magnified circle
-		// read as glass instead of a flat cutout; fully adjustable per scope.
-		profile->shaderData.fishEyeStrength = 0.35F;
+		// Keep the center optically quiet and bend only subtly toward the rim.
+		// The earlier 0.35 default visibly warped the entire image.
+		profile->shaderData.fishEyeStrength = 0.05F;
 		profile->shaderData.fishEyePower = 2.0F;
+		profile->shaderData.edgeRefractionStrength = 0.018F;
+		profile->shaderData.edgeRefractionWidth = 0.14F;
+		profile->shaderData.edgeChromaticAberration = 0.35F;
+		profile->shaderData.sceneParallaxStrength = 1.0F;
+		profile->shaderData.opticalLagStrength = 1.0F;
+		// Automatic profiles benefit from mild spatial cleanup after a large
+		// crop, followed by bounded local-contrast recovery. Explicit legacy
+		// FTS profiles retain zero defaults unless they opt in.
+		profile->shaderData.imageDenoise = 0.35F;
+		profile->shaderData.imageSharpen = 0.5F;
 		const float diameter = std::clamp(defaultDiameter, 64.0F, 2160.0F);
 		profile->shaderData.Size[0] = diameter;
 		profile->shaderData.Size[1] = diameter;
@@ -712,10 +789,10 @@ namespace ScopeData
 		// mask edge, which produces the visible dark eye-relief ring at the
 		// rim of the circle and the moving scope shadow when the view drifts
 		// off the optical axis. These are the values shipped FTS profiles use.
-		profile->shaderData.parallax.radius = 2.65F;
+		profile->shaderData.parallax.radius = 2.0F;
 		profile->shaderData.parallax.relativeFogRadius = 9.0F;
 		profile->shaderData.parallax.scopeSwayAmount = 3.0F;
-		profile->shaderData.parallax.maxTravel = 1.0F;
+		profile->shaderData.parallax.maxTravel = 4.0F;
 
 		// Automatic STS scopes replace the weapon's full-screen FOV zoom with
 		// lens-only magnification. Keep the authored camera offset so the

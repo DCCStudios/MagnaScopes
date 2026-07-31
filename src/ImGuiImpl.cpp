@@ -2,11 +2,11 @@
 #include "FTSData.h"
 #include "Settings.h"
 #include "hooking.h"
-#include <d3d11.h>
 #include <DirectXMath.h>
+#include <cmath>
+#include <d3d11.h>
+#include <mutex>
 
-
-inline void InitCurrentScopeData();
 char* _MESSAGE(const char* fmt, ...);
 
 namespace ImGuiImpl
@@ -14,7 +14,6 @@ namespace ImGuiImpl
 	std::vector<std::string> additionalKeywords;
 	int additionalKeywords_count = 0;
 	bool legacyFlag = true;
-	bool bhasSaveZoomData = false;
 
 #define LF(f) (legacyFlag ? (f) : (f) / 1000.0f)
 #define FL(f) (legacyFlag ? (f) : (f) * 1000.0f)
@@ -55,10 +54,8 @@ namespace ImGuiImpl
 	ScopeData::FTSData* currData;
 	ScopeData::ScopeDataHandler* sdh;
 
-	RE::PlayerCharacter* player;
-	RE::PlayerCamera* pcam;
 	bool bInitZoomData = false;
-	RE::TESObjectWEAP::InstanceData* Imgui_InstanceData;
+	std::atomic_bool equippedZoomDataAvailable{ false };
 
 	// Attaches a hover tooltip to the widget submitted immediately before.
 	void Tip(const char* text)
@@ -66,19 +63,13 @@ namespace ImGuiImpl
 		ImGui::SetItemTooltip("%s", text);
 	}
 
-	void RestoreOwnedZoomFields(
-		RE::BGSZoomData::Data& destination,
-		const RE::BGSZoomData::Data& source)
-	{
-		// The editor owns only sighted FOV and camera position. Preserve the
-		// overlay and image-space modifier fields maintained by Fallout.
-		destination.fovMult = source.fovMult;
-		destination.cameraOffset = source.cameraOffset;
-	}
-
 	void ImGuiImplClass::UpdateWeaponInstance(RE::TESObjectWEAP::InstanceData* instanceData)
 	{
-		Imgui_InstanceData = instanceData;
+		// Publish availability only. The renderer thread must not retain or
+		// dereference the live instance that the game thread owns.
+		equippedZoomDataAvailable.store(
+			instanceData && instanceData->zoomData,
+			std::memory_order_release);
 	}
 
 	void ImGuiImplClass::UpdateImGuiData()
@@ -93,51 +84,185 @@ namespace ImGuiImpl
 
 	namespace
 	{
+		std::mutex editorPreviewMutex;
+		EditorPreviewSnapshot editorPreview{};
+		std::mutex authoredZoomMutex;
+		AuthoredZoomSnapshot authoredZoomSnapshot{};
+		std::atomic<ProfileRequest> pendingProfileAction{
+			ProfileRequest::kNone
+		};
+		std::mutex profileSaveMutex;
+		std::unique_ptr<ScopeData::FTSData> pendingProfileSave;
+		MENU_WINDOW scopeEditorWindow = nullptr;
+		F4SEMenuFramework::Model::HudElement* scopeVisualProbe = nullptr;
+		// The popout is intended to be an interactive editor by default.
+		// Actual framework input blocking is armed only after the main panel's
+		// close sweep, so this preference cannot cause the popout to be closed.
+		std::atomic_bool captureMouseOutsidePanel{ true };
+		std::atomic_bool frameworkMenuOpen{ false };
+	}
+
+	void PublishAuthoredZoomSnapshot(
+		const ScopeData::ZoomDataOverwrite* authoredValues,
+		std::uint64_t selectionRevision)
+	{
+		std::scoped_lock lock(authoredZoomMutex);
+		authoredZoomSnapshot = {};
+		authoredZoomSnapshot.selectionRevision = selectionRevision;
+		if (authoredValues) {
+			authoredZoomSnapshot.values = *authoredValues;
+			authoredZoomSnapshot.available = true;
+		}
+	}
+
+	AuthoredZoomSnapshot GetAuthoredZoomSnapshot()
+	{
+		std::scoped_lock lock(authoredZoomMutex);
+		return authoredZoomSnapshot;
+	}
+
+	void PublishEditorPreview(
+		const ScopeData::ZoomDataOverwrite& zoomOverride,
+		std::uint64_t selectionRevision,
+		float magnification,
+		float imageDenoise,
+		float imageSharpen,
+		float fishEyeStrength,
+		float fishEyePower,
+		float edgeRefractionStrength,
+		float edgeRefractionWidth,
+		float edgeChromaticAberration,
+		float reticleMagnification,
+		float eyeBoxRadius,
+		float vignetteReach,
+		float vignetteSharpness,
+		float eyeBoxMaxTravel,
+		float sceneParallaxStrength,
+		float opticalLagStrength)
+	{
+		std::scoped_lock lock(editorPreviewMutex);
+		editorPreview.zoomOverride = zoomOverride;
+		editorPreview.selectionRevision = selectionRevision;
+		editorPreview.magnification =
+			std::clamp(magnification, 1.0F, 15.0F);
+		editorPreview.imageDenoise =
+			std::clamp(imageDenoise, 0.0F, 1.0F);
+		editorPreview.imageSharpen =
+			std::clamp(imageSharpen, 0.0F, 1.0F);
+		editorPreview.fishEyeStrength =
+			std::clamp(fishEyeStrength, 0.0F, 2.0F);
+		editorPreview.fishEyePower =
+			std::clamp(fishEyePower, 0.5F, 6.0F);
+		editorPreview.edgeRefractionStrength =
+			std::clamp(edgeRefractionStrength, 0.0F, 0.25F);
+		editorPreview.edgeRefractionWidth =
+			std::clamp(edgeRefractionWidth, 0.02F, 0.5F);
+		editorPreview.edgeChromaticAberration =
+			std::clamp(edgeChromaticAberration, 0.0F, 2.0F);
+		editorPreview.reticleMagnification =
+			std::clamp(reticleMagnification, 0.25F, 8.0F);
+		// These existing FTS profile values now also drive the physical
+		// ScopeFade pupil. Publishing copies here preserves live editing
+		// without sharing the menu-owned profile with the game/render threads.
+		editorPreview.eyeBoxRadius =
+			std::clamp(eyeBoxRadius, 0.01F, 20.0F);
+		editorPreview.vignetteReach =
+			std::clamp(vignetteReach, 1.01F, 20.0F);
+		editorPreview.vignetteSharpness =
+			std::clamp(vignetteSharpness, 0.1F, 20.0F);
+		editorPreview.eyeBoxMaxTravel =
+			std::clamp(eyeBoxMaxTravel, 0.0F, 4.0F);
+		editorPreview.sceneParallaxStrength =
+			std::clamp(sceneParallaxStrength, 0.0F, 2.0F);
+		editorPreview.opticalLagStrength =
+			std::clamp(opticalLagStrength, 0.0F, 4.0F);
+		editorPreview.active = true;
+	}
+
+	EditorPreviewSnapshot GetEditorPreviewSnapshot()
+	{
+		std::scoped_lock lock(editorPreviewMutex);
+		return editorPreview;
+	}
+
+	void ClearEditorPreview()
+	{
+		std::scoped_lock lock(editorPreviewMutex);
+		editorPreview.active = false;
+	}
+
+	void RequestProfileAction(ProfileRequest request)
+	{
+		pendingProfileAction.store(request, std::memory_order_release);
+	}
+
+	ProfileRequest ConsumeProfileAction()
+	{
+		return pendingProfileAction.exchange(
+			ProfileRequest::kNone,
+			std::memory_order_acq_rel);
+	}
+
+	void RequestProfileSave(const ScopeData::FTSData& profile)
+	{
+		std::scoped_lock lock(profileSaveMutex);
+		pendingProfileSave =
+			std::make_unique<ScopeData::FTSData>(profile);
+	}
+
+	std::unique_ptr<ScopeData::FTSData> ConsumeProfileSave()
+	{
+		std::scoped_lock lock(profileSaveMutex);
+		return std::move(pendingProfileSave);
+	}
+
+	namespace
+	{
 		// Whether the menu is currently forcing the player to hold aim.
 		bool bHoldAim = false;
 
-		void ApplyForcedAimImmediately(bool enabled)
+		void ApplyPopoutInputCapture()
 		{
-			auto* currentPlayer = RE::PlayerCharacter::GetSingleton();
-			if (!currentPlayer || !currentPlayer->currentProcess) {
+			if (!scopeEditorWindow) {
 				return;
 			}
-
-			// The original FTS editor performed this transition directly from
-			// its window handler before suppressing gameplay input. Menu
-			// Framework may freeze game updates while its blocking editor is
-			// open, so a game-thread-only request can otherwise never run.
-			currentPlayer->SetInIronSightsImpl(enabled);
-			const auto idleFormID = enabled ? 0x0004D32u : 0x0004AD9u;
-			if (auto* idle = RE::TESForm::GetFormByID<RE::TESIdleForm>(idleFormID)) {
-				currentPlayer->currentProcess->PlayIdle(*currentPlayer, idle, nullptr);
-			}
-
-			if (enabled && d3d && currData) {
-				d3d->SetScopeEffect(true);
-				d3d->EnableRender(true);
-				d3d->QueryRender(true);
-			}
+			const bool shouldCapture =
+				scopeEditorWindow->IsOpen.load(std::memory_order_acquire) &&
+				captureMouseOutsidePanel.load(std::memory_order_acquire) &&
+				!frameworkMenuOpen.load(std::memory_order_acquire);
+			scopeEditorWindow->BlockUserInput.store(
+				shouldCapture,
+				std::memory_order_release);
 		}
 
 		void SetHoldAim(bool enabled)
 		{
 			bHoldAim = enabled;
-			ApplyForcedAimImmediately(enabled);
-			pendingForcedAim.store(enabled ? 1 : 0);
+			// F4SE Menu Framework callbacks run on the renderer thread. Only
+			// publish the request here; HookedUpdate performs all player and
+			// animation work on Fallout's game thread.
+			pendingForcedAim.store(
+				enabled ? 1 : 0,
+				std::memory_order_release);
 		}
 	}
 
 	void AbandonZoomPreview()
 	{
-		// Intentionally does not restore the snapshot: the instance it was
-		// taken from no longer belongs to the equipped weapon and may be gone.
-		bhasSaveZoomData = false;
+		// The game-thread selection transaction restores its own authored
+		// baseline. Clearing this copied request is sufficient and cannot
+		// dereference an instance that was replaced during a weapon swap.
+		ClearEditorPreview();
 		// This path ends the edit session without EndEditSession, so release
 		// the forced aim here too; otherwise game input stays ignored with no
 		// menu left to turn it off.
 		if (bHoldAim) {
 			SetHoldAim(false);
+		}
+		if (scopeEditorWindow) {
+			scopeEditorWindow->BlockUserInput.store(
+				false,
+				std::memory_order_release);
 		}
 	}
 
@@ -146,13 +271,7 @@ namespace ImGuiImpl
 		if (!sdh)
 			sdh = ScopeData::ScopeDataHandler::GetSingleton();
 
-		if (!player)
-			player = RE::PlayerCharacter::GetSingleton();
-
-		if (!pcam)
-			pcam = RE::PlayerCamera::GetSingleton();
-
-		if (!sdh || !player || !pcam)
+		if (!sdh)
 			return false;
 		return true;
 	}
@@ -218,12 +337,12 @@ namespace ImGuiImpl
 
 	void ResetUIData(ImGuiImplClass* ins)
 	{
-		if (d3d && d3d->bRefreshChar) {
-			// Consume the request before re-selection. If no supported scope is
-			// equipped, leaving it set would retry initialization every frame.
-			d3d->bRefreshChar = false;
-
-			InitCurrentScopeData();
+		if (d3d && d3d->bRefreshChar.exchange(
+					   false,
+					   std::memory_order_acq_rel)) {
+			// Profile selection and live game-object access happen in
+			// HookedUpdate. The renderer thread only copies the profile that
+			// the game thread has already selected.
 			currData = sdh->GetCurrentFTSData();
 			if (!currData)
 				return;
@@ -250,10 +369,31 @@ namespace ImGuiImpl
 
 			ins->fishEyeStrength_UI = data->shaderData.fishEyeStrength;
 			ins->fishEyePower_UI = data->shaderData.fishEyePower;
+			ins->edgeRefractionStrength_UI =
+				data->shaderData.edgeRefractionStrength;
+			ins->edgeRefractionWidth_UI =
+				data->shaderData.edgeRefractionWidth;
+			ins->edgeChromaticAberration_UI =
+				data->shaderData.edgeChromaticAberration;
+			ins->imageDenoise_UI = data->shaderData.imageDenoise;
+			ins->imageSharpen_UI = data->shaderData.imageSharpen;
+			ins->reticleMagnification_UI =
+				data->shaderData.reticleMagnification;
 			ins->radius_UI = data->shaderData.parallax.radius;
 			ins->relativeFogRadius_UI = data->shaderData.parallax.relativeFogRadius;
 			ins->scopeSwayAmount_UI = data->shaderData.parallax.scopeSwayAmount;
 			ins->maxTravel_UI = data->shaderData.parallax.maxTravel;
+			ins->sceneParallaxStrength_UI =
+				data->shaderData.sceneParallaxStrength;
+			ins->opticalLagStrength_UI =
+				std::isfinite(data->shaderData.opticalLagStrength) ?
+					std::clamp(
+						data->shaderData.opticalLagStrength,
+						0.0F,
+						4.0F) :
+					1.0F;
+			ins->selectionRevision_UI =
+				GetAuthoredZoomSnapshot().selectionRevision;
 
 			ins->bEnableZMove = data->shaderData.bEnableZMove;
 			ins->bEnableNVGEffect = data->shaderData.bCanEnableNV;
@@ -275,22 +415,12 @@ namespace ImGuiImpl
 		const bool pressed = ImGui::Button("Reload Profile", { 150, 0 });
 		Tip("Discards unsaved changes and restores the values from the profile on disk.");
 		if (pressed) {
-			if (auto data = sdh->GetCurrentFTSData()) {
-				// Undo only the editor's live preview first. The selection
-				// transaction below restores the authored baseline and applies
-				// the profile loaded from disk at the correct lifecycle point.
-				if (bhasSaveZoomData && Imgui_InstanceData && Imgui_InstanceData->zoomData) {
-					RestoreOwnedZoomFields(
-						Imgui_InstanceData->zoomData->zoomData,
-						currOriZoomData);
-				}
-				bhasSaveZoomData = false;
-
-				if (!data->autoProfile || std::filesystem::exists(data->path)) {
-					sdh->ReloadFTSData(data);
-				}
-				d3d->bRefreshChar = true;
-				ResetUIData(this);
+			if (sdh->GetCurrentFTSData()) {
+				// Disk reload and selection restoration are game-thread work.
+				// Clear the copied preview now, then let HookedUpdate reload,
+				// restore the authored baseline, and republish UI values.
+				ClearEditorPreview();
+				RequestProfileAction(ProfileRequest::kReload);
 			}
 		}
 	}
@@ -301,70 +431,82 @@ namespace ImGuiImpl
 		Tip("Writes the current values to the profile file so they persist.\n"
 			"Automatic scopes save a new profile under Data/F4SE/Plugins/FTS/Auto.");
 		if (pressed) {
-			bIsSaving = true;
+			bIsSaving.store(true, std::memory_order_release);
 			currData = sdh->GetCurrentFTSData();
-			if (!currData || !Imgui_InstanceData || !Imgui_InstanceData->zoomData) {
-				bIsSaving = false;
-				logger::error("Scope settings were not saved because the weapon instance is unavailable");
+			if (!currData) {
+				bIsSaving.store(false, std::memory_order_release);
+				logger::error(
+					"Scope settings were not saved because no profile is selected");
 				return;
 			}
-			currData->legacyMode = bLegacyMode;
+			// Build a detached value snapshot. HookedUpdate validates its
+			// profile identity, applies it to the selected profile, writes the
+			// JSON, and reselects the weapon entirely on the game thread.
+			auto editedProfile = *currData;
+			editedProfile.legacyMode = bLegacyMode;
 			Hook::D3D::bLegacyMode = bLegacyMode;
 
-			currData->UsingSTS = UsingSTS_UI;
-			currData->scopeFrame = scopeFrame_UI;
-			currData->shaderData.IsCircle = IsCircle_UI;
-			currData->shaderData.bCanEnableNV = bEnableNVGEffect;
-			currData->shaderData.baseWeaponPos = baseWeaponPos_UI;
-			currData->shaderData.bEnableZMove = bEnableZMove;
-			currData->shaderData.movePercentage = MovePercentage_UI;
-			currData->shaderData.camDepth = camDepth_UI;
-			currData->shaderData.ReticleSize = ReticleSize_UI;
-			currData->shaderData.minZoom = minZoom_UI;
-			currData->shaderData.maxZoom = maxZoom_UI;
-			currData->shaderData.reticle_Offset[0] = reticle_Offset[0];
-			currData->shaderData.reticle_Offset[1] = reticle_Offset[1];
-			currData->shaderData.PositionOffset[0] = PositionOffset_UI[0];
-			currData->shaderData.PositionOffset[1] = PositionOffset_UI[1];
-			currData->shaderData.OriPositionOffset[0] = OriPositionOffset_UI[0];
-			currData->shaderData.OriPositionOffset[1] = OriPositionOffset_UI[1];
-			currData->shaderData.Size[0] = Size_UI[0];
-			currData->shaderData.Size[1] = Size_UI[1];
-			currData->shaderData.OriSize[0] = OriSize_UI[0];
-			currData->shaderData.OriSize[1] = OriSize_UI[1];
-			currData->shaderData.fishEyeStrength = fishEyeStrength_UI;
-			currData->shaderData.fishEyePower = fishEyePower_UI;
-			currData->shaderData.parallax.radius = radius_UI;
-			currData->shaderData.parallax.relativeFogRadius = relativeFogRadius_UI;
-			currData->shaderData.parallax.scopeSwayAmount = scopeSwayAmount_UI;
-			currData->shaderData.parallax.maxTravel = maxTravel_UI;
-			currData->shaderData.bBoltDisable = bDisableWhileBolt;
-			currData->shaderData.nvIntensity = nvIntensity_UI;
-			currData->shaderData.fovAdjust = fovBase_UI;
+			editedProfile.UsingSTS = UsingSTS_UI;
+			editedProfile.scopeFrame = scopeFrame_UI;
+			editedProfile.shaderData.IsCircle = IsCircle_UI;
+			editedProfile.shaderData.bCanEnableNV = bEnableNVGEffect;
+			editedProfile.shaderData.baseWeaponPos = baseWeaponPos_UI;
+			editedProfile.shaderData.bEnableZMove = bEnableZMove;
+			editedProfile.shaderData.movePercentage = MovePercentage_UI;
+			editedProfile.shaderData.camDepth = camDepth_UI;
+			editedProfile.shaderData.ReticleSize = ReticleSize_UI;
+			editedProfile.shaderData.minZoom = minZoom_UI;
+			editedProfile.shaderData.maxZoom = maxZoom_UI;
+			editedProfile.shaderData.reticle_Offset[0] = reticle_Offset[0];
+			editedProfile.shaderData.reticle_Offset[1] = reticle_Offset[1];
+			editedProfile.shaderData.PositionOffset[0] = PositionOffset_UI[0];
+			editedProfile.shaderData.PositionOffset[1] = PositionOffset_UI[1];
+			editedProfile.shaderData.OriPositionOffset[0] = OriPositionOffset_UI[0];
+			editedProfile.shaderData.OriPositionOffset[1] = OriPositionOffset_UI[1];
+			editedProfile.shaderData.Size[0] = Size_UI[0];
+			editedProfile.shaderData.Size[1] = Size_UI[1];
+			editedProfile.shaderData.OriSize[0] = OriSize_UI[0];
+			editedProfile.shaderData.OriSize[1] = OriSize_UI[1];
+			editedProfile.shaderData.fishEyeStrength = fishEyeStrength_UI;
+			editedProfile.shaderData.fishEyePower = fishEyePower_UI;
+			editedProfile.shaderData.edgeRefractionStrength =
+				edgeRefractionStrength_UI;
+			editedProfile.shaderData.edgeRefractionWidth =
+				edgeRefractionWidth_UI;
+			editedProfile.shaderData.edgeChromaticAberration =
+				edgeChromaticAberration_UI;
+			editedProfile.shaderData.imageDenoise = imageDenoise_UI;
+			editedProfile.shaderData.imageSharpen = imageSharpen_UI;
+			editedProfile.shaderData.reticleMagnification =
+				reticleMagnification_UI;
+			editedProfile.shaderData.parallax.radius = radius_UI;
+			editedProfile.shaderData.parallax.relativeFogRadius = relativeFogRadius_UI;
+			editedProfile.shaderData.parallax.scopeSwayAmount = scopeSwayAmount_UI;
+			editedProfile.shaderData.parallax.maxTravel = maxTravel_UI;
+			editedProfile.shaderData.sceneParallaxStrength =
+				sceneParallaxStrength_UI;
+			editedProfile.shaderData.opticalLagStrength =
+				std::isfinite(opticalLagStrength_UI) ?
+					std::clamp(opticalLagStrength_UI, 0.0F, 4.0F) :
+					1.0F;
+			editedProfile.shaderData.bBoltDisable = bDisableWhileBolt;
+			editedProfile.shaderData.nvIntensity = nvIntensity_UI;
+			editedProfile.shaderData.fovAdjust = fovBase_UI;
 
-			currData->shaderData.rectSize[0] = Size_rect_UI[0];
-			currData->shaderData.rectSize[1] = Size_rect_UI[1];
-			currData->shaderData.rectSize[2] = Size_rect_UI[2];
-			currData->shaderData.rectSize[3] = Size_rect_UI[3];
+			editedProfile.shaderData.rectSize[0] = Size_rect_UI[0];
+			editedProfile.shaderData.rectSize[1] = Size_rect_UI[1];
+			editedProfile.shaderData.rectSize[2] = Size_rect_UI[2];
+			editedProfile.shaderData.rectSize[3] = Size_rect_UI[3];
 
 			// The override editor works on Imgui_ZDO directly; the live weapon
 			// only mirrors it as a preview, so save the editor values.
-			currData->zoomDataOverwrite = Imgui_ZDO;
+			editedProfile.zoomDataOverwrite = Imgui_ZDO;
 
-			currData->additionalKeywords = additionalKeywords;
+			editedProfile.additionalKeywords = additionalKeywords;
 
-			sdh->SetCurrentFTSData(currData);
-			sdh->WriteCurrentFTSData();
+			RequestProfileSave(editedProfile);
 
-			// Re-select immediately so the saved override becomes the live
-			// persisted state, then repopulate every editor field from that
-			// state. The old ordering called ResetUIData before setting this
-			// flag, so the refresh was silently skipped.
-			d3d->bRefreshChar = true;
-			bhasSaveZoomData = false;
-			ResetUIData(this);
-
-			bIsSaving = false;
+			bIsSaving.store(false, std::memory_order_release);
 		}
 	}
 
@@ -374,7 +516,7 @@ namespace ImGuiImpl
 
 		scopeData.ScopeEffect_Offset = { LF(PositionOffset_UI[0]), LF(PositionOffset_UI[1]) };
 
-		scopeData.ScopeEffect_OriPositionOffset = {  LF(OriPositionOffset_UI[0]),  LF(OriPositionOffset_UI[1]) };
+		scopeData.ScopeEffect_OriPositionOffset = { LF(OriPositionOffset_UI[0]), LF(OriPositionOffset_UI[1]) };
 		scopeData.ScopeEffect_Size = { LF(Size_UI[0]), LF(Size_UI[1]) };
 		scopeData.ScopeEffect_OriSize = { OriSize_UI[0], OriSize_UI[1] };
 
@@ -437,8 +579,7 @@ namespace ImGuiImpl
 
 		ImGui::Spacing();
 
-		if (ImGui::TreeNode("Additional Keywords"))
-		{
+		if (ImGui::TreeNode("Additional Keywords")) {
 			ImGui::TextWrapped(
 				"This profile only activates when the player also has every keyword "
 				"listed here. Use it to bind a profile to one specific scope "
@@ -478,12 +619,12 @@ namespace ImGuiImpl
 
 		ImGui::Spacing();
 
-		// The sliders edit the profile's override values (Imgui_ZDO), not the
-		// live weapon directly. The edited values are pushed onto the weapon
-		// every frame as a preview; the snapshot taken on enable restores the
-		// weapon when the override is unchecked or the menu closes unsaved.
-		const bool overrideToggled =
-			ImGui::Checkbox("Override Sighted Zoom and Camera", &Imgui_ZDO.enableZoomDateOverwrite);
+		// These controls edit only copied profile data. RenderImgui publishes
+		// the complete preview after every section, and HookedUpdate applies
+		// it to the selected BGSZoomData from the game thread.
+		ImGui::Checkbox(
+			"Override Sighted Zoom and Camera",
+			&Imgui_ZDO.enableZoomDateOverwrite);
 		const bool overridesAllowed =
 			MagnaScope::GetSettings().AllowsOverrides();
 		if (!overridesAllowed) {
@@ -494,33 +635,35 @@ namespace ImGuiImpl
 			"and are stored with Save Profile.\n"
 			"Warning: lowering the FOV multiplier on a tube scope can leave the\n"
 			"camera inside the scope model, which shows up as a black screen.");
-		if (!overridesAllowed)
-		{
+		if (!overridesAllowed) {
 			ImGui::TextDisabled(
 				"Override preview is disabled by the current verification stage.");
+		} else {
+			const auto authoredZoom = GetAuthoredZoomSnapshot();
+			const bool authoredZoomMatchesSelection =
+				authoredZoom.available &&
+				authoredZoom.selectionRevision == selectionRevision_UI;
+			if (!authoredZoomMatchesSelection) {
+				ImGui::BeginDisabled();
+			}
+			if (ImGui::Button("Use Authored Zoom Data")) {
+				// Copy only the fields that Fallout actually stores in
+				// BGSZoomData. Lens-only magnification remains independent.
+				Imgui_ZDO.fovMul = authoredZoom.values.fovMul;
+				Imgui_ZDO.x = authoredZoom.values.x;
+				Imgui_ZDO.y = authoredZoom.values.y;
+				Imgui_ZDO.z = authoredZoom.values.z;
+				Imgui_ZDO.enableZoomDateOverwrite = true;
+			}
+			Tip("Copies the selected scope's pre-MagnaScope FOV multiplier and\n"
+				"camera X/Y/Z offset as an editable starting point. Fallout's\n"
+				"BGSZoomData has no camera rotation fields, so none are copied.");
+			if (!authoredZoomMatchesSelection) {
+				ImGui::EndDisabled();
+			}
 		}
-		else if (Imgui_ZDO.enableZoomDateOverwrite)
-		{
-			if (Imgui_InstanceData && Imgui_InstanceData->zoomData)
-			{
-				auto& liveZoom = Imgui_InstanceData->zoomData->zoomData;
-
-				if (!bhasSaveZoomData)
-				{
-					currOriZoomData = liveZoom;
-					bhasSaveZoomData = true;
-				}
-
-				if (overrideToggled)
-				{
-					// Just switched on: start editing from the weapon's own
-					// values so nothing jumps.
-					Imgui_ZDO.fovMul = liveZoom.fovMult;
-					Imgui_ZDO.x = liveZoom.cameraOffset.x;
-					Imgui_ZDO.y = liveZoom.cameraOffset.y;
-					Imgui_ZDO.z = liveZoom.cameraOffset.z;
-				}
-
+		if (overridesAllowed && Imgui_ZDO.enableZoomDateOverwrite) {
+			if (equippedZoomDataAvailable.load(std::memory_order_acquire)) {
 				ImGui::DragFloat("FOV Multiplier", &Imgui_ZDO.fovMul, 0.01F, 0, 30, "%.3f");
 				Tip("The weapon's sighted zoom strength. Lower values zoom the whole\n"
 					"first-person view in further while aiming.");
@@ -546,38 +689,19 @@ namespace ImGuiImpl
 				// circle zoom can be rebalanced right where the game zoom is
 				// being overridden. Shares its value with the Magnification
 				// slider under Magnified Image.
-				if (ImGui::DragFloat("Scope Magnification", &minZoom_UI, 0.01F, 1.0F, 15.0F, "%.2fx")) {
-					d3d->SetZoom(minZoom_UI);
-				}
+				ImGui::DragFloat(
+					"Scope Magnification",
+					&minZoom_UI,
+					0.01F,
+					1.0F,
+					15.0F,
+					"%.2fx");
 				Tip("Magnification inside the scope circle. Raise it to compensate\n"
 					"when you lower the FOV multiplier above, so the scope keeps its\n"
 					"optical zoom while the rest of the screen stays wide.");
-
-				// Live preview: push the edited values onto the weapon.
-				liveZoom.fovMult = Imgui_ZDO.fovMul;
-				if (cameraOverrideAllowed) {
-					liveZoom.cameraOffset = {
-						Imgui_ZDO.x,
-						Imgui_ZDO.y,
-						Imgui_ZDO.z
-					};
-				}
-			}
-			else
-			{
+			} else {
 				ImGui::TextWrapped("The equipped weapon has no zoom data to override.");
 			}
-		}
-		else if (bhasSaveZoomData)
-		{
-			// Just switched off: put the weapon back the way it was.
-			if (Imgui_InstanceData && Imgui_InstanceData->zoomData)
-			{
-				RestoreOwnedZoomFields(
-					Imgui_InstanceData->zoomData->zoomData,
-					currOriZoomData);
-			}
-			bhasSaveZoomData = false;
 		}
 	}
 
@@ -594,9 +718,13 @@ namespace ImGuiImpl
 
 			ImGui::Spacing();
 
-			if (ImGui::DragFloat("Magnification", &minZoom_UI, 0.01F, 1.0F, 15.0F, "%.2fx")) {
-				d3d->SetZoom(minZoom_UI);
-			}
+			ImGui::DragFloat(
+				"Magnification",
+				&minZoom_UI,
+				0.01F,
+				1.0F,
+				15.0F,
+				"%.2fx");
 			Tip("Magnification inside the scope when you start aiming. For automatic\n"
 				"STS scopes this stacks on top of the scope's own zoom.\n"
 				"Previews live while aiming in edit mode.");
@@ -612,6 +740,52 @@ namespace ImGuiImpl
 			Tip("How sharply the bend ramps up toward the edge of the lens.\n"
 				"Higher values keep the center flat and push the distortion\n"
 				"out to the rim.");
+			ImGui::DragFloat(
+				"Edge Refraction Strength",
+				&edgeRefractionStrength_UI,
+				0.001F,
+				0.0F,
+				0.25F,
+				"%.3f");
+			Tip("Adds a subtle glass-like radial displacement only near the\n"
+				"edge of the lens. 0 disables the effect.");
+			ImGui::DragFloat(
+				"Edge Refraction Width",
+				&edgeRefractionWidth_UI,
+				0.005F,
+				0.02F,
+				0.5F,
+				"%.3f");
+			Tip("Controls how far the edge-refraction band reaches toward the\n"
+				"center. Smaller values confine it more tightly to the rim.");
+			ImGui::DragFloat(
+				"Edge Chromatic Aberration",
+				&edgeChromaticAberration_UI,
+				0.01F,
+				0.0F,
+				2.0F,
+				"%.2f");
+			Tip("Separates red and blue by a bounded number of source pixels\n"
+				"inside the refracted rim. 0 disables color separation.");
+			ImGui::DragFloat(
+				"Edge-Aware Cleanup",
+				&imageDenoise_UI,
+				0.01F,
+				0.0F,
+				1.0F,
+				"%.2f");
+			Tip("Blends nearby samples only when their colors are similar.\n"
+				"This can soften magnification shimmer without smearing strong\n"
+				"edges. It cannot reconstruct detail missing from the frame.");
+			ImGui::DragFloat(
+				"Image Sharpen",
+				&imageSharpen_UI,
+				0.01F,
+				0.0F,
+				1.0F,
+				"%.2f");
+			Tip("Restores local contrast after magnification or cleanup.\n"
+				"High values can emphasize halos and temporal artifacts.");
 
 			ImGui::Spacing();
 
@@ -622,8 +796,7 @@ namespace ImGuiImpl
 			Tip("Moves the magnified area on screen, in 1080p reference pixels from\n"
 				"the scope's center. Use it to line the circle up with the lens.");
 
-			if (bLegacyMode)
-			{
+			if (bLegacyMode) {
 				ImGui::DragFloat2("Circle Size", Size_UI, 1.0F, 0, 3840, "%.4f");
 				Tip("Diameter of the magnified circle, in 1080p reference pixels.");
 			} else {
@@ -653,6 +826,18 @@ namespace ImGuiImpl
 				"Has no effect when the profile ships without a reticle texture.");
 			ImGui::DragFloat2("Reticle Offset", reticle_Offset, 0.01F, -1000.0F, 1000.0F);
 			Tip("Moves the reticle texture inside the magnified area.");
+			if (currData && currData->autoProfile) {
+				ImGui::DragFloat(
+					"STS Reticle Magnification",
+					&reticleMagnification_UI,
+					0.01F,
+					0.25F,
+					8.0F,
+					"%.2fx");
+				Tip("Scales the STS-authored 3D reticle around its own geometric\n"
+					"vertex center. 1.00x preserves the authored size and remains\n"
+					"independent of scene magnification.");
+			}
 		}
 
 		if (ImGui::CollapsingHeader("Effects")) {
@@ -688,16 +873,56 @@ namespace ImGuiImpl
 		if (ImGui::CollapsingHeader("Eye Box and Vignette")) {
 			ImGui::DragFloat("Eye Box Radius", &radius_UI, 0.01F, 0, 20);
 			Tip("How far your eye can wander from the scope's axis before the image\n"
-				"starts to fog out. Larger values are more forgiving.");
+				"starts to fog out, measured relative to the detected ScopeFade\n"
+				"aperture. Larger values are more forgiving.");
 			ImGui::DragFloat("Vignette Reach", &relativeFogRadius_UI, 0.01F, 0, 20);
 			Tip("How far the dark vignette reaches into the image from the edge.\n"
 				"Higher values darken the scope edge sooner.");
 			ImGui::DragFloat("Vignette Sharpness", &scopeSwayAmount_UI, 0.01F, 0, 20);
 			Tip("How abruptly the image transitions into the dark edge.\n"
 				"Higher values give a harder edge.");
-			ImGui::DragFloat("Maximum Brightness", &maxTravel_UI, 0.01F, 0, 20);
-			Tip("Brightness cap for the magnified image. 1.0 shows the scene at full\n"
-				"brightness; lower values tint the whole scope darker.");
+			if (currData && currData->autoProfile) {
+				ImGui::DragFloat(
+					"Maximum Eye Travel",
+					&maxTravel_UI,
+					0.01F,
+					0.0F,
+					4.0F);
+				Tip("Clamps how far the measured exit pupil can move across the\n"
+					"ScopeFade aperture during sway, recoil, or weapon inertia.");
+			} else {
+				// Preserve the original FTS control and JSON meaning for
+				// explicit profiles. Automatic STS profiles reinterpret this
+				// scalar only inside their physical ScopeFade shader.
+				ImGui::DragFloat(
+					"Maximum Brightness",
+					&maxTravel_UI,
+					0.01F,
+					0.0F,
+					20.0F);
+				Tip("Brightness cap for the magnified image. 1.0 shows the scene at full\n"
+					"brightness; lower values tint the whole scope darker.");
+			}
+			ImGui::DragFloat(
+				"Scene Parallax Strength",
+				&sceneParallaxStrength_UI,
+				0.01F,
+				0.0F,
+				2.0F,
+				"%.2f");
+			Tip("Moves the magnified scene beneath the fixed ScopeFade aperture as\n"
+				"the eye leaves the optical axis. The visible scene shift is capped\n"
+				"separately from Maximum Eye Travel to remain stable during recoil.");
+			ImGui::DragFloat(
+				"Optical Lag Strength",
+				&opticalLagStrength_UI,
+				0.01F,
+				0.0F,
+				4.0F,
+				"%.2f");
+			Tip("Scales transient weapon-motion response for both the exit-pupil\n"
+				"shadow and scene counter-shift. 0 disables motion lag, 1 uses\n"
+				"the measured movement, and higher values exaggerate it.");
 		}
 	}
 
@@ -748,22 +973,16 @@ namespace ImGuiImpl
 
 		ImGui::Spacing();
 
-		if (ImGui::Checkbox("Edit Mode", &Hook::D3D::bEnableEditMode) &&
-			!Hook::D3D::bEnableEditMode) {
-			// Leaving edit mode without saving: revert the zoom preview and
-			// reload the on-screen effect from the stored profile values.
-			if (bhasSaveZoomData && Imgui_InstanceData && Imgui_InstanceData->zoomData) {
-				RestoreOwnedZoomFields(
-					Imgui_InstanceData->zoomData->zoomData,
-					instance->currOriZoomData);
-				bhasSaveZoomData = false;
-			}
-			if (d3d) {
-				d3d->bRefreshChar = true;
-				ResetUIData(instance);
-				if (currData) {
-					instance->MapScopeShaderEffect();
-				}
+		bool editMode =
+			Hook::D3D::bEnableEditMode.load(std::memory_order_acquire);
+		if (ImGui::Checkbox("Edit Mode", &editMode)) {
+			Hook::D3D::bEnableEditMode.store(
+				editMode,
+				std::memory_order_release);
+			if (!editMode) {
+				// HookedUpdate observes the cleared request, restores the
+				// stored profile override, and republishes magnification.
+				ClearEditorPreview();
 			}
 		}
 		Tip("Live-preview changes on the equipped scope while you aim.\n"
@@ -778,7 +997,7 @@ namespace ImGuiImpl
 			"Game controls are suspended while this is on. Released\n"
 			"automatically when the menu closes.");
 
-		if (!Hook::D3D::bEnableEditMode) {
+		if (!editMode) {
 			ImGui::TextWrapped("Enable Edit Mode to preview and save changes for the equipped scope.");
 			ImGui::PopItemWidth();
 			return;
@@ -793,15 +1012,30 @@ namespace ImGuiImpl
 		instance->ShaderDataSection();
 		instance->ParallaxDataSection();
 		instance->MapScopeShaderEffect();
+		PublishEditorPreview(
+			instance->Imgui_ZDO,
+			instance->selectionRevision_UI,
+			instance->minZoom_UI,
+			instance->imageDenoise_UI,
+			instance->imageSharpen_UI,
+			instance->fishEyeStrength_UI,
+			instance->fishEyePower_UI,
+			instance->edgeRefractionStrength_UI,
+			instance->edgeRefractionWidth_UI,
+			instance->edgeChromaticAberration_UI,
+			instance->reticleMagnification_UI,
+			instance->radius_UI,
+			instance->relativeFogRadius_UI,
+			instance->scopeSwayAmount_UI,
+			instance->maxTravel_UI,
+			instance->sceneParallaxStrength_UI,
+			instance->opticalLagStrength_UI);
 
 		ImGui::PopItemWidth();
 	}
 
 	namespace
 	{
-		MENU_WINDOW scopeEditorWindow = nullptr;
-		F4SEMenuFramework::Model::HudElement* scopeVisualProbe = nullptr;
-
 		void __stdcall RenderScopeVisualProbe()
 		{
 			const auto& settings = MagnaScope::GetSettings();
@@ -902,23 +1136,22 @@ namespace ImGuiImpl
 		// effect from the stored profile values.
 		void EndEditSession()
 		{
-			Hook::D3D::bEnableEditMode = false;
+			if (scopeEditorWindow) {
+				scopeEditorWindow->BlockUserInput.store(
+					false,
+					std::memory_order_release);
+			}
+			Hook::D3D::bEnableEditMode.store(
+				false,
+				std::memory_order_release);
+			ClearEditorPreview();
 			if (bHoldAim) {
 				SetHoldAim(false);
 			}
-			auto* instance = ImGuiImplClass::GetSington();
-			if (bhasSaveZoomData && Imgui_InstanceData && Imgui_InstanceData->zoomData) {
-				RestoreOwnedZoomFields(
-					Imgui_InstanceData->zoomData->zoomData,
-					instance->currOriZoomData);
-				bhasSaveZoomData = false;
-			}
 			if (d3d) {
-				d3d->bRefreshChar = true;
-				ResetUIData(instance);
-				if (currData) {
-					instance->MapScopeShaderEffect();
-				}
+				// Selection restoration is requested rather than executed
+				// from this renderer-thread callback.
+				RequestProfileAction(ProfileRequest::kReselect);
 			}
 		}
 
@@ -926,19 +1159,34 @@ namespace ImGuiImpl
 		{
 			if (type == F4SEMenuFramework::Events::kBeforeRender) {
 				Hook::D3D::GetSington()->RenderFromFramework();
-			} else if (type == F4SEMenuFramework::Events::kCloseMenu) {
-				// Hold Aim blocks the game's keyboard/mouse processing while
-				// it is active. Whatever else happens on menu close, that
-				// block must lift now; with the panel gone there is no
-				// interactive UI left to turn it off.
-				if (bHoldAim) {
-					SetHoldAim(false);
+			} else if (type == F4SEMenuFramework::Events::kOpenMenu) {
+				frameworkMenuOpen.store(true, std::memory_order_release);
+				// WindowManager closes every blocking plugin window before it
+				// dispatches kCloseMenu. Keep the popout nonblocking while the
+				// main panel owns input so it survives that close sweep.
+				if (scopeEditorWindow) {
+					scopeEditorWindow->BlockUserInput.store(
+						false,
+						std::memory_order_release);
 				}
+			} else if (type == F4SEMenuFramework::Events::kCloseMenu) {
+				frameworkMenuOpen.store(false, std::memory_order_release);
 				// The editor popout is a non-pausing window that survives the
-				// Mod Control Panel, so dismissing the panel while the popout
-				// is open keeps the edit session and its live preview alive.
+				// Mod Control Panel. Arm mouse capture only after the
+				// framework's blocking-window close sweep has completed.
 				if (scopeEditorWindow && scopeEditorWindow->IsOpen.load()) {
+					ApplyPopoutInputCapture();
+					if (!captureMouseOutsidePanel.load(
+							std::memory_order_acquire) &&
+						bHoldAim) {
+						SetHoldAim(false);
+					}
 					return;
+				}
+				if (scopeEditorWindow) {
+					scopeEditorWindow->BlockUserInput.store(
+						false,
+						std::memory_order_release);
 				}
 				EndEditSession();
 			}
@@ -985,11 +1233,40 @@ namespace ImGuiImpl
 	{
 		bool popoutOpen = scopeEditorWindow && scopeEditorWindow->IsOpen.load();
 		if (ImGui::Checkbox("Open controls in popout window", &popoutOpen) && scopeEditorWindow) {
-			scopeEditorWindow->IsOpen.store(popoutOpen);
+			if (!popoutOpen) {
+				scopeEditorWindow->BlockUserInput.store(
+					false,
+					std::memory_order_release);
+				scopeEditorWindow->IsOpen.store(
+					false,
+					std::memory_order_release);
+			} else {
+				// Keep the popout nonblocking until the framework has finished
+				// its close sweep. kCloseMenu then applies the user's capture
+				// preference without the framework mistaking this persistent
+				// editor for a blocking window that must also be closed.
+				scopeEditorWindow->BlockUserInput.store(
+					false,
+					std::memory_order_release);
+				scopeEditorWindow->IsOpen.store(
+					true,
+					std::memory_order_release);
+				if (!F4SEMenuFramework::CloseMenu()) {
+					// Older framework builds do not export CloseMenu. The
+					// popout remains open and nonblocking, and the user can
+					// close the main panel normally without a crash.
+					static std::once_flag loggedMissingCloseMenu;
+					std::call_once(loggedMissingCloseMenu, [] {
+						logger::warn(
+							"F4SE Menu Framework does not export CloseMenu; "
+							"close its main panel manually to use the popout");
+					});
+				}
+			}
 		}
 		Tip("Moves these controls into a movable, resizable window that stays on\n"
-			"screen after this menu closes, so you can watch changes while aiming.\n"
-			"Reopen this menu (same hotkey) when you need the mouse to adjust it.");
+			"screen while aiming. Newer F4SE Menu Framework builds close the\n"
+			"main panel automatically when this popout opens.");
 		if (!scopeEditorWindow) {
 			ImGui::TextWrapped("The popout window is unavailable.");
 		}
@@ -1005,29 +1282,56 @@ namespace ImGuiImpl
 	{
 		auto* viewport = ImGui::GetMainViewport();
 		if (viewport) {
+			const float defaultWidth = std::clamp(
+				viewport->Size.x * 0.30F,
+				360.0F,
+				500.0F);
+			const float defaultHeight = std::clamp(
+				viewport->Size.y * 0.72F,
+				420.0F,
+				720.0F);
 			ImGui::SetNextWindowPos(
-				{ viewport->Pos.x + viewport->Size.x * 0.5F, viewport->Pos.y + viewport->Size.y * 0.5F },
-				ImGui::ImGuiCond_Appearing,
-				{ 0.5F, 0.5F });
+				{ viewport->Pos.x + 20.0F, viewport->Pos.y + 20.0F },
+				ImGui::ImGuiCond_FirstUseEver,
+				{ 0.0F, 0.0F });
 			ImGui::SetNextWindowSize(
-				{ viewport->Size.x * 0.65F, viewport->Size.y * 0.75F },
-				ImGui::ImGuiCond_Appearing);
+				{ defaultWidth, defaultHeight },
+				ImGui::ImGuiCond_FirstUseEver);
 		}
 
 		if (ImGui::Begin("Scope Customization##MagnaScope", nullptr, ImGui::ImGuiWindowFlags_NoCollapse)) {
 			if (ImGui::Button("Close") && scopeEditorWindow) {
+				scopeEditorWindow->BlockUserInput.store(
+					false,
+					std::memory_order_release);
 				scopeEditorWindow->IsOpen.store(false);
 				// With the Mod Control Panel also closed there is nothing
 				// left to edit from, so end the session and revert any
 				// unsaved preview.
-				if (!F4SEMenuFramework::IsAnyBlockingWindowOpened()) {
+				if (!frameworkMenuOpen.load(std::memory_order_acquire)) {
 					EndEditSession();
 				}
 			}
+			bool captureMouse =
+				captureMouseOutsidePanel.load(std::memory_order_acquire);
+			if (ImGui::Checkbox(
+					"Capture mouse when main menu is closed",
+					&captureMouse)) {
+				captureMouseOutsidePanel.store(
+					captureMouse,
+					std::memory_order_release);
+				ApplyPopoutInputCapture();
+				if (!captureMouse && bHoldAim) {
+					SetHoldAim(false);
+				}
+			}
+			Tip("When enabled, this popout captures the mouse and blocks game\n"
+				"input after the main F4SE Menu Framework panel closes, so its\n"
+				"controls remain interactive. Enable Hold Aim to remain sighted.\n"
+				"Uncheck this to return mouse control to the game.");
 			ImGui::Separator();
 			ImGuiImplClass::GetSington()->RenderImgui();
 		}
 		ImGui::End();
 	}
 }
-
