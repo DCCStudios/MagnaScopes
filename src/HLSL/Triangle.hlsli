@@ -51,6 +51,11 @@ cbuffer ResolutionConstantData : register(b4){
 	float SCOPE_VIGNETTE_REACH;
 	float SCOPE_VIGNETTE_SHARPNESS;
 	float SCOPE_EYEBOX_MAX_TRAVEL;
+
+	float SCOPE_RETICLE_SIZE;
+	float SCOPE_RETICLE_OFFSET_X;
+	float SCOPE_RETICLE_OFFSET_Y;
+	float SCOPE_RETICLE_PADDING;
 };
 
 cbuffer ScopeEffectData : register(b5)

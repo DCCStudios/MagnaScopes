@@ -2084,6 +2084,18 @@ namespace Hook
 				std::memory_order_acquire),
 			0.25F,
 			8.0F);
+		resolution.reticleSize = std::clamp(
+			scopeReticleSize.load(std::memory_order_acquire),
+			0.01F,
+			128.0F);
+		resolution.reticleOffsetX = std::clamp(
+			scopeReticleOffsetX.load(std::memory_order_acquire),
+			-1000.0F,
+			1000.0F);
+		resolution.reticleOffsetY = std::clamp(
+			scopeReticleOffsetY.load(std::memory_order_acquire),
+			-1000.0F,
+			1000.0F);
 		D3D11_MAPPED_SUBRESOURCE mapped{};
 		const HRESULT mapResult = context->Map(
 			mScopeFadeResolutionBuffer.Get(),
@@ -6610,6 +6622,9 @@ namespace Hook
 	std::atomic<float> D3D::scopeEdgeRefractionWidth{ 0.15F };
 	std::atomic<float> D3D::scopeEdgeChromaticAberration{ 0.0F };
 	std::atomic<float> D3D::scopeReticleMagnification{ 1.0F };
+	std::atomic<float> D3D::scopeReticleSize{ 4.0F };
+	std::atomic<float> D3D::scopeReticleOffsetX{ 0.0F };
+	std::atomic<float> D3D::scopeReticleOffsetY{ 0.0F };
 	std::atomic<float> D3D::scopeEyeBoxRadius{ 2.0F };
 	std::atomic<float> D3D::scopeVignetteReach{ 9.0F };
 	std::atomic<float> D3D::scopeVignetteSharpness{ 3.0F };

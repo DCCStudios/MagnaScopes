@@ -62,9 +62,9 @@ namespace MagnaScope
 		bool verificationGeometryMagnification = false;
 		bool autoSTS = true;
 		float defaultMaskDiameter = 700.0F;
-		// Starting overlay magnification for automatically detected scopes.
-		// Stacks on top of the sighted zoom the weapon already has.
-		float defaultMagnification = 2.0F;
+		// Starting lens-only magnification for newly detected automatic scopes.
+		// One preserves authored apparent scale until the user tunes the optic.
+		float defaultMagnification = 1.0F;
 		// Mouse wheel zoom headroom: maxZoom = magnification * zoomSpread.
 		float zoomSpread = 1.5F;
 

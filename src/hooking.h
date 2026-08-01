@@ -113,9 +113,16 @@ namespace Hook
 			float vignetteReach = 9.0F;
 			float vignetteSharpness = 3.0F;
 			float eyeBoxMaxTravel = 4.0F;
+
+			// Late automatic-STS reticle controls. Keeping these in b4 lets the
+			// isolated reticle composite remain independent of scene zoom.
+			float reticleSize = 4.0F;
+			float reticleOffsetX = 0.0F;
+			float reticleOffsetY = 0.0F;
+			float reticlePadding = 0.0F;
 		};
 		static_assert(
-			sizeof(ConstBufferData) == 128,
+			sizeof(ConstBufferData) == 144,
 			"ScopeFade constant buffer must match Triangle.hlsli");
 
 	public:
@@ -493,6 +500,9 @@ namespace Hook
 		// Independent STS reticle vertex scale. 1 preserves the authored mesh
 		// size regardless of scene magnification.
 		static std::atomic<float> scopeReticleMagnification;
+		static std::atomic<float> scopeReticleSize;
+		static std::atomic<float> scopeReticleOffsetX;
+		static std::atomic<float> scopeReticleOffsetY;
 		static std::atomic<float> scopeEyeBoxRadius;
 		static std::atomic<float> scopeVignetteReach;
 		static std::atomic<float> scopeVignetteSharpness;

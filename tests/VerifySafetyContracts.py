@@ -368,12 +368,17 @@ def main() -> int:
         "aperture-derived shadow fit or bounded scene parallax is missing",
     )
     require(
-        "float radius = 2;" in data_h
-        and "float maxTravel = 4;" in data_h
-        and "profile->shaderData.parallax.radius = 2.0F;" in data_cpp
+        "float maxTravel = 4;" in data_h
+        and "profile->shaderData.parallax.radius = 1.55F;" in data_cpp
+        and "profile->shaderData.parallax.relativeFogRadius = 7.0F;"
+        in data_cpp
+        and "profile->shaderData.parallax.scopeSwayAmount = 18.0F;"
+        in data_cpp
         and "profile->shaderData.parallax.maxTravel = 4.0F;" in data_cpp
-        and "profile->shaderData.sceneParallaxStrength = 1.0F;" in data_cpp,
-        "automatic STS eye-box or scene-parallax defaults regressed",
+        and "profile->shaderData.sceneParallaxStrength = 1.0F;" in data_cpp
+        and "profile->shaderData.reticleMagnification = 1.0F;" in data_cpp
+        and "float defaultMagnification = 1.0F;" in settings,
+        "automatic STS eye-box, scene-parallax, or neutral magnification defaults regressed",
     )
     require(
         "EyeBoxRecentering::CalculateBlend(" in main_cpp
@@ -723,9 +728,6 @@ def main() -> int:
         "SCOPE_EDGE_CHROMATIC_ABERRATION",
         "SCOPE_DENOISE_STRENGTH",
         "SCOPE_SHARPEN_STRENGTH",
-        "SCOPE_SCENE_PARALLAX_STRENGTH",
-        "SCOPE_EYE_OFFSET_X",
-        "SCOPE_EYE_OFFSET_Y",
     ):
         require(
             forbidden_optic not in reticle_shader,
@@ -743,18 +745,27 @@ def main() -> int:
         in reticle_shader
         and "saturate(whiteCapture - blackCapture)" in reticle_shader
         and "return SampleAuthoredReticle(input.tex);" in reticle_shader
-        and "return SampleAuthoredReticle(sourceUv);" in reticle_shader
+        and "ReticleCompositeOutput reticle = SampleAuthoredReticle(sourceUv);"
+        in reticle_shader
         and "const float2 reticleCenterPixel = float2(" in reticle_shader
         and "SCOPE_AIM_CENTER_X" in reticle_shader
         and "SCOPE_AIM_CENTER_Y" in reticle_shader
         and "saturate(SCOPE_FADE_ACTIVATION)" in reticle_shader
-        and "(outputPixel - reticleCenterPixel) / reticleScale"
+        and "(outputPixel - reticleOutputPivot) / reticleScale"
         in reticle_shader
+        and "SCOPE_RETICLE_SIZE" in reticle_shader
+        and "SCOPE_RETICLE_OFFSET_X" in reticle_shader
+        and "SCOPE_RETICLE_OFFSET_Y" in reticle_shader
+        and "SCOPE_SCENE_PARALLAX_STRENGTH" in reticle_shader
+        and "SCOPE_EYE_OFFSET_X" in reticle_shader
+        and "reticle.sourceContribution *= reticleVisibility"
+        in reticle_shader
+        and "reticle.destinationTransmittance = lerp(" in reticle_shader
         and "SCOPE_AIM_OFFSET_VALID" in reticle_shader
         and "basisX * authoredOffset.x" in reticle_shader
         and "basisZ * authoredOffset.y" in reticle_shader
         and "dot(lensCoordinates, lensCoordinates)" in reticle_shader,
-        "reticle layer lost dual-source reconstruction, invalid-projection preservation, local-pivot scaling, or lens clipping",
+        "reticle layer lost dual-source reconstruction, independent size/offset, optical motion, shadow occlusion, or lens clipping",
     )
 
     # The retired paths either modified authored vertices before the scene

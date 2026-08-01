@@ -133,6 +133,9 @@ namespace ImGuiImpl
 		float edgeRefractionWidth,
 		float edgeChromaticAberration,
 		float reticleMagnification,
+		float reticleSize,
+		float reticleOffsetX,
+		float reticleOffsetY,
 		float eyeBoxRadius,
 		float vignetteReach,
 		float vignetteSharpness,
@@ -161,6 +164,12 @@ namespace ImGuiImpl
 			std::clamp(edgeChromaticAberration, 0.0F, 2.0F);
 		editorPreview.reticleMagnification =
 			std::clamp(reticleMagnification, 0.25F, 8.0F);
+		editorPreview.reticleSize =
+			std::clamp(reticleSize, 0.01F, 128.0F);
+		editorPreview.reticleOffsetX =
+			std::clamp(reticleOffsetX, -1000.0F, 1000.0F);
+		editorPreview.reticleOffsetY =
+			std::clamp(reticleOffsetY, -1000.0F, 1000.0F);
 		// These existing FTS profile values now also drive the physical
 		// ScopeFade pupil. Publishing copies here preserves live editing
 		// without sharing the menu-owned profile with the game/render threads.
@@ -822,10 +831,12 @@ namespace ImGuiImpl
 			ImGui::Spacing();
 
 			ImGui::DragFloat("Reticle Size", &ReticleSize_UI, 0.01F, 0, 128);
-			Tip("Scales the reticle texture drawn inside the magnified area.\n"
-				"Has no effect when the profile ships without a reticle texture.");
+			Tip("Scales the isolated STS reticle around its authored geometric\n"
+				"center. 4.00 preserves authored size before the STS reticle\n"
+				"magnification multiplier is applied.");
 			ImGui::DragFloat2("Reticle Offset", reticle_Offset, 0.01F, -1000.0F, 1000.0F);
-			Tip("Moves the reticle texture inside the magnified area.");
+			Tip("Moves the isolated reticle in the optic's local X/Z frame. The\n"
+				"offset follows optic roll and inertia without moving the aperture.");
 			if (currData && currData->autoProfile) {
 				ImGui::DragFloat(
 					"STS Reticle Magnification",
@@ -1024,6 +1035,9 @@ namespace ImGuiImpl
 			instance->edgeRefractionWidth_UI,
 			instance->edgeChromaticAberration_UI,
 			instance->reticleMagnification_UI,
+			instance->ReticleSize_UI,
+			instance->reticle_Offset[0],
+			instance->reticle_Offset[1],
 			instance->radius_UI,
 			instance->relativeFogRadius_UI,
 			instance->scopeSwayAmount_UI,

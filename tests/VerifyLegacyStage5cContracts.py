@@ -366,15 +366,11 @@ def main() -> int:
             re.DOTALL,
         )
         and re.search(
-            r"AllowsAuxiliaryWorldPass\(\).*?"
-            r"return\s+verificationStage\s*==\s*5\s*&&\s*"
-            r"!verificationAuxiliaryPassThroughHooks\s*&&\s*"
-            r"!verificationAuxiliaryObservationHooks\s*&&\s*"
-            r"verificationAuxiliaryWorldPass\s*;",
+            r"AllowsAuxiliaryWorldPass\(\).*?return\s+false\s*;",
             settings,
             re.DOTALL,
         ),
-        "Stage 5 rollout gates are not explicit, bounded, and mutually exclusive",
+        "Stage 5 diagnostic gates are not bounded or the retired auxiliary world pass can still activate",
     )
     stage5_world_pass = main_cpp.find(
         "if (settings.AllowsAuxiliaryWorldPass())"
@@ -846,7 +842,7 @@ def main() -> int:
         in prepare_scope_source
         and "projection.aimCenterY - projection.centerY"
         in prepare_scope_source
-        and "sizeof(ConstBufferData) == 128" in hooking_h
+        and "sizeof(ConstBufferData) == 144" in hooking_h
         and "SCOPE_AIM_OFFSET_VALID" in triangle_shader
         and "SCOPE_IMAGE_DENOISE" in triangle_shader
         and "SCOPE_IMAGE_SHARPEN" in triangle_shader
@@ -946,7 +942,10 @@ def main() -> int:
         and "m_pPixelShader_STSReticleLayer.Get()" in hooking
         and "PSSetConstantBuffers(4U, 1U, &resolutionBuffer)" in hooking
         and "SCOPE_RETICLE_MAGNIFICATION" in reticle_layer_shader
-        and "reticleCenterPixel +" in reticle_layer_shader
+        and "SCOPE_RETICLE_SIZE" in reticle_layer_shader
+        and "SCOPE_RETICLE_OFFSET_X" in reticle_layer_shader
+        and "reticleOutputPivot" in reticle_layer_shader
+        and "reticleVisibility" in reticle_layer_shader
         and "SCOPE_FADE_MAGNIFICATION" not in reticle_layer_shader
         and hooking.count("DrawReticleWithScaledVertices(") == 1,
         "Reticle is not isolated into a same-format post-optics layer with independent local-pivot scaling",

@@ -45,7 +45,7 @@ animation-flavor keywords and chooses the most-specific matching entry.
 [AutoSTS]
 Enabled=1
 DefaultMaskDiameter=700.0
-DefaultMagnification=2.0
+DefaultMagnification=1.0
 ZoomSpread=1.5
 ```
 

@@ -770,28 +770,30 @@ namespace ScopeData
 		// The earlier 0.35 default visibly warped the entire image.
 		profile->shaderData.fishEyeStrength = 0.05F;
 		profile->shaderData.fishEyePower = 2.0F;
-		profile->shaderData.edgeRefractionStrength = 0.018F;
-		profile->shaderData.edgeRefractionWidth = 0.14F;
-		profile->shaderData.edgeChromaticAberration = 0.35F;
+		profile->shaderData.edgeRefractionStrength = 0.05F;
+		profile->shaderData.edgeRefractionWidth = 0.235F;
+		profile->shaderData.edgeChromaticAberration = 2.0F;
 		profile->shaderData.sceneParallaxStrength = 1.0F;
-		profile->shaderData.opticalLagStrength = 1.0F;
-		// Automatic profiles benefit from mild spatial cleanup after a large
-		// crop, followed by bounded local-contrast recovery. Explicit legacy
-		// FTS profiles retain zero defaults unless they opt in.
-		profile->shaderData.imageDenoise = 0.35F;
+		profile->shaderData.opticalLagStrength = 0.2F;
+		// The tested baseline leaves edge-aware cleanup disabled; a large
+		// spatial kernel can turn stable object edges into shadow-like blobs.
+		profile->shaderData.imageDenoise = 0.0F;
 		profile->shaderData.imageSharpen = 0.5F;
+		profile->shaderData.ReticleSize = 4.0F;
+		profile->shaderData.reticle_Offset[0] = 0.0F;
+		profile->shaderData.reticle_Offset[1] = 0.0F;
+		profile->shaderData.reticleMagnification = 1.0F;
 		const float diameter = std::clamp(defaultDiameter, 64.0F, 2160.0F);
 		profile->shaderData.Size[0] = diameter;
 		profile->shaderData.Size[1] = diameter;
 		profile->shaderData.OriSize[0] = diameter;
 		profile->shaderData.OriSize[1] = diameter;
-		// Stock FTS parallax tuning: the fog reaches black slightly inside the
-		// mask edge, which produces the visible dark eye-relief ring at the
-		// rim of the circle and the moving scope shadow when the view drifts
-		// off the optical axis. These are the values shipped FTS profiles use.
-		profile->shaderData.parallax.radius = 2.0F;
-		profile->shaderData.parallax.relativeFogRadius = 9.0F;
-		profile->shaderData.parallax.scopeSwayAmount = 3.0F;
+		// Tested MagnaScope baseline: the fog reaches black slightly inside the
+		// mask edge, producing a dark eye-relief ring at the rim and a moving
+		// scope shadow as the eye drifts away from the optical axis.
+		profile->shaderData.parallax.radius = 1.55F;
+		profile->shaderData.parallax.relativeFogRadius = 7.0F;
+		profile->shaderData.parallax.scopeSwayAmount = 18.0F;
 		profile->shaderData.parallax.maxTravel = 4.0F;
 
 		// Automatic STS scopes replace the weapon's full-screen FOV zoom with

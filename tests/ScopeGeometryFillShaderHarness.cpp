@@ -74,8 +74,13 @@ namespace
 		float vignetteReach = 9.0F;
 		float vignetteSharpness = 3.0F;
 		float eyeBoxMaxTravel = 4.0F;
+
+		float reticleSize = 4.0F;
+		float reticleOffsetX = 0.0F;
+		float reticleOffsetY = 0.0F;
+		float reticlePadding = 0.0F;
 	};
-	static_assert(sizeof(ResolutionConstants) == 128);
+	static_assert(sizeof(ResolutionConstants) == 144);
 
 	void Check(HRESULT result, std::string_view operation)
 	{

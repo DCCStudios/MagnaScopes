@@ -202,6 +202,9 @@ namespace ImGuiImpl
 		float edgeRefractionWidth = 0.15F;
 		float edgeChromaticAberration = 0.0F;
 		float reticleMagnification = 1.0F;
+		float reticleSize = 4.0F;
+		float reticleOffsetX = 0.0F;
+		float reticleOffsetY = 0.0F;
 		float eyeBoxRadius = 2.0F;
 		float vignetteReach = 9.0F;
 		float vignetteSharpness = 3.0F;
@@ -253,6 +256,9 @@ namespace ImGuiImpl
 		float edgeRefractionWidth,
 		float edgeChromaticAberration,
 		float reticleMagnification,
+		float reticleSize,
+		float reticleOffsetX,
+		float reticleOffsetY,
 		float eyeBoxRadius,
 		float vignetteReach,
 		float vignetteSharpness,

@@ -68,8 +68,13 @@ namespace
 		float vignetteReach = 9.0F;
 		float vignetteSharpness = 3.0F;
 		float eyeBoxMaxTravel = 4.0F;
+
+		float reticleSize = 4.0F;
+		float reticleOffsetX = 0.0F;
+		float reticleOffsetY = 0.0F;
+		float reticlePadding = 0.0F;
 	};
-	static_assert(sizeof(ResolutionConstants) == 128U);
+	static_assert(sizeof(ResolutionConstants) == 144U);
 
 	struct PixelMetrics
 	{
@@ -681,6 +686,15 @@ try {
 	pivotConstants.reticleMagnification = 2.0F;
 	const auto twoX = fixture.Render(pivotConstants, offsetLayer);
 	const auto twoMetrics = AnalyzeDifference(twoX);
+	ResolutionConstants sizeEquivalent = pivotConstants;
+	sizeEquivalent.reticleMagnification = 1.0F;
+	sizeEquivalent.reticleSize = 8.0F;
+	const auto sizeEquivalentOutput =
+		fixture.Render(sizeEquivalent, offsetLayer);
+	if (twoX != sizeEquivalentOutput) {
+		throw std::runtime_error(
+			"reticle size and reticle magnification did not compose identically");
+	}
 	if (halfMetrics.count == 0U || pivotOneMetrics.count == 0U ||
 		twoMetrics.count == 0U) {
 		throw std::runtime_error("reticle layer produced no visible pixels");
@@ -740,8 +754,8 @@ try {
 			"reticle scaling moved its authored screen-space pivot");
 	}
 
-	// Scene optical settings must be irrelevant to the late reticle layer.
-	// This byte comparison catches accidental reuse of the scene shader math.
+	// Scene sampling effects must be irrelevant to the late reticle layer.
+	// Physical eye motion and exit-pupil visibility are tested separately.
 	ResolutionConstants cleanOptics{};
 	cleanOptics.reticleMagnification = 2.0F;
 	const auto cleanOutput = fixture.Render(cleanOptics, centeredLayer);
@@ -754,17 +768,55 @@ try {
 	hostileOptics.edgeRefractionStrength = 0.25F;
 	hostileOptics.edgeRefractionWidth = 0.5F;
 	hostileOptics.edgeChromaticAberration = 2.0F;
-	hostileOptics.sceneParallaxStrength = 2.0F;
-	hostileOptics.eyeOffsetX = 3.0F;
-	hostileOptics.eyeOffsetY = -3.0F;
-	hostileOptics.opticalLagStrength = 4.0F;
-	hostileOptics.eyeBoxRadius = 0.1F;
-	hostileOptics.vignetteReach = 1.01F;
-	hostileOptics.vignetteSharpness = 20.0F;
 	const auto hostileOutput = fixture.Render(hostileOptics, centeredLayer);
 	if (cleanOutput != hostileOutput) {
 		throw std::runtime_error(
 			"scene optics changed the independent reticle layer");
+	}
+
+	// Reticle offset is optic-local and is applied after scaling. With a
+	// 56-pixel X basis, 178.5714 thousandths is exactly +10 display pixels.
+	ResolutionConstants offsetConstants = cleanOptics;
+	offsetConstants.reticleOffsetX = 178.5714286F;
+	const auto offsetOutput = fixture.Render(offsetConstants, centeredLayer);
+	const auto cleanMetrics = AnalyzeDifference(cleanOutput);
+	const auto offsetMetrics = AnalyzeDifference(offsetOutput);
+	if (std::abs(offsetMetrics.centerX - cleanMetrics.centerX - 10.0) > 0.15 ||
+		std::abs(offsetMetrics.centerY - cleanMetrics.centerY) > 0.15 ||
+		offsetMetrics.count != cleanMetrics.count) {
+		throw std::runtime_error(
+			"reticle local offset was scaled or changed reticle coverage");
+	}
+
+	// The isolated reticle follows the same bounded scene-parallax display
+	// translation while remaining independent of scene magnification.
+	ResolutionConstants movingConstants{};
+	movingConstants.sceneParallaxStrength = 1.0F;
+	movingConstants.eyeOffsetX = 0.5F;
+	movingConstants.opticalLagStrength = 1.0F;
+	movingConstants.eyeBoxRadius = 4.0F;
+	const auto movingOneX = fixture.Render(movingConstants, centeredLayer);
+	const auto movingOneMetrics = AnalyzeDifference(movingOneX);
+	movingConstants.sceneMagnification = 4.0F;
+	const auto movingFourX = fixture.Render(movingConstants, centeredLayer);
+	if (movingOneX != movingFourX ||
+		std::abs(movingOneMetrics.centerX - AnalyzeDifference(oneX).centerX - 14.0) > 0.15) {
+		throw std::runtime_error(
+			"reticle optical translation depended on scene zoom or used wrong sign");
+	}
+
+	// A fully closed exit pupil must turn the dual-source reticle blend into
+	// identity so the reticle cannot paint over the already-dark scope shadow.
+	ResolutionConstants shadowedConstants{};
+	shadowedConstants.sceneParallaxStrength = 0.0F;
+	shadowedConstants.eyeOffsetX = 2.0F;
+	shadowedConstants.eyeBoxRadius = 0.1F;
+	shadowedConstants.vignetteReach = 10.0F;
+	shadowedConstants.vignetteSharpness = 3.0F;
+	const auto shadowedOutput = fixture.Render(shadowedConstants, centeredLayer);
+	if (AnalyzeDifference(shadowedOutput).count != 0U) {
+		throw std::runtime_error(
+			"reticle remained visible over a fully closed scope shadow");
 	}
 
 	// A projection publication gap must preserve the authored layer instead
@@ -842,7 +894,8 @@ try {
 
 	std::cout << std::format(
 		"Reticle layer shader PASSED: scene 1x/2x/4x invariant; "
-		"reticle 0.5x={}x{}, 1x={}x{}, 2x={}x{}; clippedPixels={}\n",
+		"reticle 0.5x={}x{}, 1x={}x{}, 2x={}x{}; "
+		"size/offset/motion/shadow verified; clippedPixels={}\n",
 		halfMetrics.Width(),
 		halfMetrics.Height(),
 		pivotOneMetrics.Width(),

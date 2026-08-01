@@ -118,7 +118,7 @@ namespace MagnaScope
 				path.c_str()) != 0;
 		autoSTS = GetPrivateProfileIntW(L"AutoSTS", L"Enabled", 1, path.c_str()) != 0;
 		defaultMaskDiameter = ReadIniFloat(path, L"DefaultMaskDiameter", 700.0F);
-		defaultMagnification = ReadIniFloat(path, L"DefaultMagnification", 2.0F);
+		defaultMagnification = ReadIniFloat(path, L"DefaultMagnification", 1.0F);
 		zoomSpread = ReadIniFloat(path, L"ZoomSpread", 1.5F);
 		logger::info(
 			"Config loaded from {}: verification stage={}, auxiliary pass-through hooks={}, auxiliary observation hooks={}, auxiliary world pass={}, camera override={}, TAA capture={}, visual probe={}, geometry probe={}, geometry magnification={}, AutoSTS={}, diameter={}, magnification={}, zoom spread={}",
@@ -1915,6 +1915,15 @@ void HookedUpdate()
 				Hook::D3D::scopeReticleMagnification.store(
 					editorPreview.reticleMagnification,
 					std::memory_order_release);
+				Hook::D3D::scopeReticleSize.store(
+					editorPreview.reticleSize,
+					std::memory_order_release);
+				Hook::D3D::scopeReticleOffsetX.store(
+					editorPreview.reticleOffsetX,
+					std::memory_order_release);
+				Hook::D3D::scopeReticleOffsetY.store(
+					editorPreview.reticleOffsetY,
+					std::memory_order_release);
 				Hook::D3D::scopeEyeBoxRadius.store(
 					editorPreview.eyeBoxRadius,
 					std::memory_order_release);
@@ -1995,6 +2004,24 @@ void HookedUpdate()
 						currentData->shaderData.reticleMagnification,
 						0.25F,
 						8.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeReticleSize.store(
+					std::clamp(
+						currentData->shaderData.ReticleSize,
+						0.01F,
+						128.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeReticleOffsetX.store(
+					std::clamp(
+						currentData->shaderData.reticle_Offset[0],
+						-1000.0F,
+						1000.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeReticleOffsetY.store(
+					std::clamp(
+						currentData->shaderData.reticle_Offset[1],
+						-1000.0F,
+						1000.0F),
 					std::memory_order_release);
 				Hook::D3D::scopeEyeBoxRadius.store(
 					std::clamp(
@@ -2365,6 +2392,15 @@ void HookedUpdate()
 				std::memory_order_release);
 			Hook::D3D::scopeReticleMagnification.store(
 				1.0F,
+				std::memory_order_release);
+			Hook::D3D::scopeReticleSize.store(
+				4.0F,
+				std::memory_order_release);
+			Hook::D3D::scopeReticleOffsetX.store(
+				0.0F,
+				std::memory_order_release);
+			Hook::D3D::scopeReticleOffsetY.store(
+				0.0F,
 				std::memory_order_release);
 			Hook::D3D::scopeSceneParallaxStrength.store(
 				0.0F,
