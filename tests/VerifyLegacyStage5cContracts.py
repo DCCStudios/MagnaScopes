@@ -285,8 +285,8 @@ def main() -> int:
     )
     require(
         "profile->zoomDataOverwrite.enableZoomDateOverwrite = true" in code
-        and "profile->zoomDataOverwrite.fovMul = 1.0F" in code,
-        "automatic STS profiles do not default to lens-only magnification",
+        and "profile->zoomDataOverwrite.fovMul = zoomData.fovMult" in code,
+        "automatic STS profiles do not begin from authored ZoomData",
     )
     require(
         "reinterpret_cast<std::uintptr_t>(controller.get()) + 0x470" not in code,

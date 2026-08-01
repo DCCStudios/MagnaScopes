@@ -796,12 +796,12 @@ namespace ScopeData
 		profile->shaderData.parallax.scopeSwayAmount = 18.0F;
 		profile->shaderData.parallax.maxTravel = 4.0F;
 
-		// Automatic STS scopes replace the weapon's full-screen FOV zoom with
-		// lens-only magnification. Keep the authored camera offset so the
-		// manually aligned STS reticle remains in its intended position.
-		// Stage 2 verifies this override before any renderer is enabled.
+		// New automatic profiles begin from the weapon's authored sighted zoom
+		// and camera offsets. Lens magnification remains neutral at 1x until the
+		// user or a saved profile changes it, so STS alignment is not silently
+		// replaced by a guessed FOV value.
 		profile->zoomDataOverwrite.enableZoomDateOverwrite = true;
-		profile->zoomDataOverwrite.fovMul = 1.0F;
+		profile->zoomDataOverwrite.fovMul = zoomData.fovMult;
 		profile->zoomDataOverwrite.x = zoomData.cameraOffset.x;
 		profile->zoomDataOverwrite.y = zoomData.cameraOffset.y;
 		profile->zoomDataOverwrite.z = zoomData.cameraOffset.z;

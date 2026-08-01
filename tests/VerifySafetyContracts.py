@@ -377,8 +377,9 @@ def main() -> int:
         and "profile->shaderData.parallax.maxTravel = 4.0F;" in data_cpp
         and "profile->shaderData.sceneParallaxStrength = 1.0F;" in data_cpp
         and "profile->shaderData.reticleMagnification = 1.0F;" in data_cpp
+        and "profile->zoomDataOverwrite.fovMul = zoomData.fovMult;" in data_cpp
         and "float defaultMagnification = 1.0F;" in settings,
-        "automatic STS eye-box, scene-parallax, or neutral magnification defaults regressed",
+        "automatic STS eye-box, authored zoom, scene-parallax, or neutral magnification defaults regressed",
     )
     require(
         "EyeBoxRecentering::CalculateBlend(" in main_cpp

@@ -138,6 +138,16 @@ int main()
 	Require(
 		firstSettledBlend > 0.0F && firstSettledBlend < 0.10F,
 		"settled recovery is discontinuous or frame-rate dependent");
+	const float nearFirst =
+		CalculateBlend(0.0F, 1.0F / 60.0F, 0.0F);
+	const float farFirst =
+		CalculateBlend(0.0F, 1.0F / 60.0F, 4.0F);
+	Require(
+		Near(farFirst, nearFirst, 0.0001F),
+		"large displacement changed the first settled-frame response");
+	Require(
+		CalculateBlend(0.0F, 0.05F, 4.0F) < 0.30F,
+		"long frame recentering step was too large");
 
 	// A finite displacement beyond the former three-radius reset threshold
 	// must retain visible lag and recover monotonically. The response should
