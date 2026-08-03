@@ -4145,7 +4145,13 @@ namespace Hook
 				// Both have been observed to latch for an entire session and
 				// clear on a game restart, which is the signature of the
 				// published identity going stale rather than of a transient.
-				// Bounded near-miss reporting is what tells the two apart.
+				//
+				// Fallout pools unrelated meshes into the same buffers, so
+				// "shares the pooled buffer pair" selects most of the world and
+				// is useless as a filter -- a first attempt at this spent its
+				// whole log budget on 195555-index terrain. The index count and
+				// stride together are what actually make a draw ScopeFade
+				// shaped, so count those per frame and report only those.
 				if (!exactGeometryMatch) {
 					const auto expectedVertexBuffer =
 						automaticSTSVertexBuffer.load(
@@ -4159,51 +4165,37 @@ namespace Hook
 					const auto expectedStride =
 						automaticSTSVertexStride.load(
 							std::memory_order_relaxed);
-					const auto currentVertexBufferAddress =
-						reinterpret_cast<std::uintptr_t>(
-							currentVertexBuffer.Get());
-					const auto currentIndexBufferAddress =
-						reinterpret_cast<std::uintptr_t>(
-							currentIndexBuffer.Get());
-					const bool sharesBuffers =
-						currentVertexBufferAddress == expectedVertexBuffer &&
-						currentIndexBufferAddress == expectedIndexBuffer;
-					// Fallout pools many shapes into one buffer, so a draw
-					// sharing the pooled pair is a genuine candidate. A draw
-					// with the right index count on a different buffer means
-					// the pool itself moved. Sampling the first draws of a
-					// frame covers the case where neither is true, which is
-					// what an unrecognized pool looks like.
-					static std::atomic_uint32_t loggedGeometryMismatches{ 0U };
-					static std::atomic_uint32_t loggedGeometrySamples{ 0U };
-					const bool nearMiss =
-						sharesBuffers || IndexCount == expectedIndexCount;
-					const bool report =
-						nearMiss ?
-							loggedGeometryMismatches.fetch_add(
+					if (IndexCount == expectedIndexCount &&
+						currentStride == expectedStride) {
+						automaticSTSScopeFadeShapedDrawsThisFrame.fetch_add(
+							1U,
+							std::memory_order_relaxed);
+						static std::atomic_uint32_t
+							loggedGeometryMismatches{ 0U };
+						if (loggedGeometryMismatches.fetch_add(
 								1U,
-								std::memory_order_relaxed) < 8U :
-							(drawOrdinal <= 2U &&
-								loggedGeometrySamples.fetch_add(
-									1U,
-									std::memory_order_relaxed) < 4U);
-					if (report) {
-						logger::info(
-							"Stage 4d ScopeFade geometry mismatch ({}): "
-							"VB=0x{:x} expected 0x{:x}, "
-							"IB=0x{:x} expected 0x{:x}, "
-							"indexCount={} expected {}, "
-							"stride={} expected {}, ordinal={}",
-							nearMiss ? "candidate" : "sample",
-							currentVertexBufferAddress,
-							expectedVertexBuffer,
-							currentIndexBufferAddress,
-							expectedIndexBuffer,
-							IndexCount,
-							expectedIndexCount,
-							currentStride,
-							expectedStride,
-							drawOrdinal);
+								std::memory_order_relaxed) < 8U) {
+							logger::info(
+								"Stage 4d ScopeFade shaped draw rejected: "
+								"VB=0x{:x} expected 0x{:x}, "
+								"IB=0x{:x} expected 0x{:x}, "
+								"vertexOffset={} effective={} expected={}, "
+								"indexOffset={} effective={} expected={}, "
+								"ordinal={}",
+								reinterpret_cast<std::uintptr_t>(
+									currentVertexBuffer.Get()),
+								expectedVertexBuffer,
+								reinterpret_cast<std::uintptr_t>(
+									currentIndexBuffer.Get()),
+								expectedIndexBuffer,
+								currentVertexOffset,
+								effectiveVertexOffset,
+								expectedVertexDataOffset,
+								currentIndexOffset,
+								effectiveIndexOffset,
+								expectedIndexDataOffset,
+								drawOrdinal);
+						}
 					}
 				}
 
@@ -6141,6 +6133,14 @@ namespace Hook
 			automaticSTSScopeFadeVisibleLastFrame.store(
 				scopeFadeDraws > 0U,
 				std::memory_order_release);
+			// Reported every frame rather than through a bounded log budget,
+			// because the question it answers -- did See Through Scopes submit
+			// the aperture at all -- has to be answerable from a session where
+			// the lens never engaged, long after any log budget is spent.
+			const auto scopeFadeShapedDraws =
+				automaticSTSScopeFadeShapedDrawsThisFrame.exchange(
+					0U,
+					std::memory_order_acq_rel);
 			const auto reticleDraws =
 				automaticSTSReticleDrawsThisFrame.exchange(
 					0U,
@@ -6195,6 +6195,9 @@ namespace Hook
 			static std::atomic_uint32_t previousGunState{
 				std::numeric_limits<std::uint32_t>::max()
 			};
+			static std::atomic_uint32_t previousShapedDraws{
+				std::numeric_limits<std::uint32_t>::max()
+			};
 			const bool firingSighted =
 				gunState ==
 				static_cast<std::uint32_t>(RE::GUN_STATE::kFireSighted);
@@ -6211,12 +6214,14 @@ namespace Hook
 					previousInstancedDraws.load(
 						std::memory_order_relaxed) ||
 				gunState != previousGunState.load(
-								std::memory_order_relaxed);
+								std::memory_order_relaxed) ||
+				scopeFadeShapedDraws != previousShapedDraws.load(
+										   std::memory_order_relaxed);
 			if (firingSighted || changed) {
 				logger::info(
 					"Stage 4d.2d draw telemetry: gunState={} ({}), "
 					"automaticDraws={}, "
-					"ScopeFade=DI:{} DII:{} @{}, "
+					"ScopeFade=DI:{} DII:{} @{} shaped:{}, "
 					"Reticle=DI:{} DII:{} @{}, "
 					"Housing=DI:{} DII:{} @{}",
 					gunState,
@@ -6230,6 +6235,7 @@ namespace Hook
 					scopeFadeDraws,
 					scopeFadeInstancedDraws,
 					scopeFadeOrdinal,
+					scopeFadeShapedDraws,
 					reticleDraws,
 					reticleInstancedDraws,
 					reticleOrdinal,
@@ -6239,6 +6245,9 @@ namespace Hook
 			}
 			previousScopeFadeDraws.store(
 				scopeFadeDraws,
+				std::memory_order_relaxed);
+			previousShapedDraws.store(
+				scopeFadeShapedDraws,
 				std::memory_order_relaxed);
 			previousReticleDraws.store(
 				reticleDraws,
@@ -6769,6 +6778,7 @@ namespace Hook
 	std::atomic<float> D3D::scopeRecenterSpeed{ 1.0F };
 	std::atomic<float> D3D::scopeApertureScaleRatio{ 1.0F };
 	std::atomic<float> D3D::scopeTubeDepth{ 0.0F };
+	std::atomic_uint32_t D3D::automaticSTSScopeFadeShapedDrawsThisFrame = 0U;
 	std::atomic<float> D3D::scopeLensOffsetX{ 0.0F };
 	std::atomic<float> D3D::scopeLensOffsetY{ 0.0F };
 	std::atomic<float> D3D::scopeLensScale{ 1.0F };

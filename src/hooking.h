@@ -642,6 +642,13 @@ namespace Hook
 		static std::atomic_uint32_t automaticSTSHousingIndexDataOffset;
 		static std::atomic_bool automaticSTSHousingGeometryReady;
 		static std::atomic_uint32_t automaticSTSScopeFadeDrawsThisFrame;
+		// Draws carrying ScopeFade's exact index count and stride, whatever
+		// buffer they came from. Fallout pools unrelated meshes into the same
+		// buffers, so a plain near-miss sample is dominated by world geometry
+		// and cannot answer the one question that matters: whether See Through
+		// Scopes submitted the aperture at all. Zero here every frame means it
+		// did not; non-zero means it did and the identity match rejected it.
+		static std::atomic_uint32_t automaticSTSScopeFadeShapedDrawsThisFrame;
 		// Published at Present from the exact ScopeFade draw count. The game
 		// thread uses this previous-frame fact to begin optical blending only
 		// after the ScopeAiming branch is genuinely visible.
