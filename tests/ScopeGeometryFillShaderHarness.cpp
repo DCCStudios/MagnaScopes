@@ -888,6 +888,10 @@ Output main(Input input)
 	context->PSSetSamplers(0, 1, &boundSampler);
 	context->PSSetConstantBuffers(4, 1, &boundResolution);
 	context->PSSetConstantBuffers(5, 1, &boundScopeEffect);
+	// The fill geometry shader reads the published lens center from b4 so the
+	// fabricated center fan converges on a single apex. Mirror the production
+	// binding or the harness silently exercises the per-wedge fallback.
+	context->GSSetConstantBuffers(4, 1, &boundResolution);
 	context->DrawIndexed(static_cast<UINT>(indices.size()), 0, 0);
 
 	context->CopyResource(staging.Get(), renderTarget.Get());

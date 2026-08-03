@@ -182,6 +182,12 @@ target("AutoSTSShaderTest")
     add_syslinks("d3d11", "d3dcompiler", "dxgi")
     set_runtimes("MD")
     set_targetdir("build/tests")
+    -- The harnesses resolve Compile/Shaders relative to the working
+    -- directory. Without this, xmake run starts them in build/tests and
+    -- they silently load whatever stale shader tree happens to sit there
+    -- instead of the shaders just built, reporting failures that do not
+    -- exist in the production output.
+    set_rundir("$(projectdir)")
 
 target("ScopeGeometryFillShaderTest")
     set_default(false)
@@ -192,6 +198,12 @@ target("ScopeGeometryFillShaderTest")
     add_syslinks("d3d11", "d3dcompiler", "dxgi")
     set_runtimes("MD")
     set_targetdir("build/tests")
+    -- The harnesses resolve Compile/Shaders relative to the working
+    -- directory. Without this, xmake run starts them in build/tests and
+    -- they silently load whatever stale shader tree happens to sit there
+    -- instead of the shaders just built, reporting failures that do not
+    -- exist in the production output.
+    set_rundir("$(projectdir)")
 
 target("DrawTimeEyeBoxTest")
     set_default(false)
@@ -201,6 +213,12 @@ target("DrawTimeEyeBoxTest")
     add_includedirs("src")
     set_runtimes("MD")
     set_targetdir("build/tests")
+    -- The harnesses resolve Compile/Shaders relative to the working
+    -- directory. Without this, xmake run starts them in build/tests and
+    -- they silently load whatever stale shader tree happens to sit there
+    -- instead of the shaders just built, reporting failures that do not
+    -- exist in the production output.
+    set_rundir("$(projectdir)")
 
 -- Executes the independent late reticle composite on D3D11 WARP. This
 -- verifies local pivot scaling, optical-effect isolation, and physical lens
@@ -214,3 +232,9 @@ target("ReticleLayerShaderTest")
     add_syslinks("d3d11", "d3dcompiler", "dxgi")
     set_runtimes("MD")
     set_targetdir("build/tests")
+    -- The harnesses resolve Compile/Shaders relative to the working
+    -- directory. Without this, xmake run starts them in build/tests and
+    -- they silently load whatever stale shader tree happens to sit there
+    -- instead of the shaders just built, reporting failures that do not
+    -- exist in the production output.
+    set_rundir("$(projectdir)")
