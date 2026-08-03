@@ -4134,6 +4134,79 @@ namespace Hook
 								expectedVertexDataOffset)) &&
 					(currentIndexOffset == expectedIndexDataOffset ||
 						effectiveIndexOffset == expectedIndexDataOffset);
+				// A failed geometry match is silent, and that makes two very
+				// different faults look identical from the log: See Through
+				// Scopes not drawing the aperture at all, versus drawing it
+				// against buffers we no longer recognize. Only the
+				// suballocation rejection below is reported, and it is never
+				// reached when the buffer pointer, index count, or stride is
+				// what diverged.
+				//
+				// Both have been observed to latch for an entire session and
+				// clear on a game restart, which is the signature of the
+				// published identity going stale rather than of a transient.
+				// Bounded near-miss reporting is what tells the two apart.
+				if (!exactGeometryMatch) {
+					const auto expectedVertexBuffer =
+						automaticSTSVertexBuffer.load(
+							std::memory_order_relaxed);
+					const auto expectedIndexBuffer =
+						automaticSTSIndexBuffer.load(
+							std::memory_order_relaxed);
+					const auto expectedIndexCount =
+						automaticSTSIndexCount.load(
+							std::memory_order_relaxed);
+					const auto expectedStride =
+						automaticSTSVertexStride.load(
+							std::memory_order_relaxed);
+					const auto currentVertexBufferAddress =
+						reinterpret_cast<std::uintptr_t>(
+							currentVertexBuffer.Get());
+					const auto currentIndexBufferAddress =
+						reinterpret_cast<std::uintptr_t>(
+							currentIndexBuffer.Get());
+					const bool sharesBuffers =
+						currentVertexBufferAddress == expectedVertexBuffer &&
+						currentIndexBufferAddress == expectedIndexBuffer;
+					// Fallout pools many shapes into one buffer, so a draw
+					// sharing the pooled pair is a genuine candidate. A draw
+					// with the right index count on a different buffer means
+					// the pool itself moved. Sampling the first draws of a
+					// frame covers the case where neither is true, which is
+					// what an unrecognized pool looks like.
+					static std::atomic_uint32_t loggedGeometryMismatches{ 0U };
+					static std::atomic_uint32_t loggedGeometrySamples{ 0U };
+					const bool nearMiss =
+						sharesBuffers || IndexCount == expectedIndexCount;
+					const bool report =
+						nearMiss ?
+							loggedGeometryMismatches.fetch_add(
+								1U,
+								std::memory_order_relaxed) < 8U :
+							(drawOrdinal <= 2U &&
+								loggedGeometrySamples.fetch_add(
+									1U,
+									std::memory_order_relaxed) < 4U);
+					if (report) {
+						logger::info(
+							"Stage 4d ScopeFade geometry mismatch ({}): "
+							"VB=0x{:x} expected 0x{:x}, "
+							"IB=0x{:x} expected 0x{:x}, "
+							"indexCount={} expected {}, "
+							"stride={} expected {}, ordinal={}",
+							nearMiss ? "candidate" : "sample",
+							currentVertexBufferAddress,
+							expectedVertexBuffer,
+							currentIndexBufferAddress,
+							expectedIndexBuffer,
+							IndexCount,
+							expectedIndexCount,
+							currentStride,
+							expectedStride,
+							drawOrdinal);
+					}
+				}
+
 				const bool exactReticleMatch =
 					MatchesAutomaticSTSReticleSet(
 						currentVertexBuffer.Get(),
