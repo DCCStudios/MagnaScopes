@@ -649,6 +649,11 @@ namespace Hook
 		// Scopes submitted the aperture at all. Zero here every frame means it
 		// did not; non-zero means it did and the identity match rejected it.
 		static std::atomic_uint32_t automaticSTSScopeFadeShapedDrawsThisFrame;
+		// Draws reaching the automatic-profile branch regardless of the
+		// readiness gate. Compared against the gated ordinal, this says whether
+		// a frame that never sees ScopeFade stopped being delivered draws or
+		// stopped being allowed to inspect them.
+		static std::atomic_uint32_t automaticSTSObservedDrawsThisFrame;
 		// Published at Present from the exact ScopeFade draw count. The game
 		// thread uses this previous-frame fact to begin optical blending only
 		// after the ScopeAiming branch is genuinely visible.

@@ -4059,6 +4059,21 @@ namespace Hook
 		const auto* activeProfile = ScopeData::ScopeDataHandler::GetSingleton()->GetCurrentScopeProfile();
 		if (activeProfile && activeProfile->autoProfile) {
 			const auto& verification = MagnaScope::GetSettings();
+			// Every draw that gets this far, whether or not the readiness gate
+			// below lets it through. ScopeFade is submitted at roughly 94% of
+			// the way through a frame -- ordinal 4470 of 4750 in a healthy
+			// session -- so a session that only ever counts 75 draws per frame
+			// stops looking long before the aperture arrives, and that is
+			// exactly what both failed sessions recorded.
+			//
+			// Comparing this against the gated count separates the two causes.
+			// If this reads a full frame while the gated count reads 75, the
+			// readiness gate is closing mid-frame and invalidation needs to
+			// become frame-coherent. If both read 75, our detour is not being
+			// called at all and the problem is the hook chain.
+			automaticSTSObservedDrawsThisFrame.fetch_add(
+				1U,
+				std::memory_order_relaxed);
 			// ScopeFade is a child of STS's ScopeAiming branch. The actual draw is therefore the authoritative visibility signal.
 			// Do not additionally gate on gunState: Fallout can briefly report
 			// a non-sighted firing state while ScopeAiming remains visible,
@@ -6043,7 +6058,28 @@ namespace Hook
 		// The opaque addresses are left intact for post-mortem diagnostics.
 		// Clearing readiness first prevents a render-thread draw from matching
 		// an object that has just been unequipped.
-		automaticSTSGeometryReady.store(false, std::memory_order_release);
+		//
+		// This runs on the game thread and takes effect immediately, including
+		// partway through a frame the render thread is still submitting. If it
+		// lands before ScopeFade -- which is drawn near the very end of the
+		// frame -- the aperture is skipped for that frame. Report the
+		// transition so a session where the lens never engages shows whether
+		// this is firing repeatedly.
+		if (automaticSTSGeometryReady.exchange(
+				false,
+				std::memory_order_acq_rel)) {
+			static std::atomic_uint32_t loggedInvalidations{ 0U };
+			const auto invalidationIndex =
+				loggedInvalidations.fetch_add(1U, std::memory_order_relaxed);
+			if (invalidationIndex < 16U) {
+				logger::info(
+					"Automatic STS geometry readiness cleared "
+					"(invalidation {}, draws observed this frame: {})",
+					invalidationIndex + 1U,
+					automaticSTSObservedDrawsThisFrame.load(
+						std::memory_order_relaxed));
+			}
+		}
 		automaticSTSReticleSetSequence.fetch_add(
 			1U,
 			std::memory_order_acq_rel);
@@ -6102,6 +6138,12 @@ namespace Hook
 		automaticSTSLastHousingOrdinal.store(
 			0U,
 			std::memory_order_relaxed);
+		automaticSTSObservedDrawsThisFrame.store(
+			0U,
+			std::memory_order_relaxed);
+		automaticSTSScopeFadeShapedDrawsThisFrame.store(
+			0U,
+			std::memory_order_relaxed);
 	}
 
 	void D3D::PublishAutomaticSTSGunState(
@@ -6139,6 +6181,10 @@ namespace Hook
 			// the lens never engaged, long after any log budget is spent.
 			const auto scopeFadeShapedDraws =
 				automaticSTSScopeFadeShapedDrawsThisFrame.exchange(
+					0U,
+					std::memory_order_acq_rel);
+			const auto observedDraws =
+				automaticSTSObservedDrawsThisFrame.exchange(
 					0U,
 					std::memory_order_acq_rel);
 			const auto reticleDraws =
@@ -6220,7 +6266,7 @@ namespace Hook
 			if (firingSighted || changed) {
 				logger::info(
 					"Stage 4d.2d draw telemetry: gunState={} ({}), "
-					"automaticDraws={}, "
+					"automaticDraws={}/{} observed, "
 					"ScopeFade=DI:{} DII:{} @{} shaped:{}, "
 					"Reticle=DI:{} DII:{} @{}, "
 					"Housing=DI:{} DII:{} @{}",
@@ -6232,6 +6278,7 @@ namespace Hook
 											"Sighted" :
 											"other"),
 					totalAutomaticDraws,
+					observedDraws,
 					scopeFadeDraws,
 					scopeFadeInstancedDraws,
 					scopeFadeOrdinal,
@@ -6262,6 +6309,17 @@ namespace Hook
 				std::memory_order_relaxed);
 			previousGunState.store(
 				gunState,
+				std::memory_order_relaxed);
+		} else {
+			// The telemetry above only runs while the readiness gate is open,
+			// so the observed-draw counter has to be cleared here too or it
+			// accumulates across every frame the gate was shut and reports a
+			// meaningless total on the frame it reopens.
+			automaticSTSObservedDrawsThisFrame.store(
+				0U,
+				std::memory_order_relaxed);
+			automaticSTSScopeFadeShapedDrawsThisFrame.store(
+				0U,
 				std::memory_order_relaxed);
 		}
 
@@ -6779,6 +6837,7 @@ namespace Hook
 	std::atomic<float> D3D::scopeApertureScaleRatio{ 1.0F };
 	std::atomic<float> D3D::scopeTubeDepth{ 0.0F };
 	std::atomic_uint32_t D3D::automaticSTSScopeFadeShapedDrawsThisFrame = 0U;
+	std::atomic_uint32_t D3D::automaticSTSObservedDrawsThisFrame = 0U;
 	std::atomic<float> D3D::scopeLensOffsetX{ 0.0F };
 	std::atomic<float> D3D::scopeLensOffsetY{ 0.0F };
 	std::atomic<float> D3D::scopeLensScale{ 1.0F };
