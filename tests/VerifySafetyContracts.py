@@ -422,7 +422,13 @@ def main() -> int:
         and "const bool exactDrawFrameValid" in shader
         and "if (!exactDrawFrameValid)" in shader
         and "tBACKBUFFER.SampleLevel(gSamLinear, screenUv, 0.0f)" in shader
-        and "publishedCenterPixels" not in shader
+        # Optical sampling must stay on the frame-exact solve. A published
+        # centre one frame stale would smear the magnified image during recoil.
+        # The scope-shadow mask is deliberately exempt and reads the published
+        # frame instead -- see the mask contract below -- so this pins the
+        # sampling pivot itself rather than banning the name outright.
+        and "const float2 currentCenterUv = centerPixels * PixelSize" in shader
+        and "shadowCenterPixels * PixelSize" not in shader
         and "float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y)" in shader
         and "EvaluateScopeShadow(" in shader
         and "shadow.visibility" in shader
@@ -534,16 +540,19 @@ def main() -> int:
         "const float currentProjectedRadius =" in shader
         and "float2 stableShadowCoordinates = normalizedLensPosition;"
         in shader
-        # The mask uses the published lens frame so its contour cannot pick up
-        # per-triangle seams, but only while that frame agrees with the
-        # aperture actually drawn; otherwise the shadow ring would sit visibly
-        # inside or outside the glass.
-        and "publishedFrameMatchesGeometry" in shader
-        and "abs(publishedRadius / currentProjectedRadius - 1.0f) < 0.15f"
-        in shader
+        # Every input to the scope-shadow mask -- coordinate, eye travel, and
+        # tube-parallax offset -- must come from the uniform published lens
+        # frame. Any of them read from the per-pixel solve is evaluated per
+        # triangle, and the disagreement between wedges shows up as radial
+        # spikes at the rim. That includes a validity predicate: a radius
+        # agreement guard here made wedges flip frames mid-lens.
+        and "const bool shadowFrameValid =" in shader
+        and "publishedFrameMatchesGeometry" not in shader
         and "float2 eyeTravelLens =" in shader
-        and "const float2 numeratorAtEye =" in shader
-        and "const float reciprocalWAtEye =" in shader
+        and "physicalEyeTravel * publishedRadius" in shader
+        and "const float2 numeratorAtEye =" not in shader
+        and "(shadowCenterPixels - opticalAxisPixels) / publishedRadius"
+        in shader
         and "SCOPE_SCENE_PARALLAX_STRENGTH" in shader
         and (
             "physicalEyeTravel /" in shader
@@ -593,8 +602,7 @@ def main() -> int:
         and "float2 stableShadowCoordinates = normalizedLensPosition;"
         in shader
         and "float2 eyeTravelLens =" in shader
-        and "const float2 numeratorAtEye =" in shader
-        and "const float reciprocalWAtEye =" in shader
+        and "physicalEyeTravel * publishedRadius" in shader
         and "CalculateScopeDrawTimeEyeTravel(" not in shader,
         "eye-box motion is not self-centering in ScopeFade-local coordinates",
     )
@@ -607,10 +615,15 @@ def main() -> int:
         and "kAngularLagDecaySeconds = 0.055F" in main_cpp
         and "state.angularLagX *= decay" in main_cpp
         and "state.angularLagY *= decay" in main_cpp
-        # Eye travel still reaches the pupil in exact ScopeFade replay
-        # coordinates rather than through a CPU projection from another frame.
+        # Eye travel reaches the pupil through the published basis inverse.
+        # It used to run through the replay's derivative frame, which is exact
+        # but triangle-local, so the mask's offset differed from wedge to
+        # wedge and the disagreement read as radial spikes at the rim. The
+        # reticle composite performs the identical conversion, which is what
+        # keeps the two layers' pupils on top of each other.
         and "float2 eyeTravelLens =" in shader
-        and "numeratorAtEye / reciprocalWAtEye" in shader
+        and "numeratorAtEye / reciprocalWAtEye" not in shader
+        and "eyeTravelPixels.x * shadowBasisZ.y" in shader
         # Eye travel now carries the optical-tube parallax term. A
         # recessed image disc that stays concentric with the aperture
         # only looks smaller; it still tracks the housing one-for-one.

@@ -468,23 +468,31 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
         float2(SCOPE_LENS_BASIS_ZX, SCOPE_LENS_BASIS_ZY);
     const float shadowBasisDeterminant =
         shadowBasisX.x * shadowBasisZ.y - shadowBasisX.y * shadowBasisZ.x;
-    // Fail back to the solved frame if the published basis does not describe
-    // the aperture actually being drawn. A mask circle that disagrees with the
-    // rim would put the shadow ring visibly inside or outside the glass, which
-    // is far worse than the faint wedge seams this replaces. Both radii are
-    // smooth across the lens, so this decision is uniform in practice rather
-    // than flipping from triangle to triangle.
+    // Every term the mask consumes below is uniform across the whole draw, and
+    // that is the entire point. It is not enough for the coordinate to come
+    // from the published frame: any predicate, offset, or scale built from the
+    // per-pixel solve is evaluated per triangle, so wedges landing on opposite
+    // sides of it select or shift the mask differently. A radius-agreement
+    // guard tried here did exactly that, and the flip showed up as 24 radial
+    // spikes reaching in from the rim, where the pupil falloff is steepest and
+    // the smallest coordinate disagreement is most visible.
+    //
+    // So the only validity test is whether the published basis is invertible.
+    // The reticle composite has always trusted it on those terms; the two
+    // layers agreeing with each other matters more than either agreeing with a
+    // frame-exact rim, and a one-frame-stale mask is invisible on a smooth
+    // radial function.
+    const bool shadowFrameValid =
+        abs(shadowBasisDeterminant) > 0.0001f;
     const float publishedRadius = max(
         0.5f * (length(shadowBasisX) + length(shadowBasisZ)),
         1.0f);
-    const bool publishedFrameMatchesGeometry =
-        abs(publishedRadius / currentProjectedRadius - 1.0f) < 0.15f;
+    const float2 shadowCenterPixels =
+        float2(SCOPE_LENS_CENTER_X, SCOPE_LENS_CENTER_Y);
     float2 stableShadowCoordinates = normalizedLensPosition;
-    if (publishedFrameMatchesGeometry &&
-        abs(shadowBasisDeterminant) > 0.0001f) {
+    if (shadowFrameValid) {
         const float2 shadowDisplacement =
-            input.position.xy -
-            float2(SCOPE_LENS_CENTER_X, SCOPE_LENS_CENTER_Y);
+            input.position.xy - shadowCenterPixels;
         stableShadowCoordinates = float2(
             (shadowDisplacement.x * shadowBasisZ.y -
              shadowDisplacement.y * shadowBasisZ.x) /
@@ -493,25 +501,26 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
              shadowDisplacement.y * shadowBasisX.x) /
                 shadowBasisDeterminant);
     }
+    // Display-X/Y travel becomes optic-local travel through the published basis
+    // inverse. This used to run through the derivative frame, which made the
+    // mask's offset differ from wedge to wedge -- the same faceting the
+    // coordinate change above removes, arriving by a second route. It is now
+    // the identical conversion the reticle composite performs, so both layers
+    // shift their pupil by the same amount by construction.
     float2 eyeTravelLens = float2(0.0f, 0.0f);
     if (physicalEyeTravelValid) {
         const float2 eyeTravelPixels =
-            physicalEyeTravel * currentProjectedRadius;
-        const float reciprocalWAtCenter =
-            reciprocalClipW +
-            reciprocalWDx * pixelsToCenter.x +
-            reciprocalWDy * pixelsToCenter.y;
-        const float2 numeratorAtEye =
-            numeratorDx * eyeTravelPixels.x +
-            numeratorDy * eyeTravelPixels.y;
-        const float reciprocalWAtEye =
-            reciprocalWAtCenter +
-            reciprocalWDx * eyeTravelPixels.x +
-            reciprocalWDy * eyeTravelPixels.y;
+            physicalEyeTravel * publishedRadius;
         eyeTravelLens =
-            abs(reciprocalWAtEye) > 0.000001f ?
-                numeratorAtEye / reciprocalWAtEye :
-                float2(0.0f, 0.0f);
+            shadowFrameValid ?
+                float2(
+                    (eyeTravelPixels.x * shadowBasisZ.y -
+                     eyeTravelPixels.y * shadowBasisZ.x) /
+                        shadowBasisDeterminant,
+                    (-eyeTravelPixels.x * shadowBasisX.y +
+                     eyeTravelPixels.y * shadowBasisX.x) /
+                        shadowBasisDeterminant) :
+                physicalEyeTravel;
     }
     // Positive relief moved the eyepiece farther away, so the lit disc
     // contracts slightly. The bound keeps ordinary breathing subtle and stops
@@ -544,9 +553,13 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // what a recessed image does -- it swings further than the rear glass. The
     // residual screen-centre offset is kept, since it is genuinely off-axis
     // when the optic is not centred, but it is no longer the only source.
+    //
+    // Measured in the published frame for the same reason as everything else
+    // here: the solved centre and radius are triangle-local, so driving the
+    // disc's offset from them gave each wedge its own recessed circle.
     const float2 opticalAxisPixels = 0.5f * ScreenSize;
     const float2 axisOffsetLens =
-        (centerPixels - opticalAxisPixels) / currentProjectedRadius;
+        (shadowCenterPixels - opticalAxisPixels) / publishedRadius;
     const float2 tubeParallaxLens =
         -(axisOffsetLens + eyeTravelLens) * saturate(ScopeTubeDepth);
 
