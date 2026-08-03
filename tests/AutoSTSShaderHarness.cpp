@@ -175,10 +175,12 @@ namespace
 	}
 }
 
-int wmain()
+int wmain(int argc, wchar_t** argv)
 {
 	try {
-		const auto project = std::filesystem::current_path();
+		const auto project = argc > 1 ?
+		                         std::filesystem::path(argv[1]) :
+		                         std::filesystem::current_path();
 		const auto shaderDirectory =
 			project / "Package" / "MagnaScope" / "Shaders" / "MagnaScope";
 		const auto vertexShaderBlob =

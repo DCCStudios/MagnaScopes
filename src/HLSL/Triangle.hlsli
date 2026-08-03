@@ -55,7 +55,11 @@ cbuffer ResolutionConstantData : register(b4){
 	float SCOPE_RETICLE_SIZE;
 	float SCOPE_RETICLE_OFFSET_X;
 	float SCOPE_RETICLE_OFFSET_Y;
-	float SCOPE_RETICLE_PADDING;
+	float SCOPE_EYE_RELIEF_DELTA;
+	float SCOPE_RETICLE_SHADOW_STRENGTH;
+	float SCOPE_RETICLE_PARALLAX_STRENGTH;
+	float SCOPE_LENS_CENTER_X;
+	float SCOPE_LENS_CENTER_Y;
 };
 
 cbuffer ScopeEffectData : register(b5)
@@ -103,7 +107,7 @@ cbuffer ScopeEffectData : register(b5)
 
 	float4x4 CameraRotation; 
 
-	float2 FTS_ScreenPos;
+	float2 ScopeScreenPos;
 	float2 Reticle_Offset;
 
 	row_major float4x4 projMat;
@@ -114,7 +118,8 @@ cbuffer ScopeEffectData : register(b5)
 	// how sharply the bend ramps toward the lens edge.
 	float FishEyeStrength;
 	float FishEyePower;
-	float2 padding6;
+	float ScopeSceneDepth;
+	float ScopeShadowDepth;
 };
 
 

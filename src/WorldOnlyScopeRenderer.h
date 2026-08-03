@@ -71,15 +71,16 @@ namespace MagnaScope
 		// atomic handoff; callers may publish from the game thread.
 		void RequestFrame(bool requested) noexcept;
 
-		// Called by the existing D3D11 DrawIndexed/DrawIndexedInstanced hooks
-		// before they forward the original draw. It is a no-op unless the call
-		// occurs while the verified first-person RenderBatches invocation is
-		// active. On the first draw whose live OM binding uniquely matches RT4,
-		// it copies that color into a private resource and publishes the
-		// same-frame SRV. No D3D binding is changed. Returns true only when this
-		// call completed the capture.
+		// Captures RT4 while the verified first-person RenderBatches invocation
+		// is active. The RenderBatches entry calls this with
+		// requireLiveBinding=false because that hook itself is the authoritative
+		// pre-first-person boundary; RT4 need not still be an OM output before
+		// the batch binds its first material. DrawIndexed fallbacks retain the
+		// stricter live-binding check. No D3D binding is changed. Returns true
+		// only when this call completed the capture.
 		[[nodiscard]] bool CaptureBeforeFirstPersonDraw(
-			ID3D11DeviceContext* context) noexcept;
+			ID3D11DeviceContext* context,
+			bool requireLiveBinding = true) noexcept;
 
 		[[nodiscard]] bool IsInstalled() const noexcept;
 

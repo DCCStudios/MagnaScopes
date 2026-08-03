@@ -1,4 +1,4 @@
-#include "FTSData.h"
+#include "ScopeProfile.h"
 
 #include <cmath>
 #include <filesystem>
@@ -48,14 +48,14 @@ namespace ScopeData
 
 		void UpdateConfigValue(std::string_view key, const json& value)
 		{
-			const std::filesystem::path path = "Data\\F4SE\\Plugins\\FTSConfig.json";
+			const std::filesystem::path path = "Data\\F4SE\\Plugins\\MagnaScopeConfig.json";
 			json data = json::object();
 			try {
 				if (std::ifstream input(path); input) {
 					data = json::parse(input, nullptr, true, true);
 				}
 			} catch (const std::exception& error) {
-				logger::error("FTSConfig.json is invalid; rebuilding it: {}", error.what());
+				logger::error("MagnaScopeConfig.json is invalid; rebuilding it: {}", error.what());
 			}
 
 			try {
@@ -67,13 +67,13 @@ namespace ScopeData
 				}
 				output << data.dump(2) << '\n';
 			} catch (const std::exception& error) {
-				logger::error("Unable to update FTSConfig.json key {}: {}", key, error.what());
+				logger::error("Unable to update MagnaScopeConfig.json key {}: {}", key, error.what());
 			}
 		}
 
 	}
 
-	FTSData::FTSData(std::string pathO)
+	ScopeProfile::ScopeProfile(std::string pathO)
 	{
 		path = pathO;
 	}
@@ -86,6 +86,8 @@ namespace ScopeData
 		p.relativeFogRadius = j.value("relativeFogRadius", 0.0F);
 		p.scopeSwayAmount = j.value("scopeSwayAmount", 0.0F);
 		p.maxTravel = j.value("maxTravel", 0.0F);
+		p.sceneDepth = j.value("sceneDepth", 1.0F);
+		p.shadowDepth = j.value("shadowDepth", 1.0F);
 	}
 
 	void from_json(const json& j, ZoomDataOverwrite& z)
@@ -134,14 +136,18 @@ namespace ScopeData
 		s.imageSharpen = j.value("ImageSharpen", 0.0F);
 		s.reticleMagnification =
 			j.value("ReticleMagnification", 1.0F);
+		s.reticleShadowStrength =
+			j.value("ReticleShadowStrength", 0.0F);
+		s.reticleParallaxStrength =
+			j.value("ReticleParallaxStrength", 1.0F);
 		s.fovAdjust = j.value("fovAdjust", 0.0F);
 		s.parallax = j.value("Parallax", Parallax());
 	}
 
-	void from_json(const json& j, FTSData& f)
+	void from_json(const json& j, ScopeProfile& f)
 	{
-		f.keywordName = j.value("keywordEditorID", "FTS_Default");
-		f.animFlavorEditorID = j.value("AnimFlavorKeywordEditorID", "FTS_NONE");
+		f.keywordName = j.value("keywordEditorID", "AUTO_Default");
+		f.animFlavorEditorID = j.value("AnimFlavorKeywordEditorID", "");
 		f.additionalKeywordsStr = j.value("AdditionalKeywords", "");
 
 		f.additionalKeywords.clear();
@@ -179,7 +185,9 @@ namespace ScopeData
 			{ "radius", p.radius },
 			{ "relativeFogRadius", p.relativeFogRadius },
 			{ "scopeSwayAmount", p.scopeSwayAmount },
-			{ "maxTravel", p.maxTravel }
+			{ "maxTravel", p.maxTravel },
+			{ "sceneDepth", p.sceneDepth },
+			{ "shadowDepth", p.shadowDepth }
 		};
 	}
 
@@ -225,14 +233,16 @@ namespace ScopeData
 			{ "ImageDenoise", s.imageDenoise },
 			{ "ImageSharpen", s.imageSharpen },
 			{ "ReticleMagnification", s.reticleMagnification },
+			{ "ReticleShadowStrength", s.reticleShadowStrength },
+			{ "ReticleParallaxStrength", s.reticleParallaxStrength },
 			{ "fovAdjust", s.fovAdjust },
 			//
 			{ "Parallax", s.parallax }
 		};
 	}
 
-	// 为FTSData类型定义to_json函数
-	void to_json(json& j, const FTSData& f)
+	// 为ScopeProfile类型定义to_json函数
+	void to_json(json& j, const ScopeProfile& f)
 	{
 		std::ostringstream oss;
 		for (int i = 0; i < f.additionalKeywords.size(); i++) {
@@ -267,34 +277,16 @@ namespace ScopeData
 	{
 	}
 
-	void ScopeDataHandler::WriteCurrentFTSData()
+	void ScopeDataHandler::WriteCurrentScopeProfile()
 	{
 		if (!currentData) {
 			return;
 		}
 
-		if (currentData->autoProfile) {
-			WriteAutoProfile(currentData);
-			return;
-		}
-
-		try {
-			const std::filesystem::path outputPath(currentData->path);
-			if (outputPath.has_parent_path()) {
-				std::filesystem::create_directories(outputPath.parent_path());
-			}
-			std::ofstream output(outputPath, std::ios::trunc);
-			if (!output) {
-				logger::error("Unable to write scope profile {}", outputPath.string());
-				return;
-			}
-			output << json(*currentData).dump(2) << '\n';
-		} catch (const std::exception& error) {
-			logger::error("Unable to write scope profile {}: {}", currentData->path, error.what());
-		}
+		WriteAutoProfile(currentData);
 	}
 
-	void ScopeDataHandler::ReloadFTSData(FTSData* data)
+	void ScopeDataHandler::ReloadScopeProfile(ScopeProfile* data)
 	{
 		if (!data) {
 			return;
@@ -327,18 +319,18 @@ namespace ScopeData
 		}
 	}
 
-	void ScopeDataHandler::ReloadCurrentFTSData()
+	void ScopeDataHandler::ReloadCurrentScopeProfile()
 	{
 	}
 
-	void ScopeDataHandler::SetCurrentFTSData(FTSData* data, bool containsAllAdditionkeyword)
+	void ScopeDataHandler::SetCurrentScopeProfile(ScopeProfile* data, bool containsAllAdditionkeyword)
 	{
 		currentData = data;
 		if (data)
 			data->containAlladditionalKeywords = containsAllAdditionkeyword;
 	}
 
-	FTSData* ScopeDataHandler::GetCurrentFTSData()
+	ScopeProfile* ScopeDataHandler::GetCurrentScopeProfile()
 	{
 		return currentData;
 	}
@@ -362,7 +354,7 @@ namespace ScopeData
 
 			const auto parsed = json::parse(input, nullptr, true, true);
 			const auto applyAutomaticOpticsDefaults =
-				[](const json& entry, FTSData& data) {
+				[](const json& entry, ScopeProfile& data) {
 					const auto shaderEntry = entry.find("ShaderData");
 					if (shaderEntry == entry.end() ||
 						!shaderEntry->is_object()) {
@@ -394,7 +386,7 @@ namespace ScopeData
 				const auto fileFormID = parsed.value("SourceFormID", 0U);
 				bool loadedAny = false;
 				for (const auto& [omodKey, entry] : parsed["Scopes"].items()) {
-					auto data = std::make_unique<FTSData>(path);
+					auto data = std::make_unique<ScopeProfile>(path);
 					entry.get_to(*data);
 					data->autoProfile = true;
 					applyAutomaticOpticsDefaults(entry, *data);
@@ -418,13 +410,13 @@ namespace ScopeData
 				return loadedAny;
 			}
 
-			auto data = std::make_unique<FTSData>(path);
+			auto data = std::make_unique<ScopeProfile>(path);
 			parsed.get_to(*data);
 
 			auto* dataPointer = data.get();
 			if (dataPointer->autoProfile && !dataPointer->sourcePlugin.empty() && dataPointer->sourceFormID != 0) {
 				applyAutomaticOpticsDefaults(parsed, *dataPointer);
-				// Legacy flat auto profile file (one weapon, one entry). Loads
+				// Earlier flat auto profile file (one weapon, one entry). Loads
 				// as the file-wide default entry; the next save rewrites the
 				// file in the per-scope container format.
 				dataPointer->omodKey = "Default";
@@ -432,7 +424,10 @@ namespace ScopeData
 					{ dataPointer->sourcePlugin, dataPointer->sourceFormID, dataPointer->omodKey },
 					dataPointer);
 			} else {
-				ScopeDataMap.emplace(dataPointer->keywordName, dataPointer);
+				logger::warn(
+					"Skipping non-automatic profile outside MagnaScope's STS contract: {}",
+					path);
+				return false;
 			}
 			ownedData.push_back(std::move(data));
 			return true;
@@ -512,14 +507,14 @@ namespace ScopeData
 
 	void ScopeDataHandler::ReadDefaultScopeDataFile()
 	{
-		const std::filesystem::path path = "Data\\F4SE\\Plugins\\FTSConfig.json";
+		const std::filesystem::path path = "Data\\F4SE\\Plugins\\MagnaScopeConfig.json";
 		json data = json::object();
 		try {
 			if (std::ifstream input(path); input) {
 				data = json::parse(input, nullptr, true, true);
 			}
 		} catch (const std::exception& error) {
-			logger::error("FTSConfig.json is invalid; using safe defaults: {}", error.what());
+			logger::error("MagnaScopeConfig.json is invalid; using safe defaults: {}", error.what());
 		}
 
 		PassRenderIndex = data.value("RenderPassIndex", 1);
@@ -550,7 +545,7 @@ namespace ScopeData
 			std::ofstream output(path, std::ios::trunc);
 			output << data.dump(2) << '\n';
 		} catch (const std::exception& error) {
-			logger::error("Unable to write FTSConfig.json defaults: {}", error.what());
+			logger::error("Unable to write MagnaScopeConfig.json defaults: {}", error.what());
 		}
 	}
 
@@ -615,23 +610,19 @@ namespace ScopeData
 		for (const auto& file : files) {
 			ReadScopeData(file);
 		}
-		logger::info(
-			"Loaded {} explicit and {} automatic scope profiles",
-			ScopeDataMap.size(),
-			autoProfileMap.size());
+		logger::info("Loaded {} automatic STS scope profiles", autoProfileMap.size());
 	}
 
 	void ScopeDataHandler::ReloadZoomData(std::string path)
 	{
-		SetCurrentFTSData(nullptr);
-		ScopeDataMap.clear();
+		SetCurrentScopeProfile(nullptr);
 		autoProfileMap.clear();
 		ownedData.clear();
 		ReadCustomScopeDataFiles(path);
 		ReadDefaultScopeDataFile();
 	}
 
-	FTSData* ScopeDataHandler::GetOrCreateAutoProfile(
+	ScopeProfile* ScopeDataHandler::GetOrCreateAutoProfile(
 		RE::TESObjectWEAP* weapon,
 		const RE::BGSZoomData::Data& zoomData,
 		std::string attachmentKey,
@@ -742,9 +733,9 @@ namespace ScopeData
 			},
 			'_');
 
-		const auto profilePath = std::filesystem::path("Data\\F4SE\\Plugins\\FTS\\Auto") /
+		const auto profilePath = std::filesystem::path("Data\\F4SE\\Plugins\\MagnaScope\\Auto") /
 		                         std::format("{}_{:08X}.json", safePlugin, sourceFormID);
-		auto profile = std::make_unique<FTSData>(profilePath.string());
+		auto profile = std::make_unique<ScopeProfile>(profilePath.string());
 		profile->keywordName = std::format("AUTO_{:08X} [{}]", sourceFormID, omodKey);
 		profile->omodKey = omodKey;
 		profile->legacyMode = true;
@@ -763,7 +754,8 @@ namespace ScopeData
 		// at the eyepiece and only see black scope interior at unzoomed FOV.
 		// The overlay starts at the configured default magnification and the
 		// mouse wheel can push it up to magnification * spread while aiming.
-		profile->shaderData.minZoom = std::max(1.0F, defaultMagnification);
+		(void)defaultMagnification;
+		profile->shaderData.minZoom = 1.0F;
 		profile->shaderData.maxZoom =
 			profile->shaderData.minZoom * std::max(1.0F, zoomSpread);
 		// Keep the center optically quiet and bend only subtly toward the rim.
@@ -783,6 +775,8 @@ namespace ScopeData
 		profile->shaderData.reticle_Offset[0] = 0.0F;
 		profile->shaderData.reticle_Offset[1] = 0.0F;
 		profile->shaderData.reticleMagnification = 1.0F;
+		profile->shaderData.reticleShadowStrength = 0.0F;
+		profile->shaderData.reticleParallaxStrength = 1.0F;
 		const float diameter = std::clamp(defaultDiameter, 64.0F, 2160.0F);
 		profile->shaderData.Size[0] = diameter;
 		profile->shaderData.Size[1] = diameter;
@@ -795,6 +789,8 @@ namespace ScopeData
 		profile->shaderData.parallax.relativeFogRadius = 7.0F;
 		profile->shaderData.parallax.scopeSwayAmount = 18.0F;
 		profile->shaderData.parallax.maxTravel = 4.0F;
+		profile->shaderData.parallax.sceneDepth = 1.0F;
+		profile->shaderData.parallax.shadowDepth = 1.0F;
 
 		// New automatic profiles begin from the weapon's authored sighted zoom
 		// and camera offsets. Lens magnification remains neutral at 1x until the
@@ -819,7 +815,7 @@ namespace ScopeData
 		return result;
 	}
 
-	bool ScopeDataHandler::WriteAutoProfile(FTSData* data)
+	bool ScopeDataHandler::WriteAutoProfile(ScopeProfile* data)
 	{
 		if (!data || !data->autoProfile || data->path.empty()) {
 			return false;
@@ -867,11 +863,6 @@ namespace ScopeData
 			logger::error("Unable to save STS auto profile {}: {}", data->path, error.what());
 			return false;
 		}
-	}
-
-	std::multimap<std::string, FTSData*>* ScopeDataHandler::GetScopeDataMap()
-	{
-		return &ScopeDataMap;
 	}
 
 	std::vector<std::string_view> splitSV(std::string_view strv, std::string_view delims)

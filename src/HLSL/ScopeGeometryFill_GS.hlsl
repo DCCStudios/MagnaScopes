@@ -13,13 +13,27 @@ struct GeometryOutput
 {
     float4 position : SV_Position;
 
-    // These are the authored lens-plane X/Z coordinates, not screen UVs.
-    // Ordinary perspective-correct interpolation gives every shared annulus
-    // edge the same values from both adjacent primitives. The pixel shader can
-    // therefore derive one continuous optical mapping even though packed
-    // ScopeFade positions do not preserve an exact 2:1 radius ratio.
-    float2 lensCoordinates : TEXCOORD0;
+    // Publish homogeneous lens coordinates with no perspective correction.
+    // The rasterizer linearly interpolates (localX / clipW,
+    // localZ / clipW, 1 / clipW) in display space. Dividing XY by Z recovers
+    // the authored lens coordinate exactly, while XY itself remains affine
+    // across the projected triangle. The pixel shader can therefore solve the
+    // projective center without pretending that perspective-correct local
+    // coordinates have one constant screen derivative.
+    noperspective float3 lensProjective : TEXCOORD0;
 };
+
+float3 MakeProjectiveLensCoordinates(
+    float4 clipPosition,
+    float2 lensCoordinates)
+{
+    const float safeClipW =
+        abs(clipPosition.w) > 0.000001f ?
+            clipPosition.w :
+            (clipPosition.w < 0.0f ? -0.000001f : 0.000001f);
+    const float reciprocalW = rcp(safeClipW);
+    return float3(lensCoordinates * reciprocalW, reciprocalW);
+}
 
 void AppendTriangle(
     inout TriangleStream<GeometryOutput> stream,
@@ -32,13 +46,19 @@ void AppendTriangle(
 {
     GeometryOutput output;
     output.position = first.position;
-    output.lensCoordinates = firstLensCoordinates;
+    output.lensProjective = MakeProjectiveLensCoordinates(
+        first.position,
+        firstLensCoordinates);
     stream.Append(output);
     output.position = second.position;
-    output.lensCoordinates = secondLensCoordinates;
+    output.lensProjective = MakeProjectiveLensCoordinates(
+        second.position,
+        secondLensCoordinates);
     stream.Append(output);
     output.position = third.position;
-    output.lensCoordinates = thirdLensCoordinates;
+    output.lensProjective = MakeProjectiveLensCoordinates(
+        third.position,
+        thirdLensCoordinates);
     stream.Append(output);
     stream.RestartStrip();
 }

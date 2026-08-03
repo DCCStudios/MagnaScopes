@@ -1,7 +1,8 @@
-#include "FTSData.h"
+#include "ScopeProfile.h"
 #include "EyeBoxRecentering.h"
 #include "ImGuiImpl.h"
 #include "Settings.h"
+#include "WorldOnlyScopeRenderer.h"
 #include <hooking.h>
 using namespace RE;
 using namespace BSScript;
@@ -222,7 +223,7 @@ namespace
 	MagnaScope::Settings& settings = MagnaScope::GetSettings();
 }
 
-bool bNeedToUpdateFTSData = true;
+bool bNeedToUpdateScopeProfile = true;
 bool bChangeAnimFlag = false;
 bool nvgFlag = false;
 bool hasCombo = false;
@@ -305,15 +306,25 @@ struct AutomaticSTSEyeBoxTrackingState
 	// calibration state into a stale-pointer read.
 	const RE::NiAVObject* apertureIdentity{ nullptr };
 	const void* profileIdentity{ nullptr };
-	RE::NiPoint3 baselineEyeLocal{};
-	RE::NiPoint3 candidateEyeLocal{};
-	RE::NiPoint3 previousEyeLocal{};
+	float baselineEyeLocalX{ 0.0F };
+	float baselineEyeLocalZ{ 0.0F };
+	float baselineEyeReliefDistance{ 0.0F };
 	Hook::D3D::PhysicalEyeBoxSample lastValidSample{};
-	float stableSeconds{ 0.0F };
-	bool hasCandidate{ false };
-	bool hasPrevious{ false };
+	// Published eye-box offsets are smoothed independently of the calibration
+	// baseline. Keeping the previous output makes a transient projection or
+	// baseline change converge continuously instead of snapping to zero or to a
+	// newly measured target.
+	float smoothedNormalizedX{ 0.0F };
+	float smoothedNormalizedY{ 0.0F };
+	float smoothedNormalizedRelief{ 0.0F };
+	RE::NiPoint3 previousCameraTranslation{};
+	RE::NiMatrix3 previousCameraRotation{};
+	float angularLagX{ 0.0F };
+	float angularLagY{ 0.0F };
 	bool baselineReady{ false };
 	bool hasLastValidSample{ false };
+	bool hasSmoothedOffset{ false };
+	bool previousCameraPoseReady{ false };
 };
 
 AutomaticSTSEyeBoxTrackingState automaticSTSEyeBoxTracking{};
@@ -351,7 +362,7 @@ float UpdateAutomaticSTSTracking(
 	bool apertureVisible,
 	float deltaSeconds)
 {
-	if (!aperture || !projection.valid) {
+	if (!aperture) {
 		ResetAutomaticSTSProjectionTracking();
 		return 0.0F;
 	}
@@ -371,6 +382,12 @@ float UpdateAutomaticSTSTracking(
 		return linearProgress * linearProgress *
 			(3.0F - 2.0F * linearProgress);
 	};
+	if (!projection.valid) {
+		// A CPU sphere can be invalid for a frame while the exact ScopeFade
+		// draw and the previous coherent projection remain usable. Do not
+		// invalidate the output or force the shader back to its center.
+		return activationProgress();
+	}
 
 	// ADS input arms the renderer before Fallout has finished raising the
 	// weapon, but the optical blend does not begin until ScopeAiming actually
@@ -445,11 +462,37 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 	if (state.apertureIdentity != aperture ||
 		state.profileIdentity != profileIdentity) {
 		// ScopeFade objects are rebuilt when a weapon or attachment changes.
-		// Never carry an eye position calibrated for one optical assembly into
-		// another, even if the generated profile happens to share defaults.
+		// Never carry a calibration baseline into another optical assembly, but
+		// preserve the already-published output while the replacement node is
+		// settling. This avoids a visible center snap during a scene-graph
+		// rebuild without reusing stale calibration data.
+		const bool preserveOutput =
+			state.profileIdentity == profileIdentity &&
+			state.hasSmoothedOffset;
+		const float savedX = state.smoothedNormalizedX;
+		const float savedY = state.smoothedNormalizedY;
+		const float savedRelief = state.smoothedNormalizedRelief;
+		const float savedAngularX = state.angularLagX;
+		const float savedAngularY = state.angularLagY;
+		const RE::NiPoint3 savedCameraTranslation =
+			state.previousCameraTranslation;
+		const RE::NiMatrix3 savedCameraRotation =
+			state.previousCameraRotation;
+		const bool savedCameraPoseReady = state.previousCameraPoseReady;
 		state = {};
 		state.apertureIdentity = aperture;
 		state.profileIdentity = profileIdentity;
+		if (preserveOutput) {
+			state.smoothedNormalizedX = savedX;
+			state.smoothedNormalizedY = savedY;
+			state.smoothedNormalizedRelief = savedRelief;
+			state.angularLagX = savedAngularX;
+			state.angularLagY = savedAngularY;
+			state.previousCameraTranslation = savedCameraTranslation;
+			state.previousCameraRotation = savedCameraRotation;
+			state.previousCameraPoseReady = savedCameraPoseReady;
+			state.hasSmoothedOffset = true;
+		}
 	}
 
 	const float worldScale = std::abs(aperture->world.scale);
@@ -465,163 +508,18 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		return lastValidOrCentered();
 	}
 
-	// STS ScopeFade's standardized 48-vertex annulus lies in local X/Z and
-	// uses local Y as its optical normal. Transforming the camera into that
-	// authored coordinate system makes weapon inertia, sway, and recoil show
-	// up as real eye-versus-optic motion without assuming screen center or
-	// reading FPGunplayOverhaul internals.
+	// STS ScopeFade's standardized 48-vertex annulus lies in local X/Z. Build
+	// its current projected basis, but measure camera-versus-optic displacement
+	// in that authored local plane. Screen-center drift is not a usable motion
+	// signal: a correctly aligned ADS optic remains centered while the camera
+	// turns, which reduced the prior scope-shadow input to approximately zero.
 	const RE::NiTransform inverseAperture = aperture->world.Invert();
 	const RE::NiPoint3 apertureLocalCenter =
 		inverseAperture * apertureWorldCenter;
-	const RE::NiPoint3 cameraLocal =
-		inverseAperture * camera->world.translate;
-	const RE::NiPoint3 eyeLocal = cameraLocal - apertureLocalCenter;
 	if (!IsFinitePoint(apertureLocalCenter) ||
-		!IsFinitePoint(cameraLocal) ||
-		!IsFinitePoint(eyeLocal)) {
+		!IsFinitePoint(apertureScreenCenter)) {
 		return lastValidOrCentered();
 	}
-
-	const float boundedDeltaSeconds =
-		std::clamp(deltaSeconds, 0.0F, 0.05F);
-	if (!state.baselineReady) {
-		// The centered pupil may already fade in during aim-in, but measured
-		// offsets begin only after the weapon settles. Use velocity and elapsed
-		// time rather than frame count so vanilla and FPGunplay inertia produce
-		// the same calibration at 30, 60, or 144 FPS.
-		if (activationProgress < 0.999F) {
-			state.hasCandidate = false;
-			state.hasPrevious = false;
-			state.stableSeconds = 0.0F;
-		} else if (!state.hasCandidate || !state.hasPrevious) {
-			state.candidateEyeLocal = eyeLocal;
-			state.previousEyeLocal = eyeLocal;
-			state.hasCandidate = true;
-			state.hasPrevious = true;
-			state.stableSeconds = 0.0F;
-		} else {
-			const float elapsed =
-				std::max(boundedDeltaSeconds, 1.0F / 240.0F);
-			const float normalizedVelocity =
-				(eyeLocal - state.previousEyeLocal).Length() /
-				(localRadius * elapsed);
-			state.previousEyeLocal = eyeLocal;
-			constexpr float kMaximumCalibrationVelocity = 1.50F;
-			if (!std::isfinite(normalizedVelocity) ||
-				normalizedVelocity > kMaximumCalibrationVelocity) {
-				state.candidateEyeLocal = eyeLocal;
-				state.stableSeconds = 0.0F;
-			} else {
-				// Time-constant EMA rejects idle micro-motion without making
-				// the baseline depend on how many frames fit in the window.
-				constexpr float kCalibrationTimeConstant = 0.08F;
-				const float blend =
-					1.0F -
-					std::exp(
-						-boundedDeltaSeconds /
-						kCalibrationTimeConstant);
-				state.candidateEyeLocal +=
-					(eyeLocal - state.candidateEyeLocal) * blend;
-				state.stableSeconds += boundedDeltaSeconds;
-				constexpr float kRequiredStableSeconds = 0.12F;
-				if (state.stableSeconds >= kRequiredStableSeconds) {
-					state.baselineEyeLocal = state.candidateEyeLocal;
-					state.baselineReady = true;
-					state.previousEyeLocal = eyeLocal;
-					state.hasPrevious = true;
-					logger::info(
-						"Automatic STS physical eye-box baseline ready: "
-						"eyeLocal=({:.4f}, {:.4f}, {:.4f}), "
-						"localRadius={:.4f}, stableSeconds={:.3f}",
-						state.baselineEyeLocal.x,
-						state.baselineEyeLocal.y,
-						state.baselineEyeLocal.z,
-						localRadius,
-						state.stableSeconds);
-				}
-			}
-		}
-	}
-
-	if (state.baselineReady) {
-		// Parallax is a transient response to relative eye/optic motion, not a
-		// persistent function of the direction in which the player looks.
-		// Follow a settled optic with a short time constant, but freeze the
-		// baseline while recoil, sway, or weapon-inertia motion is occurring.
-		// This forms a bounded high-pass response: movement exposes scope
-		// shadow and shifts the scene, then a stationary aim always returns to
-		// the authored optical center regardless of camera pitch or yaw.
-		const float normalizedDisplacement =
-			(eyeLocal - state.baselineEyeLocal).Length() /
-			localRadius;
-		if (!std::isfinite(normalizedDisplacement)) {
-			return lastValidOrCentered();
-		} else {
-			const float elapsed =
-				std::max(boundedDeltaSeconds, 1.0F / 240.0F);
-			const RE::NiPoint3 previousEye =
-				state.hasPrevious ? state.previousEyeLocal : eyeLocal;
-			const float normalizedVelocity =
-				(eyeLocal - previousEye).Length() /
-				(localRadius * elapsed);
-			state.previousEyeLocal = eyeLocal;
-			state.hasPrevious = true;
-
-			if (std::isfinite(normalizedVelocity)) {
-				const float recenterBlend =
-					MagnaScope::EyeBoxRecentering::CalculateBlend(
-						normalizedVelocity,
-						boundedDeltaSeconds,
-						normalizedDisplacement);
-				state.baselineEyeLocal +=
-					(eyeLocal - state.baselineEyeLocal) *
-					recenterBlend;
-			}
-		}
-	}
-
-	// Before calibration completes the centered zero-offset pupil is still a
-	// valid optical result. This removes the former one-frame pop after the
-	// ADS transition; only live displacement waits for a settled baseline.
-	const RE::NiPoint3 deltaLocal =
-		state.baselineReady ?
-			eyeLocal - state.baselineEyeLocal :
-			RE::NiPoint3{};
-	float normalizedX = deltaLocal.x / localRadius;
-	float normalizedY = deltaLocal.z / localRadius;
-	float normalizedRelief =
-		state.baselineReady ?
-			(std::abs(eyeLocal.y) -
-			 std::abs(state.baselineEyeLocal.y)) /
-				localRadius :
-			0.0F;
-	if (!std::isfinite(normalizedX) ||
-		!std::isfinite(normalizedY) ||
-		!std::isfinite(normalizedRelief)) {
-		return lastValidOrCentered();
-	}
-	// A sharp but finite drag remains a valid optical sample. Clamp the
-	// published pupil travel instead of invalidating it, which formerly made
-	// the shader snap to its zero-offset fallback for one frame.
-	const float maximumTravel = std::clamp(
-		Hook::D3D::scopeEyeBoxMaxTravel.load(std::memory_order_acquire),
-		0.0F,
-		4.0F);
-	const float planarLength =
-		std::sqrt(normalizedX * normalizedX + normalizedY * normalizedY);
-	if (planarLength > maximumTravel && planarLength > 0.0001F) {
-		const float scale = maximumTravel / planarLength;
-		normalizedX *= scale;
-		normalizedY *= scale;
-	}
-	normalizedRelief =
-		std::clamp(normalizedRelief, -maximumTravel, maximumTravel);
-
-	// Project one physical aperture radius along each in-plane local axis.
-	// The resulting pixel vectors preserve roll, perspective, off-center
-	// authoring, and non-square render surfaces. A later shader can multiply
-	// the normalized local displacement by these vectors without inventing a
-	// screen-space orientation.
 	const RE::NiPoint3 xAxisWorld =
 		aperture->world *
 		(apertureLocalCenter + RE::NiPoint3{ localRadius, 0.0F, 0.0F });
@@ -632,11 +530,8 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		hookIns->WorldPointToScreen(camera, xAxisWorld, firstPersonFov);
 	const RE::NiPoint3 zAxisScreen =
 		hookIns->WorldPointToScreen(camera, zAxisWorld, firstPersonFov);
-	if (!IsFinitePoint(apertureScreenCenter) ||
-		!IsFinitePoint(xAxisScreen) ||
-		!IsFinitePoint(zAxisScreen) ||
-		xAxisScreen.z <= 0.001F ||
-		zAxisScreen.z <= 0.001F) {
+	if (!IsFinitePoint(xAxisScreen) || !IsFinitePoint(zAxisScreen) ||
+		xAxisScreen.z <= 0.001F || zAxisScreen.z <= 0.001F) {
 		return lastValidOrCentered();
 	}
 
@@ -648,18 +543,220 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		std::sqrt(basisXX * basisXX + basisXY * basisXY);
 	const float zBasisLength =
 		std::sqrt(basisZX * basisZX + basisZY * basisZY);
-	if (!std::isfinite(xBasisLength) ||
-		!std::isfinite(zBasisLength) ||
-		xBasisLength <= 0.01F ||
-		zBasisLength <= 0.01F ||
-		xBasisLength > 100000.0F ||
-		zBasisLength > 100000.0F) {
+	const float averageBasisLength = 0.5F * (xBasisLength + zBasisLength);
+	if (!std::isfinite(xBasisLength) || !std::isfinite(zBasisLength) ||
+		!std::isfinite(averageBasisLength) ||
+		xBasisLength <= 0.01F || zBasisLength <= 0.01F ||
+		xBasisLength > 100000.0F || zBasisLength > 100000.0F) {
 		return lastValidOrCentered();
 	}
 
-	result.eyeOffsetX = normalizedX;
-	result.eyeOffsetY = normalizedY;
-	result.eyeReliefDelta = normalizedRelief;
+	const float boundedDeltaSeconds =
+		std::clamp(deltaSeconds, 0.0F, 0.05F);
+	// ScopeFade lies in local X/Z, making local Y its authored optical normal.
+	// Measure the camera against that plane in ScopeFade-local coordinates.
+	// Unlike camera-view Z, this distance cannot change merely because the
+	// player pans or pitches while the camera and optic remain a rigid pair.
+	const RE::NiPoint3 cameraApertureLocal =
+		inverseAperture * camera->world.translate;
+	const float currentEyeReliefDistance =
+		MagnaScope::EyeBoxRecentering::CalculateEyeReliefDistance(
+			cameraApertureLocal.y,
+			apertureLocalCenter.y);
+	if (!IsFinitePoint(cameraApertureLocal) ||
+		!std::isfinite(currentEyeReliefDistance) ||
+		currentEyeReliefDistance <= 0.001F) {
+		return lastValidOrCentered();
+	}
+	if (!state.baselineReady || activationProgress <= 0.001F) {
+		// Start exactly centered. A stationary optic must never inherit a
+		// heading-dependent calibration error from a previous pose.
+		state.baselineEyeLocalX = cameraApertureLocal.x;
+		state.baselineEyeLocalZ = cameraApertureLocal.z;
+		state.baselineEyeReliefDistance = currentEyeReliefDistance;
+		state.baselineReady = true;
+	} else {
+		// The settled eye point follows the current camera position continuously
+		// in ScopeFade-local space.  The difference is a bounded high-pass motion
+		// signal: rigid camera/weapon rotation cancels, relative weapon inertia
+		// remains visible, and a stationary pose returns asymptotically to center
+		// without thresholds or a final snap.
+		constexpr float kOpticalFollowerTimeConstant = 0.090F;
+		const float followerBlend =
+			MagnaScope::EyeBoxRecentering::CalculateResponseAlpha(
+				boundedDeltaSeconds,
+				kOpticalFollowerTimeConstant);
+		state.baselineEyeLocalX +=
+			(cameraApertureLocal.x - state.baselineEyeLocalX) * followerBlend;
+		state.baselineEyeLocalZ +=
+			(cameraApertureLocal.z - state.baselineEyeLocalZ) * followerBlend;
+		// Axial depth is independent from the planar follower even though both
+		// use a smooth response. A lateral pan therefore cannot make the exit
+		// pupil uniformly shrink or grow.
+		state.baselineEyeReliefDistance +=
+			(currentEyeReliefDistance - state.baselineEyeReliefDistance) *
+			followerBlend;
+	}
+
+	// Convert the local eye displacement through the *current* projected basis.
+	// The shaders consume display X/Y and invert that same basis at draw time,
+	// recovering a direction-independent optic-local pupil displacement.
+	const auto screenEyeOffset =
+		MagnaScope::EyeBoxRecentering::ProjectLocalEyeOffsetToScreen(
+			cameraApertureLocal.x,
+			cameraApertureLocal.z,
+			state.baselineEyeLocalX,
+			state.baselineEyeLocalZ,
+			localRadius,
+			basisXX,
+			basisXY,
+			basisZX,
+			basisZY,
+			averageBasisLength);
+	if (!screenEyeOffset.valid) {
+		return lastValidOrCentered();
+	}
+	const float maximumTravel = std::clamp(
+		Hook::D3D::scopeEyeBoxMaxTravel.load(std::memory_order_acquire),
+		0.0F,
+		4.0F);
+
+	// Weapon-relative camera displacement above is the physically meaningful
+	// signal for first-person inertia. A rigid camera/weapon rotation cancels in
+	// that local frame, however, so it cannot by itself produce the familiar
+	// transient eye-box shadow during a quick pan. Measure that second signal by
+	// projecting the previous and current camera forward rays through the
+	// *current* camera. This is display-local rather than world-heading-local:
+	// right is always right and up is always up, regardless of compass heading
+	// or pitch. prev-current makes the pupil lag opposite the camera movement.
+	const RE::NiPoint3 currentCameraTranslation = camera->world.translate;
+	const RE::NiMatrix3 currentCameraRotation = camera->world.rotate;
+	if (!state.previousCameraPoseReady || activationProgress <= 0.001F) {
+		state.previousCameraTranslation = currentCameraTranslation;
+		state.previousCameraRotation = currentCameraRotation;
+		state.previousCameraPoseReady = true;
+		state.angularLagX = 0.0F;
+		state.angularLagY = 0.0F;
+	} else {
+		constexpr float kForwardDistance = 1000.0F;
+		const RE::NiPoint3 localForward{ 0.0F, 0.0F, -kForwardDistance };
+		const RE::NiPoint3 previousForwardWorld =
+			state.previousCameraTranslation +
+			state.previousCameraRotation.Transpose() * localForward;
+		const RE::NiPoint3 currentForwardWorld =
+			currentCameraTranslation +
+			currentCameraRotation.Transpose() * localForward;
+		const RE::NiPoint3 previousForwardScreen = hookIns->WorldPointToScreen(
+			camera,
+			previousForwardWorld,
+			firstPersonFov);
+		const RE::NiPoint3 currentForwardScreen = hookIns->WorldPointToScreen(
+			camera,
+			currentForwardWorld,
+			firstPersonFov);
+
+		constexpr float kAngularLagDecaySeconds = 0.055F;
+		const float decay = std::exp(
+			-boundedDeltaSeconds / kAngularLagDecaySeconds);
+		state.angularLagX *= decay;
+		state.angularLagY *= decay;
+		if (IsFinitePoint(previousForwardScreen) &&
+			IsFinitePoint(currentForwardScreen) &&
+			previousForwardScreen.z > 0.001F &&
+			currentForwardScreen.z > 0.001F) {
+			float impulseX =
+				(previousForwardScreen.x - currentForwardScreen.x) /
+				averageBasisLength *
+				MagnaScope::EyeBoxRecentering::kAngularLagGain;
+			float impulseY =
+				(previousForwardScreen.y - currentForwardScreen.y) /
+				averageBasisLength *
+				MagnaScope::EyeBoxRecentering::kAngularLagGain;
+			// Bound the accumulated lag, not the individual impulse. Clamping
+			// each impulse still let the decaying sum settle far past the
+			// configured travel, and it put a derivative discontinuity in the
+			// middle of a fast pan.
+			MagnaScope::EyeBoxRecentering::SoftLimitVector(
+				impulseX,
+				impulseY,
+				maximumTravel);
+			if (std::isfinite(impulseX) && std::isfinite(impulseY)) {
+				state.angularLagX += impulseX;
+				state.angularLagY += impulseY;
+				MagnaScope::EyeBoxRecentering::SoftLimitVector(
+					state.angularLagX,
+					state.angularLagY,
+					maximumTravel);
+			}
+		}
+		state.previousCameraTranslation = currentCameraTranslation;
+		state.previousCameraRotation = currentCameraRotation;
+	}
+
+	float normalizedX = screenEyeOffset.x + state.angularLagX;
+	float normalizedY = screenEyeOffset.y + state.angularLagY;
+	const auto axialEyeRelief =
+		MagnaScope::EyeBoxRecentering::CalculateAxialEyeRelief(
+			currentEyeReliefDistance,
+			state.baselineEyeReliefDistance);
+	// Axial relief is optional. A malformed or temporarily unavailable depth
+	// sample must not discard valid lateral X/Y travel, because that invalidates
+	// the complete physical-eye-box sample and disables the stationary rim.
+	float normalizedRelief =
+		axialEyeRelief.valid ? axialEyeRelief.normalizedDelta : 0.0F;
+	if (!std::isfinite(normalizedX) ||
+		!std::isfinite(normalizedY) ||
+		!std::isfinite(normalizedRelief)) {
+		return lastValidOrCentered();
+	}
+	// A sharp but finite drag remains a valid optical sample. Clamp the
+	// published pupil travel instead of invalidating it, which formerly made
+	// the shader snap to its zero-offset fallback for one frame.
+	const float planarLength =
+		std::sqrt(normalizedX * normalizedX + normalizedY * normalizedY);
+	if (planarLength > maximumTravel && planarLength > 0.0001F) {
+		const float scale = maximumTravel / planarLength;
+		normalizedX *= scale;
+		normalizedY *= scale;
+	}
+	normalizedRelief =
+		std::clamp(normalizedRelief, -maximumTravel, maximumTravel);
+
+	// The follower above already provides continuous motion. Keep only a very
+	// short output filter to reject one-frame scene-graph noise without adding a
+	// second visible lag or a delayed final snap.
+	const float responseAlpha =
+		MagnaScope::EyeBoxRecentering::CalculateResponseAlpha(
+			boundedDeltaSeconds,
+			0.010F);
+	if (!state.hasSmoothedOffset) {
+		state.smoothedNormalizedX = 0.0F;
+		state.smoothedNormalizedY = 0.0F;
+		state.smoothedNormalizedRelief = 0.0F;
+		state.hasSmoothedOffset = true;
+	}
+	state.smoothedNormalizedX +=
+		(normalizedX - state.smoothedNormalizedX) * responseAlpha;
+	state.smoothedNormalizedY +=
+		(normalizedY - state.smoothedNormalizedY) * responseAlpha;
+	state.smoothedNormalizedRelief +=
+		(normalizedRelief - state.smoothedNormalizedRelief) * responseAlpha;
+	state.smoothedNormalizedX = std::clamp(
+		state.smoothedNormalizedX,
+		-maximumTravel,
+		maximumTravel);
+	state.smoothedNormalizedY = std::clamp(
+		state.smoothedNormalizedY,
+		-maximumTravel,
+		maximumTravel);
+	state.smoothedNormalizedRelief = std::clamp(
+		state.smoothedNormalizedRelief,
+		-maximumTravel,
+		maximumTravel);
+
+	result.eyeOffsetX = state.smoothedNormalizedX;
+	result.eyeOffsetY = state.smoothedNormalizedY;
+	result.eyeReliefDelta = state.smoothedNormalizedRelief;
 	result.lensBasisXX = basisXX;
 	result.lensBasisXY = basisXY;
 	result.lensBasisZX = basisZX;
@@ -959,12 +1056,11 @@ NiPoint4 currPosition;
 BSTimer* uiTimer;
 //float deltaTime;
 
-REL::Relocation<uintptr_t> ptr_PCUpdateMainThread{ REL::ID(633524), 0x22D };
 uintptr_t PCUpdateMainThreadOrig;
 
 BGSKeyword* ChangeAnimFlavorKeyword = nullptr;
-ScopeData::FTSData* currentData;
-const char* customPath = "Data\\F4SE\\Plugins\\FTS";
+ScopeData::ScopeProfile* currentData;
+const char* customPath = "Data\\F4SE\\Plugins\\MagnaScope\\Auto";
 
 using namespace Hook;
 
@@ -1303,14 +1399,14 @@ void WriteSelectedZoomOverride(const ScopeData::ZoomDataOverwrite& overrideData)
 	selectedZoomOverrideApplied = true;
 }
 
-void ApplySelectedZoomOverride(const ScopeData::FTSData* profile)
+void ApplySelectedZoomOverride(const ScopeData::ScopeProfile* profile)
 {
 	if (!settings.AllowsOverrides() ||
 		!profile || !HasSelectedZoomSession()) {
 		return;
 	}
 
-	// Match original FTS by changing the selected form's values before aim
+	// Match original scope-rendering by changing the selected form's values before aim
 	// starts. Never replace the pointer cached by Fallout systems.
 	originalZoomForm->zoomData.fovMult = originalZoomData.fovMult;
 	if (selectedCameraOverrideApplied ||
@@ -1354,8 +1450,8 @@ void ApplySelectedEditorPreview(
 }
 
 [[nodiscard]] bool IsSameProfileIdentity(
-	const ScopeData::FTSData& left,
-	const ScopeData::FTSData& right)
+	const ScopeData::ScopeProfile& left,
+	const ScopeData::ScopeProfile& right)
 {
 	// Automatic profiles share one file per weapon, so path alone is not
 	// enough. The attachment key keeps a delayed save from crossing into a
@@ -1397,13 +1493,16 @@ void ReattachIsolatedZoomAfterSave()
 
 inline void InitCurrentScopeData()
 {
-	const auto selectProfile = [](ScopeData::FTSData* profile, bool containsAllAdditionalKeywords = true) {
+	const auto selectProfile = [](ScopeData::ScopeProfile* profile, bool containsAllAdditionalKeywords = true) {
 		// A profile selection can replace the first-person NIF and its pooled
 		// D3D suballocations. Clear the old identity before exposing the new
 		// profile to the render thread.
 		InvalidateAutomaticSTSSelection();
-		sdh->SetCurrentFTSData(profile, containsAllAdditionalKeywords);
+		sdh->SetCurrentScopeProfile(profile, containsAllAdditionalKeywords);
 		currentData = profile;
+		MagnaScope::WorldOnlyScopeRenderer::GetSingleton().RequestFrame(
+			settings.AllowsWorldColorCapture() && profile != nullptr &&
+			profile->autoProfile && containsAllAdditionalKeywords);
 
 		// Apply the profile before Fallout begins an aim transition without
 		// replacing the BGSZoomData pointer cached by the engine.
@@ -1415,9 +1514,10 @@ inline void InitCurrentScopeData()
 	};
 
 	const auto clearSelection = [] {
+		MagnaScope::WorldOnlyScopeRenderer::GetSingleton().RequestFrame(false);
 		InvalidateAutomaticSTSSelection();
 		ClearIsolatedZoomSession();
-		sdh->SetCurrentFTSData(nullptr);
+		sdh->SetCurrentScopeProfile(nullptr);
 		currentData = nullptr;
 		weaponInstanceData = nullptr;
 		bFirstTimeZoomData = false;
@@ -1482,96 +1582,6 @@ inline void InitCurrentScopeData()
 			nullptr,
 			zoomSelectionRevision);
 		imgui_Impl->UpdateWeaponInstance(nullptr);
-	}
-
-	BSScrapArray<const BGSKeyword*> weaponKeywords;
-	if (instance->keywords) {
-		instance->keywords->CollectAllKeywords(weaponKeywords, nullptr);
-	}
-
-	constexpr std::string_view ftsPrefix = "FTS_";
-	const auto explicitKeyword = std::find_if(
-		weaponKeywords.begin(),
-		weaponKeywords.end(),
-		[](const BGSKeyword* keyword) {
-			return keyword && keyword->formEditorID.size() >= ftsPrefix.size() &&
-		           std::strncmp(keyword->formEditorID.c_str(), ftsPrefix.data(), ftsPrefix.size()) == 0;
-		});
-
-	if (explicitKeyword != weaponKeywords.end()) {
-		auto* scopeDataMap = sdh->GetScopeDataMap();
-		const std::string explicitKey((*explicitKeyword)->formEditorID.c_str());
-		const auto [first, last] = scopeDataMap->equal_range(explicitKey);
-		const auto* magnifierKeyword = IsMagnifier();
-
-		ScopeData::FTSData* bestProfile = nullptr;
-		std::size_t bestSpecificity = 0;
-		std::size_t candidateCount = 0;
-		for (auto profileIt = first; profileIt != last; ++profileIt) {
-			++candidateCount;
-			auto* profile = profileIt->second;
-			if (!profile) {
-				continue;
-			}
-
-			const bool hasAdditionalKeywords = std::ranges::all_of(
-				profile->additionalKeywords,
-				[instance](const std::string& keyword) {
-					return instance->keywords &&
-				           instance->keywords->HasKeywordString(keyword);
-				});
-			if (!hasAdditionalKeywords) {
-				continue;
-			}
-
-			const std::string animationFlavor = magnifierKeyword ?
-			                                        std::string(magnifierKeyword->formEditorID.c_str()) :
-			                                        profile->animFlavorEditorID;
-			const bool hasAnimationFlavor =
-				animationFlavor.empty() ||
-				animationFlavor == "FTS_NONE" ||
-				[&animationFlavor] {
-					const auto* requiredKeyword =
-						TESForm::GetFormByEditorID<BGSKeyword>(animationFlavor.c_str());
-					return requiredKeyword && player->HasKeyword(requiredKeyword);
-				}();
-			if (!hasAnimationFlavor) {
-				continue;
-			}
-
-			// Multiple shipped FTS patches may share one FTS_ keyword and
-			// distinguish variants with attachment or animation keywords.
-			// Prefer the most constrained matching entry; stable file/load
-			// order breaks ties so existing single-profile patches are
-			// unchanged.
-			const std::size_t specificity =
-				profile->additionalKeywords.size() +
-				((!profile->animFlavorEditorID.empty() &&
-					 profile->animFlavorEditorID != "FTS_NONE") ?
-						1U :
-						0U);
-			if (!bestProfile || specificity > bestSpecificity) {
-				bestProfile = profile;
-				bestSpecificity = specificity;
-			}
-		}
-
-		if (bestProfile) {
-			selectProfile(bestProfile);
-			logger::info(
-				"Selected explicit FTS profile {} from {} candidate(s), specificity {}",
-				bestProfile->keywordName,
-				candidateCount,
-				bestSpecificity);
-			return;
-		}
-		if (candidateCount > 0) {
-			logger::warn(
-				"No explicit FTS profile variant matched {} ({} candidate(s)); "
-				"trying automatic STS discovery",
-				explicitKey,
-				candidateCount);
-		}
 	}
 
 	// ScopeViewParts contains STS's authored aperture geometry. The geometry
@@ -1706,9 +1716,9 @@ bool IsNeedToBeCull(int indexCount = 0, int StrideCount = 0)
 {
 	if (!ScopeData::ScopeDataHandler::GetSingleton())
 		return false;
-	if (!ScopeData::ScopeDataHandler::GetSingleton()->GetCurrentFTSData())
+	if (!ScopeData::ScopeDataHandler::GetSingleton()->GetCurrentScopeProfile())
 		return false;
-	if (ScopeData::ScopeDataHandler::GetSingleton()->GetCurrentFTSData()->UsingSTS)
+	if (ScopeData::ScopeDataHandler::GetSingleton()->GetCurrentScopeProfile()->UsingSTS)
 		return false;
 	if (hasUpdateSighted)
 		return false;
@@ -1771,7 +1781,7 @@ void HookedUpdate()
 	if (InGameFlag && player && player->Get3D(true)) {
 		// Forced aim requested by the customization menu (which renders on
 		// the D3D thread); applied here on the game thread. Mirrors the
-		// original FTS PlayerAim: block game keyboard/mouse processing (so
+		// original scope-rendering PlayerAim: block game keyboard/mouse processing (so
 		// the engine's "aim button not held" check cannot cancel the sighted
 		// state next frame), set the sighted state, and play the vanilla
 		// sighted enter/exit idle so the weapon actually raises or lowers.
@@ -1844,8 +1854,8 @@ void HookedUpdate()
 			if (currentData &&
 				IsSameProfileIdentity(*currentData, *pendingSave)) {
 				*currentData = *pendingSave;
-				sdh->SetCurrentFTSData(currentData);
-				sdh->WriteCurrentFTSData();
+				sdh->SetCurrentScopeProfile(currentData);
+				sdh->WriteCurrentScopeProfile();
 				InitCurrentScopeData();
 				hookIns->bRefreshChar.store(
 					true,
@@ -1869,7 +1879,7 @@ void HookedUpdate()
 				currentData &&
 				(!currentData->autoProfile ||
 					std::filesystem::exists(currentData->path))) {
-				sdh->ReloadFTSData(currentData);
+				sdh->ReloadScopeProfile(currentData);
 			}
 			InitCurrentScopeData();
 			hookIns->bRefreshChar.store(true, std::memory_order_release);
@@ -1924,6 +1934,12 @@ void HookedUpdate()
 				Hook::D3D::scopeReticleOffsetY.store(
 					editorPreview.reticleOffsetY,
 					std::memory_order_release);
+				Hook::D3D::scopeReticleShadowStrength.store(
+					editorPreview.reticleShadowStrength,
+					std::memory_order_release);
+				Hook::D3D::scopeReticleParallaxStrength.store(
+					editorPreview.reticleParallaxStrength,
+					std::memory_order_release);
 				Hook::D3D::scopeEyeBoxRadius.store(
 					editorPreview.eyeBoxRadius,
 					std::memory_order_release);
@@ -1941,6 +1957,12 @@ void HookedUpdate()
 					std::memory_order_release);
 				Hook::D3D::scopeOpticalLagStrength.store(
 					editorPreview.opticalLagStrength,
+					std::memory_order_release);
+				Hook::D3D::scopeSceneDepth.store(
+					editorPreview.sceneDepth,
+					std::memory_order_release);
+				Hook::D3D::scopeShadowDepth.store(
+					editorPreview.shadowDepth,
 					std::memory_order_release);
 				editorPreviewApplied = true;
 			} else {
@@ -2023,6 +2045,18 @@ void HookedUpdate()
 						-1000.0F,
 						1000.0F),
 					std::memory_order_release);
+				Hook::D3D::scopeReticleShadowStrength.store(
+					std::clamp(
+						currentData->shaderData.reticleShadowStrength,
+						0.0F,
+						1.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeReticleParallaxStrength.store(
+					std::clamp(
+						currentData->shaderData.reticleParallaxStrength,
+						0.0F,
+						4.0F),
+					std::memory_order_release);
 				Hook::D3D::scopeEyeBoxRadius.store(
 					std::clamp(
 						currentData->shaderData.parallax.radius,
@@ -2059,6 +2093,18 @@ void HookedUpdate()
 						0.0F,
 						4.0F),
 					std::memory_order_release);
+				Hook::D3D::scopeSceneDepth.store(
+					std::clamp(
+						currentData->shaderData.parallax.sceneDepth,
+						0.0F,
+						4.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeShadowDepth.store(
+					std::clamp(
+						currentData->shaderData.parallax.shadowDepth,
+						0.0F,
+						4.0F),
+					std::memory_order_release);
 			}
 
 			if (!settings.AllowsProjection()) {
@@ -2079,7 +2125,7 @@ void HookedUpdate()
 				bFirstTimeZoomData = settings.AllowsOverrides();
 			}
 
-			// The inherited FTS hook read first-person world transforms before
+			// The inherited scope hook read first-person world transforms before
 			// invoking this original update call. On Fallout 4's flattened
 			// first-person rig those world fields still describe the previous
 			// frame, which produced the observed one-frame aperture trail.
@@ -2098,17 +2144,11 @@ void HookedUpdate()
 				InvalidateAutomaticSTSSelection();
 				return;
 			}
-			scopeNode = firstPersonRoot->GetObjectByName("FTS:CenterPoint");
 			RE::NiPoint3 scopeProjectionPoint{};
 			RE::NiPoint3 previousScopeProjectionPoint{};
 			RE::NiPoint3 aimProjectionPoint{};
 			float scopeWorldRadius = 0.0F;
-			if (scopeNode) {
-				scopeProjectionPoint = scopeNode->world.translate;
-				previousScopeProjectionPoint =
-					scopeNode->previousWorld.translate;
-				aimProjectionPoint = scopeProjectionPoint;
-			} else if (currentData->autoProfile) {
+			if (currentData->autoProfile) {
 				const auto aperture = FindSTSAperture(firstPersonRoot);
 				scopeNode = aperture.opticalPlane;
 				hookIns->PublishAutomaticSTSGeometry(
@@ -2208,9 +2248,9 @@ void HookedUpdate()
 				gcb.rootPos = rootPos;
 
 				gcb.camMat = camNode->local.rotate;
-				gcb.ftsLocalMat = scopeNode->local.rotate;
-				gcb.ftsWorldMat = scopeNode->world.rotate;
-				gcb.ftsScreenPos = tempOut;
+				gcb.scopeLocalMat = scopeNode->local.rotate;
+				gcb.scopeWorldMat = scopeNode->world.rotate;
+				gcb.scopeScreenPos = tempOut;
 				const bool automaticADS =
 					currentData->autoProfile &&
 					IsADSIntentOrActive(player);
@@ -2242,21 +2282,26 @@ void HookedUpdate()
 								activationProgress,
 								uiTimer ? uiTimer->delta : 0.0F,
 								tempOut);
+						// Physical aperture and authored reticle centers must use the
+						// same current-frame projection as the ScopeFade geometry and
+						// lens basis. Smoothing either point against current geometry
+						// changes the clipping frame at extreme pitch. Optical inertia
+						// is already filtered independently by the eye-box tracker.
 						hookIns->PublishLensProjection(
 							tempOut.x,
 							tempOut.y,
 							aimScreenPoint.x,
 							aimScreenPoint.y,
 							apertureProjection.radiusX,
-							apertureProjection.radiusY,
-							true,
-							activationProgress,
-							physicalEyeBox);
+								apertureProjection.radiusY,
+								true,
+								activationProgress,
+								physicalEyeBox);
 					} else if (automaticSTSTracking.aperture != scopeNode) {
-						// An invalid first sample or a rebuilt ScopeFade is a
-						// real identity boundary. Reset before accepting a new
-						// stable projection.
-						ResetAutomaticSTSProjectionTracking();
+						// Preserve the last publication and monotonic activation
+						// while the CPU projection is temporarily unavailable. A
+						// real selection change is handled by the selection reset,
+						// not by this transient render-time condition.
 					}
 					// During recoil the CPU sphere can cross the near plane for
 					// a frame while the exact ScopeFade draw remains valid.
@@ -2277,7 +2322,7 @@ void HookedUpdate()
 						scopeTimer = 0;
 						return;
 					}
-					if (scopeTimer >= sdh->GetCurrentFTSData()->scopeFrame) {
+					if (scopeTimer >= sdh->GetCurrentScopeProfile()->scopeFrame) {
 						bEnableScope = true;
 						hookIns->SetScopeEffect(true);
 						scopeTimer = 0;
@@ -2331,7 +2376,7 @@ void HookedUpdate()
 								std::memory_order_acquire)) {
 							auto tempZDO = currentData->zoomDataOverwrite;
 							if (tempZDO.enableZoomDateOverwrite) {
-								// The original FTS reasserts these fields while
+								// The original scope-rendering reasserts these fields while
 								// sighted. Keep that timing, but only through the
 								// validated selected-instance transaction.
 								WriteSelectedZoomOverride(tempZDO);
@@ -2355,7 +2400,7 @@ void HookedUpdate()
 					// aim-in transition starts, so the override has to stay on
 					// the form while at the hip. The original values return
 					// when the profile is deselected (see InitCurrentScopeData),
-					// exactly like the original FTS behaved.
+					// exactly like the original scope-rendering behaved.
 					if (settings.AllowsRenderer() && currentData->autoProfile) {
 						hookIns->SetScopeEffect(false);
 						bEnableScope = false;
@@ -2402,10 +2447,22 @@ void HookedUpdate()
 			Hook::D3D::scopeReticleOffsetY.store(
 				0.0F,
 				std::memory_order_release);
+			Hook::D3D::scopeReticleShadowStrength.store(
+				0.0F,
+				std::memory_order_release);
+			Hook::D3D::scopeReticleParallaxStrength.store(
+				1.0F,
+				std::memory_order_release);
 			Hook::D3D::scopeSceneParallaxStrength.store(
 				0.0F,
 				std::memory_order_release);
 			Hook::D3D::scopeOpticalLagStrength.store(
+				1.0F,
+				std::memory_order_release);
+			Hook::D3D::scopeSceneDepth.store(
+				1.0F,
+				std::memory_order_release);
+			Hook::D3D::scopeShadowDepth.store(
 				1.0F,
 				std::memory_order_release);
 			hookIns->EnableRender(false);
@@ -2437,7 +2494,7 @@ public:
 
 			if (evn.equipped && item && item->GetFormType() == ENUM_FORM_ID::kWEAP) {
 				hookIns->QueryRender(false);
-				sdh->SetCurrentFTSData(nullptr);
+				sdh->SetCurrentScopeProfile(nullptr);
 				InitCurrentScopeData();
 				hookIns->SetInterfaceTextRefresh(true);
 				bChangeAnimFlag = false;
@@ -2466,12 +2523,12 @@ public:
 		//	_MESSAGE("evn.animEvent: %s; evn.argument: %s", evn.animEvent.c_str(), evn.argument.c_str());
 
 		if (IsInADS(player)) {
-			if (!IsSideAim() && !player->IsInThirdPerson() && bNeedToUpdateFTSData) {
+			if (!IsSideAim() && !player->IsInThirdPerson() && bNeedToUpdateScopeProfile) {
 				if (bChangeAnimFlag) {
 					InitCurrentScopeData();
 				}
 
-				currentData = sdh->GetCurrentFTSData();
+				currentData = sdh->GetCurrentScopeProfile();
 
 				if (currentData && !bHasStartedScope) {
 					hookIns->StartScope(true);
@@ -2479,10 +2536,10 @@ public:
 					bHasStartedScope = true;
 				}
 
-				bNeedToUpdateFTSData = false;
+				bNeedToUpdateScopeProfile = false;
 			}
 
-			if (sdh->GetCurrentFTSData() && sdh->GetCurrentFTSData()->shaderData.bBoltDisable) {
+			if (sdh->GetCurrentScopeProfile() && sdh->GetCurrentScopeProfile()->shaderData.bBoltDisable) {
 				if (hasEjectShellCasing) {
 					hookIns->SetScopeEffect(true);
 					hasEjectShellCasing = false;
@@ -2508,7 +2565,7 @@ public:
 			hasUpdateSighted = false;
 			hasEjectShellCasing = false;
 			hookIns->StartScope(false);
-			bNeedToUpdateFTSData = true;
+			bNeedToUpdateScopeProfile = true;
 			hookIns->SetScopeEffect(false);
 			bHasStartedScope = false;
 			bEnableScope = false;
@@ -2544,9 +2601,9 @@ unordered_map<uint64_t, AnimationGraphEventWatcher::FnProcessEvent> AnimationGra
 
 bool RegisterFuncs(BSScript::IVirtualMachine* vm)
 {
-	// Keep the legacy Papyrus script name so existing FTS patches continue to
+	// Keep the legacy Papyrus script name so existing legacy patches continue to
 	// bind without requiring authors to rebuild their script assets.
-	constexpr std::string_view fileName = "FakeThroughScope";
+	constexpr std::string_view fileName = "MagnaScope";
 #ifdef _DEBUG
 	vm->BindNativeMethod(fileName, "TestButton", TestButton);
 #endif  // _DEBUG
@@ -2587,7 +2644,7 @@ void InitializePlugin()
 {
 	if (settings.AllowsPrivateRenderHooks()) {
 		// Stage 3 deliberately uses F4SE Menu Framework's already verified
-		// before-render callback. The original FTS Present, ResizeBuffers,
+		// before-render callback. The original scope-rendering Present, ResizeBuffers,
 		// DrawIndexed, and TAA hooks are not installed until Stage 4 because
 		// none of them is required to prove a read-only back-buffer copy.
 		HANDLE hThread = CreateThread(
@@ -2675,8 +2732,8 @@ void ResetScopeStatus()
 	hookIns->SetScopeEffect(false);
 	hookIns->QueryChangeReticleTexture();
 
-	if (sdh->GetCurrentFTSData()) {
-		gameDeltaZoom = sdh->GetCurrentFTSData()->shaderData.minZoom;
+	if (sdh->GetCurrentScopeProfile()) {
+		gameDeltaZoom = sdh->GetCurrentScopeProfile()->shaderData.minZoom;
 	}
 
 	InGameFlag = true;
@@ -2751,9 +2808,21 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 #ifdef _DEBUG
 	hookIns->InitRenderDoc();
 #endif  // _DEBUG
+	if (settings.AllowsWorldColorCapture() &&
+		!MagnaScope::WorldOnlyScopeRenderer::GetSingleton().InstallHooks()) {
+		logger::error(
+			"Pre-first-person world color capture hooks were not installed; automatic STS scopes will fail open to authored behavior");
+	}
 
 	REL::Trampoline& trampoline = REL::GetTrampoline();
-	const auto updateCallSite = ptr_PCUpdateMainThread.address();
+	// Resolve the fixed OG relocation only after the runtime gate above. Eager
+	// namespace-scope resolution could abort unsupported NG/AE loads before the
+	// plugin had a chance to fail safely.
+	const REL::Relocation<std::uintptr_t> pcUpdateMainThread{
+		REL::ID(633524),
+		0x22D
+	};
+	const auto updateCallSite = pcUpdateMainThread.address();
 	if (*reinterpret_cast<const std::uint8_t*>(updateCallSite) != 0xE8) {
 		logger::critical(
 			"PCUpdateMainThread hook guard failed at {:X}; MagnaScope is disabled",
@@ -2790,7 +2859,7 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 				ResetScopeStatus();
 			} else if (msg->type == F4SE::MessagingInterface::kPreLoadGame) {
 				ClearIsolatedZoomSession();
-				sdh->SetCurrentFTSData(nullptr);
+				sdh->SetCurrentScopeProfile(nullptr);
 				currentData = nullptr;
 				weaponInstanceData = nullptr;
 				lastEquippedInstance = nullptr;

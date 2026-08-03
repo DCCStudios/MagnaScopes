@@ -1,4 +1,5 @@
 #include "Triangle.hlsli"
+#include "ScopeShadow.hlsli"
 
 // The reticle is captured into a private transparent layer at its authored
 // draw point, then composited after the late magnified ScopeFade replay. It
@@ -57,10 +58,10 @@ ReticleCompositeOutput main(VertexPosHTex input)
         // than scaling or clipping it against uninitialized zero constants.
         return SampleAuthoredReticle(input.tex);
     }
-    // Recover the physical lens center from the authored reticle-minus-lens
-    // offset. The projected X/Z basis follows a translated, rolled, or
-    // sheared STS optic without assuming that its manually aligned reticle is
-    // at screen center.
+    // The physical ScopeFade center is published independently from the
+    // authored reticle pivot. Reconstructing it from a reticle offset and a
+    // differently timed basis made the clipping polygon drift at extreme
+    // pitch, leaving only partial reticle arcs.
     const float2 basisX = float2(
         SCOPE_LENS_BASIS_XX,
         SCOPE_LENS_BASIS_XY);
@@ -71,17 +72,21 @@ ReticleCompositeOutput main(VertexPosHTex input)
         basisX.x * basisZ.y - basisX.y * basisZ.x;
     const bool projectedBasisValid =
         abs(basisDeterminant) > 0.0001f;
+    // Reticle parallax and scope-shadow following consume display-X/Y eye
+    // travel. They remain valid when the older game-thread basis is stale or
+    // nearly collinear, so only coordinate inversion keeps the determinant
+    // requirement below.
+    const bool physicalEyeTravelValid =
+        SCOPE_PHYSICAL_EYEBOX_VALID > 0.0001f;
+    const float projectedRadius = max(
+        0.5f * (length(basisX) + length(basisZ)),
+        1.0f);
 
-    float2 lensCenterPixel = reticleCenterPixel;
+    const float2 lensCenterPixel = float2(
+        SCOPE_LENS_CENTER_X,
+        SCOPE_LENS_CENTER_Y);
     float2 lensCoordinates = float2(0.0f, 0.0f);
     if (projectedBasisValid) {
-        const float2 authoredOffset =
-            SCOPE_AIM_OFFSET_VALID > 0.5f ?
-                float2(SCOPE_AIM_OFFSET_X, SCOPE_AIM_OFFSET_Y) :
-                float2(0.0f, 0.0f);
-        lensCenterPixel -=
-            basisX * authoredOffset.x +
-            basisZ * authoredOffset.y;
         const float2 displacement = outputPixel - lensCenterPixel;
         lensCoordinates = float2(
             (displacement.x * basisZ.y -
@@ -108,30 +113,32 @@ ReticleCompositeOutput main(VertexPosHTex input)
     // but keeps its independently configured scale.
     float2 physicalEyeTravel = float2(0.0f, 0.0f);
     float2 opticalTranslation = float2(0.0f, 0.0f);
-    if (projectedBasisValid && SCOPE_PHYSICAL_EYEBOX_VALID > 0.0001f) {
+    if (physicalEyeTravelValid) {
         physicalEyeTravel =
             float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y) *
             saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
             clamp(SCOPE_OPTICAL_LAG_STRENGTH, 0.0f, 4.0f);
-        const float eyeTravelLength = length(physicalEyeTravel);
-        if (eyeTravelLength < 0.0125f) {
-            physicalEyeTravel = float2(0.0f, 0.0f);
-        }
+        // The CPU eye-box output is already filtered. Keep the final tiny
+        // motion continuous so the reticle cannot snap when the lens settles.
         const float travelLength = length(physicalEyeTravel);
         const float maximumTravel =
             clamp(SCOPE_EYEBOX_MAX_TRAVEL, 0.0f, 4.0f);
         if (travelLength > maximumTravel && travelLength > 0.00001f) {
             physicalEyeTravel *= maximumTravel / travelLength;
         }
+        const float reticleDepth = clamp(ScopeSceneDepth, 0.0f, 4.0f);
+        const float2 depthTravel = physicalEyeTravel * reticleDepth;
+        // Must stay bit-for-bit the same limiter the scene replay applies, or
+        // the reticle drifts off the magnified image during fast inertia.
         const float2 sceneTravel =
-            physicalEyeTravel /
-            (1.0f + 2.0f * length(physicalEyeTravel));
+            ScopeShadowSoftLimitVector(depthTravel, 1.0f);
         opticalTranslation =
-            (basisX * sceneTravel.x + basisZ * sceneTravel.y) *
-            clamp(SCOPE_SCENE_PARALLAX_STRENGTH, 0.0f, 2.0f);
+            sceneTravel * projectedRadius *
+            clamp(SCOPE_SCENE_PARALLAX_STRENGTH, 0.0f, 2.0f) *
+            clamp(SCOPE_RETICLE_PARALLAX_STRENGTH, 0.0f, 4.0f);
     }
 
-    // Existing FTS profiles express reticle offset as thousandths of the
+    // MagnaScope profiles express reticle offset as thousandths of the
     // optic-local X/Z basis. This preserves that convention while following
     // a rolled, sheared, off-center, or inertia-driven STS scope.
     const float2 userOffset =
@@ -159,16 +166,6 @@ ReticleCompositeOutput main(VertexPosHTex input)
         discard;
     }
 
-    // ScopeFade is a 24-segment circular plane. cos(pi / 24) is the largest
-    // circle guaranteed to lie inside every edge of that polygon. Clipping to
-    // this conservative boundary keeps a scaled reticle off the optic housing
-    // even when the authored aperture is rolled or sheared.
-    static const float safeApertureRadius = 0.9914448614f;
-    if (dot(lensCoordinates, lensCoordinates) >
-        safeApertureRadius * safeApertureRadius) {
-        discard;
-    }
-
     ReticleCompositeOutput reticle = SampleAuthoredReticle(sourceUv);
 
     // Match the magnified lens's exit pupil at this output pixel. The late
@@ -176,31 +173,50 @@ ReticleCompositeOutput main(VertexPosHTex input)
     // beneath scope shadow must interpolate that complete blend operator
     // toward identity. Multiplying only B or T would darken or brighten the
     // already-composited optical scene.
-    float pupilShadow = 0.0f;
-    if (projectedBasisValid) {
-        const float pupilRadius = clamp(
-            SCOPE_EYEBOX_RADIUS * 0.55f,
-            0.75f,
-            2.0f);
-        const float pupilFeather = clamp(
-            rcp(max(SCOPE_VIGNETTE_REACH, 1.01f)),
-            0.035f,
-            0.18f);
-        const float pupilDistance =
-            length(lensCoordinates - physicalEyeTravel);
-        pupilShadow = smoothstep(
-            pupilRadius - pupilFeather,
-            pupilRadius + pupilFeather,
-            pupilDistance);
-        pupilShadow = pow(
-            saturate(pupilShadow),
-            clamp(SCOPE_VIGNETTE_SHARPNESS / 3.0f, 0.35f, 6.0f));
+    // Evaluate the shadow in the same optic-local frame the scene replay uses.
+    // lensCoordinates above is the basis-inverted coordinate, so it carries
+    // ScopeFade roll and foreshortening; the isotropic pixel-radius form this
+    // replaced disagreed with the scene layer whenever the optic was not
+    // square-on to the camera, leaving the reticle lit inside a dark crescent.
+    const float2 shadowLensCoordinates = lensCoordinates;
+    // Display-X/Y travel becomes optic-local travel through the same basis
+    // inverse, matching the scene replay's derivative-frame conversion.
+    float2 eyeTravelLocal = float2(0.0f, 0.0f);
+    if (physicalEyeTravelValid && projectedBasisValid) {
+        const float2 travelPixels = physicalEyeTravel * projectedRadius;
+        eyeTravelLocal = float2(
+            (travelPixels.x * basisZ.y - travelPixels.y * basisZ.x) /
+                basisDeterminant,
+            (-travelPixels.x * basisX.y + travelPixels.y * basisX.x) /
+                basisDeterminant);
+    } else if (physicalEyeTravelValid) {
+        eyeTravelLocal = physicalEyeTravel;
     }
+    const float axialPupilScale = clamp(
+        1.0f -
+            clamp(SCOPE_EYE_RELIEF_DELTA, -0.25f, 0.25f) *
+                saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
+                saturate(SCOPE_FADE_ACTIVATION) *
+                clamp(ScopeShadowDepth, 0.0f, 4.0f),
+        0.96f,
+        1.04f);
+    const ScopeShadowLayers shadow = EvaluateScopeShadow(
+        shadowLensCoordinates,
+        eyeTravelLocal,
+        physicalEyeTravelValid,
+        SCOPE_EYEBOX_RADIUS,
+        clamp(ScopeShadowDepth, 0.0f, 4.0f),
+        axialPupilScale,
+        SCOPE_VIGNETTE_REACH,
+        SCOPE_VIGNETTE_SHARPNESS);
+    const float pupilShadow = 1.0f - shadow.visibility;
+    const float reticleShadowStrength =
+        clamp(SCOPE_RETICLE_SHADOW_STRENGTH, 0.0f, 1.0f);
     const float reticleVisibility = lerp(
         1.0f,
         1.0f - pupilShadow,
         saturate(SCOPE_FADE_ACTIVATION) *
-            saturate(SCOPE_PHYSICAL_EYEBOX_VALID));
+            reticleShadowStrength);
     reticle.sourceContribution *= reticleVisibility;
     reticle.destinationTransmittance = lerp(
         float4(1.0f, 1.0f, 1.0f, 1.0f),

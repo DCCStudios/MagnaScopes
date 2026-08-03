@@ -1,6 +1,6 @@
 #pragma once
 
-#include "FTSData.h"
+#include "ScopeProfile.h"
 #include <DirectXMath.h>
 #include <REX/W32/COMPTR.h>
 #include <d3d11.h>
@@ -119,10 +119,20 @@ namespace Hook
 			float reticleSize = 4.0F;
 			float reticleOffsetX = 0.0F;
 			float reticleOffsetY = 0.0F;
-			float reticlePadding = 0.0F;
+			// Signed camera-local fore/aft displacement as a fraction of the
+			// continuously recentered camera-to-ScopeFade distance. This occupies
+			// the former unused padding slot, preserving the cbuffer ABI size.
+			float eyeReliefDelta = 0.0F;
+			// Reticle shadow and parallax are independent of scene optical
+			// effects. A zero shadow strength keeps an authored STS reticle
+			// visible even when the exit pupil darkens the scene behind it.
+			float reticleShadowStrength = 0.0F;
+			float reticleParallaxStrength = 1.0F;
+			float lensCenterX = 0.0F;
+			float lensCenterY = 0.0F;
 		};
 		static_assert(
-			sizeof(ConstBufferData) == 144,
+			sizeof(ConstBufferData) == 160,
 			"ScopeFade constant buffer must match Triangle.hlsli");
 
 	public:
@@ -166,16 +176,18 @@ namespace Hook
 			float padding5 = 0;
 			XMFLOAT4X4 CameraRotation = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
-			XMFLOAT2 FTS_ScreenPos = { 0, 0 };
+			XMFLOAT2 ScopeScreenPos = { 0, 0 };
 			XMFLOAT2 reticle_Offset = { 0, 0 };
 
 			XMFLOAT4X4 projMat;
 			XMFLOAT4 rect;
 
-			// Mirrors the FishEye block appended to the HLSL cbuffer.
+			// Mirrors the FishEye and depth-separation block appended to the HLSL
+			// cbuffer. X is the scene distance behind the aperture and Y is the
+			// independent exit-pupil shadow distance.
 			float FishEyeStrength = 0;
 			float FishEyePower = 2;
-			XMFLOAT2 padding6 = { 0, 0 };
+			XMFLOAT2 scopeDepth = { 1.0F, 1.0F };
 		};
 		static_assert(
 			sizeof(ScopeEffectShaderData) == 352,
@@ -189,10 +201,10 @@ namespace Hook
 			RE::NiPoint3 VirTransLerp;
 			RE::NiPoint3 weaponPos;
 			RE::NiPoint3 rootPos;
-			RE::NiPoint3 ftsScreenPos;
+			RE::NiPoint3 scopeScreenPos;
 			RE::NiMatrix3 camMat;
-			RE::NiMatrix3 ftsLocalMat;
-			RE::NiMatrix3 ftsWorldMat;
+			RE::NiMatrix3 scopeLocalMat;
+			RE::NiMatrix3 scopeWorldMat;
 			float deltaZoom;
 		};
 
@@ -219,14 +231,14 @@ namespace Hook
 			// use this ease value, which prevents both corner pop-in and trailing.
 			float activationProgress = 0.0F;
 			// Physical eye-box telemetry is measured in ScopeFade-local space
-			// after Fallout has updated the first-person rig. X and Y correspond
-			// to ScopeFade's local X and Z axes respectively, normalized by the
-			// authored aperture radius. They therefore remain meaningful when
-			// another plugin adds inertia above only part of the weapon tree.
+			// after Fallout has updated the first-person rig. X and Y are display
+			// axes normalized by the projected aperture radius. Keeping them out
+			// of ScopeFade's rotating local basis makes the response independent
+			// of camera pitch, compass heading, and authored lens roll.
 			float eyeOffsetX = 0.0F;
 			float eyeOffsetY = 0.0F;
 			// Signed change in camera-to-lens distance relative to the settled
-			// ADS calibration, also normalized by aperture radius.
+			// ADS calibration, normalized by that settled forward distance.
 			float eyeReliefDelta = 0.0F;
 			// Screen-pixel displacement produced by one local aperture radius
 			// along ScopeFade X and Z. These basis vectors preserve tilted or
@@ -306,7 +318,7 @@ namespace Hook
 		bool InitResource();
 		void OnResize();
 		void ReleaseSizeDependentResources();
-		void UpdateScene(ScopeData::FTSData*);
+		void UpdateScene(ScopeData::ScopeProfile*);
 		void CreateBlender();
 		void QueryChangeReticleTexture();
 		void ResetZoomDelta();
@@ -314,8 +326,8 @@ namespace Hook
 		void SetZoom(float zoom);
 		void ScreenTextureMod();
 		// Returns true only when this call accounts for a visible composite.
-		// Explicit legacy profiles may use the fullscreen path. Automatic STS
-		// profiles replay only the exact authored ScopeFade geometry and fail
+		// Automatic STS profiles replay only the exact authored ScopeFade
+		// geometry and fail
 		// closed if that draw was not captured.
 		bool RenderToReticleTexture();
 		void RenderToReticleTextureNew(UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation);
@@ -376,7 +388,7 @@ namespace Hook
 		// first-person weapon. Once capture succeeds, the caller suppresses the
 		// authored lens-color draw so the coherent late source does not contain
 		// glass that would be sampled and drawn a second time. This matches
-		// Fake Through Scope's aperture ownership contract.
+		// MagnaScope's aperture ownership contract.
 		bool CaptureAutomaticSTSScopeFadeReplay(
 			ID3D11DeviceContext* context,
 			UINT indexCount,
@@ -503,12 +515,16 @@ namespace Hook
 		static std::atomic<float> scopeReticleSize;
 		static std::atomic<float> scopeReticleOffsetX;
 		static std::atomic<float> scopeReticleOffsetY;
+		static std::atomic<float> scopeReticleShadowStrength;
+		static std::atomic<float> scopeReticleParallaxStrength;
 		static std::atomic<float> scopeEyeBoxRadius;
 		static std::atomic<float> scopeVignetteReach;
 		static std::atomic<float> scopeVignetteSharpness;
 		static std::atomic<float> scopeEyeBoxMaxTravel;
 		static std::atomic<float> scopeSceneParallaxStrength;
 		static std::atomic<float> scopeOpticalLagStrength;
+		static std::atomic<float> scopeSceneDepth;
+		static std::atomic<float> scopeShadowDepth;
 		static std::atomic_bool isEnableRender;
 		static bool frameworkRenderAnchor;
 		static std::atomic<float> projectedLensX;
@@ -756,10 +772,7 @@ namespace Hook
 		// Cache a write-disabled clone of the authored state while preserving all
 		// of its comparison functions and the caller's stencil reference.
 		ComPtr<ID3D11DepthStencilState>
-			mAutomaticSTSReticleLayerAuthoredDepthState;
-		ComPtr<ID3D11DepthStencilState>
 			mAutomaticSTSReticleLayerReadOnlyDepthState;
-		bool mAutomaticSTSReticleLayerAuthoredDepthWasNull = false;
 		std::mutex mAutomaticSTSReticleLayerMutex;
 		std::uint64_t mAutomaticSTSReticleLayerCaptureGeneration = 0U;
 		std::uint64_t mAutomaticSTSReticleLayerGeneration = 0U;

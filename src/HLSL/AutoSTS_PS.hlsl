@@ -1,6 +1,6 @@
 #include "Triangle.hlsli"
 
-// Automatic STS scopes have no FTS marker mesh or captured draw call. This
+// Automatic STS scopes have no marker mesh or captured draw call. This
 // screen space pass derives its lens mask from the projected STS scene node.
 float4 main(float4 position : SV_Position, float2 texcoord : TEXCOORD0) : SV_Target
 {
@@ -8,10 +8,10 @@ float4 main(float4 position : SV_Position, float2 texcoord : TEXCOORD0) : SV_Tar
 	const float aspect = AspectRatio;
 	const float referenceScale = BUFFER_HEIGHT / 1080.0;
 
-	// FTS_ScreenPos is stored in physical pixels by the CPU. Rejected
+	// ScopeScreenPos is stored in physical pixels by the CPU. Rejected
 	// projections fall back to screen center, matching STS's authored ADS
 	// alignment without allowing a NaN or offscreen mask.
-	const float2 projectedCenter = FTS_ScreenPos * pixelSize;
+	const float2 projectedCenter = ScopeScreenPos * pixelSize;
 	const bool validProjection =
 		all(isfinite(projectedCenter)) &&
 		all(projectedCenter >= float2(0.0, 0.0)) &&
@@ -77,7 +77,7 @@ float4 main(float4 position : SV_Position, float2 texcoord : TEXCOORD0) : SV_Tar
 	color = nightVision * nightVision.a + color * (1.0 - nightVision.a);
 
 	// STS supplies its own world-space reticle, so automatic profiles do not
-	// add the optional FTS texture and cannot create a doubled reticle.
+	// add the optional marker texture and cannot create a doubled reticle.
 	color.a = (EnableMerge != 0 && insideLens) ? 1.0 : 0.0;
 	return color;
 }

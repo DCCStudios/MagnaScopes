@@ -5,9 +5,9 @@ float4 main(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0) : SV_Target
 	const float2 screenSize = float2(BUFFER_WIDTH, BUFFER_HEIGHT);
 	const float referenceScale = BUFFER_HEIGHT / 1080.0;
 
-	// FTS_ScreenPos is the projected mesh anchor in pixels. Old profiles that
+	// ScopeScreenPos is the projected mesh anchor in pixels. Old profiles that
 	// produce no usable anchor retain the historical screen-center behavior.
-	float2 projectedCenter = FTS_ScreenPos * PixelSize;
+	float2 projectedCenter = ScopeScreenPos * PixelSize;
 	const bool validProjectedCenter =
 		all(projectedCenter > float2(0.001, 0.001)) &&
 		all(projectedCenter < float2(0.999, 0.999));

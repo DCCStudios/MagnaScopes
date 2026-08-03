@@ -26,6 +26,10 @@ namespace ScopeData
 		float relativeFogRadius = 9;
 		float scopeSwayAmount = 3;
 		float maxTravel = 4;
+		// Distances between the authored aperture, the magnified scene, and
+		// the exit-pupil shadow. Values above one exaggerate tube depth.
+		float sceneDepth = 1.0F;
+		float shadowDepth = 1.0F;
 	};
 
 	struct ZoomDataOverwrite
@@ -87,26 +91,28 @@ namespace ScopeData
 		// Optional single-pass cleanup for the automatic STS scene sample.
 		// Denoise is an edge-aware spatial blend, not temporal reconstruction;
 		// sharpen restores local contrast after magnification. Both default to
-		// zero so legacy FTS JSON retains its authored image unchanged.
+		// zero so existing MagnaScope profiles retain their authored image unchanged.
 		float imageDenoise = 0.0F;
 		float imageSharpen = 0.0F;
 
 		// Independent local scale for the STS-authored 3D reticle. 1 preserves
 		// its authored size; this value never inherits scene magnification.
 		float reticleMagnification = 1.0F;
+		float reticleShadowStrength = 0.0F;
+		float reticleParallaxStrength = 1.0F;
 
 		float fovAdjust = 0;
 		Parallax parallax;
 	};
 
-	class FTSData
+	class ScopeProfile
 	{
 	public:
 		bool legacyMode = true;
 		std::string path = "";
 		int version = 1;
-		std::string keywordName = "FTS_Default";
-		std::string animFlavorEditorID = "FTS_NONE";
+		std::string keywordName = "AUTO_Default";
+		std::string animFlavorEditorID;
 		std::string additionalKeywordsStr;
 		std::vector<std::string> additionalKeywords = std::vector<std::string>();
 
@@ -127,9 +133,9 @@ namespace ScopeData
 		ShaderData shaderData;
 		ZoomDataOverwrite zoomDataOverwrite;
 
-		FTSData(std::string pathO);
-		//FTSData(json j, std::string pathO);
-		//void ReloadFTSData();
+		ScopeProfile(std::string pathO);
+		//ScopeProfile(json j, std::string pathO);
+		//void ReloadScopeProfile();
 	};
 
 	class ScopeDataHandler
@@ -137,24 +143,24 @@ namespace ScopeData
 	public:
 		static ScopeDataHandler* GetSingleton();
 
-		void ReloadFTSData(FTSData*);
+		void ReloadScopeProfile(ScopeProfile*);
 		void ReadDefaultScopeDataFile();
 		void ReadCustomScopeDataFiles(std::string path);
 		void TestingJson();
 
-		void WriteCurrentFTSData();
-		void ReloadCurrentFTSData();
+		void WriteCurrentScopeProfile();
+		void ReloadCurrentScopeProfile();
 
-		void SetCurrentFTSData(FTSData* data, bool containsAllAdditionkeyword = true);
-		FTSData* GetCurrentFTSData();
-		FTSData* GetOrCreateAutoProfile(
+		void SetCurrentScopeProfile(ScopeProfile* data, bool containsAllAdditionkeyword = true);
+		ScopeProfile* GetCurrentScopeProfile();
+		ScopeProfile* GetOrCreateAutoProfile(
 			RE::TESObjectWEAP* weapon,
 			const RE::BGSZoomData::Data& zoomData,
 			std::string attachmentKey,
 			float defaultDiameter,
 			float defaultMagnification,
 			float zoomSpread);
-		bool WriteAutoProfile(FTSData* data);
+		bool WriteAutoProfile(ScopeProfile* data);
 
 		int GetEffectIndex();
 		void SetEffectIndex(int);
@@ -174,8 +180,6 @@ namespace ScopeData
 
 		//bool ZoomDataWrite(RE::TESObjectWEAP::InstanceData* GetSington);
 		void ReloadZoomData(std::string path);
-
-		std::multimap<std::string, FTSData*>* GetScopeDataMap();
 
 	private:
 		bool ReadScopeData(std::string path);
@@ -200,13 +204,12 @@ namespace ScopeData
 		bool isUpscaler = false;
 		std::vector<std::string> files;
 		//CSimpleIniA iniForZoom;
-		std::multimap<std::string, FTSData*> ScopeDataMap;
 		// Keyed by weapon plugin, weapon local FormID, and scope OMOD key
-		// (see FTSData::omodKey), so each scope attachment on a weapon gets
+		// (see ScopeProfile::omodKey), so each scope attachment on a weapon gets
 		// its own profile entry.
-		std::map<std::tuple<std::string, std::uint32_t, std::string>, FTSData*> autoProfileMap;
-		std::vector<std::unique_ptr<FTSData>> ownedData;
-		FTSData* currentData;
+		std::map<std::tuple<std::string, std::uint32_t, std::string>, ScopeProfile*> autoProfileMap;
+		std::vector<std::unique_ptr<ScopeProfile>> ownedData;
+		ScopeProfile* currentData;
 		std::string currentPath;
 	};
 

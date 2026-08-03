@@ -1,80 +1,73 @@
 # MagnaScopes
 
-MagnaScope is an F4SE plugin for Fallout 4 1.10.163. It is derived from
-[Fake Through Scope](https://github.com/ss7332337/Fake-Through-Scope) and keeps
-support for existing FTS JSON profiles while adding automatic, patch-free
-detection of first-person weapons set up for See Through Scopes.
+MagnaScope is an F4SE plugin for Fallout 4 1.10.163 that adds screen-space
+optical magnification and scope effects to first-person weapons configured for
+See Through Scopes (STS). It detects existing STS scene-graph conventions at
+runtime, so weapon authors and users do not need an additional NIF or ESP
+patch.
 
-The effect magnifies a copy of the rendered frame inside the projected scope
-lens. It is screen-space rendering, not a second world camera.
+The rendered frame is resampled only through the live `ScopeFade` aperture.
+The surrounding view stays unchanged, while the lens can apply magnification,
+eye-box shadow, vignette, scene and reticle parallax, fisheye distortion, edge
+refraction, chromatic aberration, cleanup, and sharpening. This is a
+screen-space effect rather than a second world camera.
 
 ## Runtime status
 
-The current development build compiles and its automatic STS pixel shader
-passes a D3D11 WARP contract test: pixels change inside the lens and remain
-unchanged outside it. In-game acceptance of the final render anchors and
-captured-mesh FTS path is still required before release.
+Only Fallout 4 1.10.163 is supported. Other runtimes fail closed before any
+runtime-specific relocation or hook is installed.
 
-Only Fallout 4 1.10.163 is supported. Other runtimes fail closed before
-installing runtime-specific hooks.
+The build and shader contracts can be verified offline, but visual correctness
+still requires the staged in-game checks in `VERIFICATION.md`. Successful
+compilation, hook installation, or render telemetry is not proof of a correct
+scope image.
 
 ## Automatic STS profiles
 
-When no explicit `FTS_` profile applies, MagnaScope looks for `ReticleNode` or
-`ScopeAiming` in the equipped first-person weapon. It derives the optical center
-from that node and creates a profile keyed by:
+MagnaScope detects STS scopes from the equipped first-person weapon's
+`ScopeAiming`, `ScopeFade`, and reticle geometry. A profile is keyed by:
 
 - the weapon's source plugin and local FormID;
-- the equipped scope OMOD, or a deterministic attachment-set key when no
-  scope-specific OMOD can be identified.
+- the equipped scope OMOD, or a deterministic attachment-set identity when a
+  single scope OMOD cannot be isolated.
 
-Saving an automatic profile writes it under
-`Data/F4SE/Plugins/FTS/Auto`. No NIF or ESP patch is required.
+Saving a profile writes it under:
 
-## Existing FTS profiles
+`Data/F4SE/Plugins/MagnaScope/Auto`
 
-Existing JSON files under `Data/F4SE/Plugins/FTS` remain supported. If several
-profiles share one `FTS_` keyword, MagnaScope evaluates their additional and
-animation-flavor keywords and chooses the most-specific matching entry.
+One weapon file can contain separate settings for each equipped scope. New
+profiles start from the weapon's authored FOV and sighted-camera data, with
+scene magnification and reticle scale at 1x.
 
-## Configuration
+## Configuration and editing
 
-`Data/F4SE/Plugins/MagnaScope.ini` controls defaults for newly detected scopes:
+`Data/F4SE/Plugins/MagnaScope.ini` controls automatic detection defaults and
+the staged verification gates. `Data/F4SE/Plugins/MagnaScopeConfig.json`
+stores framework-level keys.
 
-```ini
-[AutoSTS]
-Enabled=1
-DefaultMaskDiameter=700.0
-DefaultMagnification=1.0
-ZoomSpread=1.5
-```
+Per-scope settings are edited through F4SE Menu Framework. The popout supports
+live preview while aimed, profile save/reload, and explicit restoration of the
+scope's authored zoom data. Temporary zoom and camera overrides are applied at
+the correct aim lifecycle point and restored when the profile or weapon is
+deselected.
 
-Per-scope magnification, eye-box shadow, vignette, parallax, chromatic
-aberration, fisheye distortion, and optional FOV/camera overrides are edited
-through F4SE Menu Framework. Overrides are applied to an instance-local copy of
-the equipped weapon's zoom data and are removed before save serialization or
-when the weapon/profile is deselected.
-
-## Build and offline test
+## Build and offline tests
 
 From a Visual Studio developer environment:
 
 ```powershell
 xmake build MagnaScope
-xmake build AutoSTSShaderTest
-.\build\tests\AutoSTSShaderTest.exe
+xmake build AutoSTSShaderTest ScopeGeometryFillShaderTest ReticleLayerShaderTest DrawTimeEyeBoxTest
 ```
 
-The MO2-ready runtime tree is staged in `Package/MagnaScope`.
+The development DLL and matching PDB are staged under
+`Compile/F4SE/Plugins`. The end-user package is staged under
+`Package/MagnaScope`.
 
-## In-game acceptance checklist
+## In-game acceptance
 
-A release build must be visibly checked in Fallout 4 1.10.163:
-
-1. Automatic STS weapon: lens-only magnification and every optical effect.
-2. Explicit FTS-profile weapon: captured lens mesh and final composite.
-3. TAA on and off, plus the active ENB/upscaler/frame-generation setup.
-4. Profile save, reload, unsaved revert, weapon switch, and scope OMOD switch.
-5. Live edit while aimed, with no stuck input after closing the menu.
-6. No black lens, invisible composite, state leakage, crash, or persistent
-   mutation of shared weapon zoom data.
+The release candidate must be visibly checked on multiple STS optics with TAA
+and non-TAA anchors, plus the active ENB/upscaler/frame-generation stack. It
+must show lens-only magnification and stable optical effects without a black
+lens, fullscreen flicker, reticle clipping, render-state leakage, stuck input,
+crashes, or persistent mutation of unrelated weapon data.

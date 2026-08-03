@@ -14,7 +14,7 @@ float4 main(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0) : SV_Target
 
     float2 eye_velocity = clampMagnitude(abseyeDirectionLerp.xy , 1.5f);
 
-    float2 FTS_ScreenPosInPixel = FTS_ScreenPos;
+    float2 ScopeScreenPosInPixel = ScopeScreenPos;
 
     float2 aspectCorrectTex = aspect_ratio_correction(texcoord);
     float2 adjTex = texcoord;

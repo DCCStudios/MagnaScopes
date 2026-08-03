@@ -1,5 +1,5 @@
 #include "ImGuiImpl.h"
-#include "FTSData.h"
+#include "ScopeProfile.h"
 #include "Settings.h"
 #include "hooking.h"
 #include <DirectXMath.h>
@@ -51,7 +51,7 @@ namespace ImGuiImpl
 	Hook::D3D::ScopeEffectShaderData scopeData;
 	Hook::D3D* d3d;
 
-	ScopeData::FTSData* currData;
+	ScopeData::ScopeProfile* currData;
 	ScopeData::ScopeDataHandler* sdh;
 
 	bool bInitZoomData = false;
@@ -74,7 +74,7 @@ namespace ImGuiImpl
 
 	void ImGuiImplClass::UpdateImGuiData()
 	{
-		currData = sdh->GetCurrentFTSData();
+		currData = sdh->GetCurrentScopeProfile();
 	}
 
 	// Persistent request consumed by the game-thread update hook. A one-shot
@@ -92,7 +92,7 @@ namespace ImGuiImpl
 			ProfileRequest::kNone
 		};
 		std::mutex profileSaveMutex;
-		std::unique_ptr<ScopeData::FTSData> pendingProfileSave;
+		std::unique_ptr<ScopeData::ScopeProfile> pendingProfileSave;
 		MENU_WINDOW scopeEditorWindow = nullptr;
 		F4SEMenuFramework::Model::HudElement* scopeVisualProbe = nullptr;
 		// The popout is intended to be an interactive editor by default.
@@ -141,7 +141,11 @@ namespace ImGuiImpl
 		float vignetteSharpness,
 		float eyeBoxMaxTravel,
 		float sceneParallaxStrength,
-		float opticalLagStrength)
+		float opticalLagStrength,
+		float reticleShadowStrength,
+		float reticleParallaxStrength,
+		float sceneDepth,
+		float shadowDepth)
 	{
 		std::scoped_lock lock(editorPreviewMutex);
 		editorPreview.zoomOverride = zoomOverride;
@@ -170,7 +174,11 @@ namespace ImGuiImpl
 			std::clamp(reticleOffsetX, -1000.0F, 1000.0F);
 		editorPreview.reticleOffsetY =
 			std::clamp(reticleOffsetY, -1000.0F, 1000.0F);
-		// These existing FTS profile values now also drive the physical
+		editorPreview.reticleShadowStrength =
+			std::clamp(reticleShadowStrength, 0.0F, 1.0F);
+		editorPreview.reticleParallaxStrength =
+			std::clamp(reticleParallaxStrength, 0.0F, 4.0F);
+		// These profile values also drive the physical
 		// ScopeFade pupil. Publishing copies here preserves live editing
 		// without sharing the menu-owned profile with the game/render threads.
 		editorPreview.eyeBoxRadius =
@@ -185,6 +193,10 @@ namespace ImGuiImpl
 			std::clamp(sceneParallaxStrength, 0.0F, 2.0F);
 		editorPreview.opticalLagStrength =
 			std::clamp(opticalLagStrength, 0.0F, 4.0F);
+		editorPreview.sceneDepth =
+			std::clamp(sceneDepth, 0.0F, 4.0F);
+		editorPreview.shadowDepth =
+			std::clamp(shadowDepth, 0.0F, 4.0F);
 		editorPreview.active = true;
 	}
 
@@ -212,14 +224,14 @@ namespace ImGuiImpl
 			std::memory_order_acq_rel);
 	}
 
-	void RequestProfileSave(const ScopeData::FTSData& profile)
+	void RequestProfileSave(const ScopeData::ScopeProfile& profile)
 	{
 		std::scoped_lock lock(profileSaveMutex);
 		pendingProfileSave =
-			std::make_unique<ScopeData::FTSData>(profile);
+			std::make_unique<ScopeData::ScopeProfile>(profile);
 	}
 
-	std::unique_ptr<ScopeData::FTSData> ConsumeProfileSave()
+	std::unique_ptr<ScopeData::ScopeProfile> ConsumeProfileSave()
 	{
 		std::scoped_lock lock(profileSaveMutex);
 		return std::move(pendingProfileSave);
@@ -352,7 +364,7 @@ namespace ImGuiImpl
 			// Profile selection and live game-object access happen in
 			// HookedUpdate. The renderer thread only copies the profile that
 			// the game thread has already selected.
-			currData = sdh->GetCurrentFTSData();
+			currData = sdh->GetCurrentScopeProfile();
 			if (!currData)
 				return;
 
@@ -360,7 +372,7 @@ namespace ImGuiImpl
 			legacyFlag = data->legacyMode;
 
 			ins->bLegacyMode = data->legacyMode;
-			ins->UsingSTS_UI = ScopeDataHandler::GetSingleton()->GetCurrentFTSData()->UsingSTS;
+			ins->UsingSTS_UI = ScopeDataHandler::GetSingleton()->GetCurrentScopeProfile()->UsingSTS;
 			ins->scopeFrame_UI = data->scopeFrame;
 			ins->IsCircle_UI = data->shaderData.IsCircle;
 			ins->camDepth_UI = data->shaderData.camDepth;
@@ -388,6 +400,14 @@ namespace ImGuiImpl
 			ins->imageSharpen_UI = data->shaderData.imageSharpen;
 			ins->reticleMagnification_UI =
 				data->shaderData.reticleMagnification;
+			ins->reticleShadowStrength_UI =
+				std::isfinite(data->shaderData.reticleShadowStrength) ?
+					std::clamp(data->shaderData.reticleShadowStrength, 0.0F, 1.0F) :
+					0.0F;
+			ins->reticleParallaxStrength_UI =
+				std::isfinite(data->shaderData.reticleParallaxStrength) ?
+					std::clamp(data->shaderData.reticleParallaxStrength, 0.0F, 4.0F) :
+					1.0F;
 			ins->radius_UI = data->shaderData.parallax.radius;
 			ins->relativeFogRadius_UI = data->shaderData.parallax.relativeFogRadius;
 			ins->scopeSwayAmount_UI = data->shaderData.parallax.scopeSwayAmount;
@@ -400,6 +420,14 @@ namespace ImGuiImpl
 						data->shaderData.opticalLagStrength,
 						0.0F,
 						4.0F) :
+					1.0F;
+			ins->sceneDepth_UI =
+				std::isfinite(data->shaderData.parallax.sceneDepth) ?
+					std::clamp(data->shaderData.parallax.sceneDepth, 0.0F, 4.0F) :
+					1.0F;
+			ins->shadowDepth_UI =
+				std::isfinite(data->shaderData.parallax.shadowDepth) ?
+					std::clamp(data->shaderData.parallax.shadowDepth, 0.0F, 4.0F) :
 					1.0F;
 			ins->selectionRevision_UI =
 				GetAuthoredZoomSnapshot().selectionRevision;
@@ -424,7 +452,7 @@ namespace ImGuiImpl
 		const bool pressed = ImGui::Button("Reload Profile", { 150, 0 });
 		Tip("Discards unsaved changes and restores the values from the profile on disk.");
 		if (pressed) {
-			if (sdh->GetCurrentFTSData()) {
+			if (sdh->GetCurrentScopeProfile()) {
 				// Disk reload and selection restoration are game-thread work.
 				// Clear the copied preview now, then let HookedUpdate reload,
 				// restore the authored baseline, and republish UI values.
@@ -438,10 +466,10 @@ namespace ImGuiImpl
 	{
 		const bool pressed = ImGui::Button("Save Profile", { 150, 0 });
 		Tip("Writes the current values to the profile file so they persist.\n"
-			"Automatic scopes save a new profile under Data/F4SE/Plugins/FTS/Auto.");
+			"Automatic scopes save a new profile under Data/F4SE/Plugins/MagnaScope/Auto.");
 		if (pressed) {
 			bIsSaving.store(true, std::memory_order_release);
-			currData = sdh->GetCurrentFTSData();
+			currData = sdh->GetCurrentScopeProfile();
 			if (!currData) {
 				bIsSaving.store(false, std::memory_order_release);
 				logger::error(
@@ -488,6 +516,10 @@ namespace ImGuiImpl
 			editedProfile.shaderData.imageSharpen = imageSharpen_UI;
 			editedProfile.shaderData.reticleMagnification =
 				reticleMagnification_UI;
+			editedProfile.shaderData.reticleShadowStrength =
+				std::clamp(reticleShadowStrength_UI, 0.0F, 1.0F);
+			editedProfile.shaderData.reticleParallaxStrength =
+				std::clamp(reticleParallaxStrength_UI, 0.0F, 4.0F);
 			editedProfile.shaderData.parallax.radius = radius_UI;
 			editedProfile.shaderData.parallax.relativeFogRadius = relativeFogRadius_UI;
 			editedProfile.shaderData.parallax.scopeSwayAmount = scopeSwayAmount_UI;
@@ -498,6 +530,10 @@ namespace ImGuiImpl
 				std::isfinite(opticalLagStrength_UI) ?
 					std::clamp(opticalLagStrength_UI, 0.0F, 4.0F) :
 					1.0F;
+			editedProfile.shaderData.parallax.sceneDepth =
+				std::clamp(sceneDepth_UI, 0.0F, 4.0F);
+			editedProfile.shaderData.parallax.shadowDepth =
+				std::clamp(shadowDepth_UI, 0.0F, 4.0F);
 			editedProfile.shaderData.bBoltDisable = bDisableWhileBolt;
 			editedProfile.shaderData.nvIntensity = nvIntensity_UI;
 			editedProfile.shaderData.fovAdjust = fovBase_UI;
@@ -536,6 +572,7 @@ namespace ImGuiImpl
 		scopeData.parallax_relativeFogRadius = relativeFogRadius_UI;
 		scopeData.parallax_scopeSwayAmount = scopeSwayAmount_UI;
 		scopeData.parallax_maxTravel = maxTravel_UI;
+		scopeData.scopeDepth = { sceneDepth_UI, shadowDepth_UI };
 
 		scopeData.BaseWeaponPos = baseWeaponPos_UI;
 		scopeData.MovePercentage = MovePercentage_UI;
@@ -570,7 +607,7 @@ namespace ImGuiImpl
 
 		ImGui::Checkbox("Legacy Mode", &bLegacyMode);
 		Tip("Renders the magnification as a screen-space circle over the scope.\n"
-			"Turn off only for weapons patched with an FTS lens material.\n"
+			"Turn off only for weapons patched with an marked lens material.\n"
 			"Takes effect after Save Profile.");
 		Hook::D3D::bLegacyMode = bLegacyMode;
 
@@ -848,6 +885,22 @@ namespace ImGuiImpl
 				Tip("Scales the STS-authored 3D reticle around its own geometric\n"
 					"vertex center. 1.00x preserves the authored size and remains\n"
 					"independent of scene magnification.");
+				ImGui::DragFloat(
+					"Reticle Shadow Strength",
+					&reticleShadowStrength_UI,
+					0.01F,
+					0.0F,
+					1.0F,
+					"%.2f");
+				Tip("Controls how strongly the exit-pupil shadow dims the reticle. 0 keeps the reticle visible across the aperture.");
+				ImGui::DragFloat(
+					"Reticle Parallax Strength",
+					&reticleParallaxStrength_UI,
+					0.01F,
+					0.0F,
+					4.0F,
+					"%.2f");
+				Tip("Scales reticle motion with optical parallax without changing its size.");
 			}
 		}
 
@@ -902,7 +955,7 @@ namespace ImGuiImpl
 				Tip("Clamps how far the measured exit pupil can move across the\n"
 					"ScopeFade aperture during sway, recoil, or weapon inertia.");
 			} else {
-				// Preserve the original FTS control and JSON meaning for
+				// Preserve the original scope-rendering control and JSON meaning for
 				// explicit profiles. Automatic STS profiles reinterpret this
 				// scalar only inside their physical ScopeFade shader.
 				ImGui::DragFloat(
@@ -925,6 +978,28 @@ namespace ImGuiImpl
 				"the eye leaves the optical axis. The visible scene shift is capped\n"
 				"separately from Maximum Eye Travel to remain stable during recoil.");
 			ImGui::DragFloat(
+				"Lens Depth Separation",
+				&sceneDepth_UI,
+				0.01F,
+				0.0F,
+				4.0F,
+				"%.2f");
+			Tip(
+				"Sets the virtual distance between the fixed ScopeFade aperture and\n"
+				"the magnified scene. Higher values strengthen both lateral parallax\n"
+				"and subtle fore/aft image breathing.");
+			ImGui::DragFloat(
+				"Shadow Depth Separation",
+				&shadowDepth_UI,
+				0.01F,
+				0.0F,
+				4.0F,
+				"%.2f");
+			Tip(
+				"Sets the virtual distance between the fixed aperture and the\n"
+				"exit-pupil shadow. Higher values strengthen lateral shadow travel\n"
+				"and subtle fore/aft pupil breathing.");
+			ImGui::DragFloat(
 				"Optical Lag Strength",
 				&opticalLagStrength_UI,
 				0.01F,
@@ -943,7 +1018,7 @@ namespace ImGuiImpl
 			sdh = ScopeData::ScopeDataHandler::GetSingleton();
 
 		d3d = Hook::D3D::GetSington();
-		currData = sdh->GetCurrentFTSData();
+		currData = sdh->GetCurrentScopeProfile();
 	}
 
 	void ImGuiImplClass::RenderImgui()
@@ -965,8 +1040,8 @@ namespace ImGuiImpl
 
 		if (!currData) {
 			ImGui::TextWrapped(
-				"No scope profile is active. Equip a weapon with an FTS profile or an "
-				"STS-configured scope, then reopen this page.");
+				"No scope profile is active. Equip a weapon with an STS-configured scope, "
+				"then reopen this page.");
 			ImGui::PopItemWidth();
 			return;
 		}
@@ -976,7 +1051,7 @@ namespace ImGuiImpl
 			ImGui::TextDisabled("%s", currData->keywordName.c_str());
 			ImGui::TextWrapped(
 				"This scope works without a patch. Saving below creates an editable "
-				"profile under Data/F4SE/Plugins/FTS/Auto.");
+				"profile under Data/F4SE/Plugins/MagnaScope/Auto.");
 		} else {
 			ImGui::TextUnformatted("Profile: from file");
 			ImGui::TextDisabled("%s", currData->path.c_str());
@@ -1043,7 +1118,11 @@ namespace ImGuiImpl
 			instance->scopeSwayAmount_UI,
 			instance->maxTravel_UI,
 			instance->sceneParallaxStrength_UI,
-			instance->opticalLagStrength_UI);
+			instance->opticalLagStrength_UI,
+			instance->reticleShadowStrength_UI,
+			instance->reticleParallaxStrength_UI,
+			instance->sceneDepth_UI,
+			instance->shadowDepth_UI);
 
 		ImGui::PopItemWidth();
 	}

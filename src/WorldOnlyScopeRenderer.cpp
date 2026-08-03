@@ -3158,6 +3158,19 @@ namespace MagnaScope
 					FirstPersonCaptureArm arm(
 						state.captureFrameGeneration.load(
 							std::memory_order_acquire));
+					// RenderBatches is entered before this accumulator submits
+					// any first-person geometry. Snapshot RT4 here, rather than
+					// waiting for a DrawIndexed call whose material setup may
+					// already have rebound the OM targets. This is the clean
+					// world-only color boundary needed by the scope composite.
+					auto* rendererData =
+						RE::BSGraphics::GetRendererData();
+					auto* context = rendererData ?
+						reinterpret_cast<ID3D11DeviceContext*>(
+							rendererData->context) :
+						nullptr;
+					(void)WorldOnlyScopeRenderer::GetSingleton()
+						.CaptureBeforeFirstPersonDraw(context, false);
 					state.renderBatchesOriginal(
 						accumulator,
 						shader,
@@ -3960,7 +3973,8 @@ namespace MagnaScope
 	}
 
 	bool WorldOnlyScopeRenderer::CaptureBeforeFirstPersonDraw(
-		ID3D11DeviceContext* context) noexcept
+		ID3D11DeviceContext* context,
+		bool requireLiveBinding) noexcept
 	{
 		auto& state = GetState();
 		if (!context ||
@@ -4005,9 +4019,10 @@ namespace MagnaScope
 							.texture) :
 					nullptr;
 				if (!rendererData || !mainColor ||
-					!IsQualifiedMainColorBoundary(
-						context,
-						mainColor)) {
+					(requireLiveBinding &&
+						!IsQualifiedMainColorBoundary(
+							context,
+							mainColor))) {
 					break;
 				}
 
@@ -4114,8 +4129,6 @@ namespace MagnaScope
 	{
 		auto& state = GetState();
 		if (token.phase != Phase::kPrimaryEligible ||
-			g_renderPhase != Phase::kPrimaryEligible ||
-			token.generation != g_renderPhaseGeneration ||
 			state.phase.load(std::memory_order_acquire) !=
 				Phase::kPrimaryEligible ||
 			token.generation == 0) {
@@ -4145,8 +4158,6 @@ namespace MagnaScope
 	{
 		auto& state = GetState();
 		if (token.phase != Phase::kPrimaryEligible ||
-			g_renderPhase != Phase::kPrimaryEligible ||
-			token.generation != g_renderPhaseGeneration ||
 			state.phase.load(std::memory_order_acquire) !=
 				Phase::kPrimaryEligible ||
 			token.generation == 0) {

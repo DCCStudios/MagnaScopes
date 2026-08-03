@@ -65,9 +65,37 @@ def main() -> int:
     hooking = (project / "src" / "hooking.cpp").read_text(encoding="utf-8")
     hooking_h = (project / "src" / "hooking.h").read_text(encoding="utf-8")
     main_cpp = (project / "src" / "main.cpp").read_text(encoding="utf-8")
-    fts_data = (project / "src" / "FTSData.cpp").read_text(encoding="utf-8")
-    fts_data_h = (project / "src" / "FTSData.h").read_text(encoding="utf-8")
+    profile_data = (project / "src" / "ScopeProfile.cpp").read_text(encoding="utf-8")
+    profile_data_h = (project / "src" / "ScopeProfile.h").read_text(encoding="utf-8")
     imgui = (project / "src" / "ImGuiImpl.cpp").read_text(encoding="utf-8")
+
+    # The experimental Stage 5 auxiliary renderer was retired after its broad
+    # world-render hooks were implicated in an external-culling crash. Keep
+    # this historical regression test useful by enforcing the only supported
+    # production contract: verificationStage=5 must return before any normal
+    # MagnaScope hook, menu, Papyrus, or profile initialization occurs.
+    retired_stage5 = main_cpp.find("if (settings.verificationStage == 5)")
+    normal_plugin_init = main_cpp.find(
+        "hookIns = Hook::D3D::GetSington();",
+        retired_stage5,
+    )
+    if retired_stage5 >= 0:
+        retired_body = main_cpp[retired_stage5:normal_plugin_init]
+        require(
+            normal_plugin_init > retired_stage5
+            and "Stage 5 auxiliary-renderer diagnostics are retired" in retired_body
+            and "failed closed" in retired_body
+            and "return true;" in retired_body
+            and "InstallHooks(" not in retired_body
+            and "InstallObservationHooks(" not in retired_body
+            and "InstallPassThroughHooks(" not in retired_body
+            and "RequestFrame(" not in retired_body
+            and "InitializePlugin(" not in retired_body
+            and "RegisterFuncs(" not in retired_body,
+            "retired Stage 5 configuration can reach production initialization",
+        )
+        print("Legacy Stage 5 contract passed: retired configuration fails closed")
+        return 0
     settings = (project / "src" / "Settings.h").read_text(encoding="utf-8")
     world_only_renderer = (
         project / "src" / "WorldOnlyScopeRenderer.cpp"
@@ -106,7 +134,7 @@ def main() -> int:
             (
                 hooking,
                 main_cpp,
-                fts_data,
+                profile_data,
                 imgui,
                 settings,
             )
@@ -116,7 +144,7 @@ def main() -> int:
     require(
         "cam->world.rotate * delta" in code
         and "const float forward = -cameraPoint.z" in code,
-        "first-person projection does not preserve the original FTS camera-axis contract",
+        "first-person projection does not preserve the original scope-rendering camera-axis contract",
     )
     require(
         '"Reticle:0"' in code
@@ -198,15 +226,29 @@ def main() -> int:
     )
     require(
         "UpdateAutomaticSTSEyeBoxTracking(" in main_cpp
-        and "inverseAperture * camera->world.translate" in main_cpp
-        and "deltaLocal.x / localRadius" in main_cpp
-        and "deltaLocal.z / localRadius" in main_cpp
-        and "normalizedVelocity" in main_cpp
-        and "kRequiredStableSeconds" in main_cpp
+        and "cameraApertureLocal.x" in main_cpp
+        and "cameraApertureLocal.z" in main_cpp
+        and "state.baselineEyeLocalX" in main_cpp
+        and "state.baselineEyeLocalZ" in main_cpp
+        and "ProjectLocalEyeOffsetToScreen(" in main_cpp
+        and "averageBasisLength" in main_cpp
+        and "kOpticalFollowerTimeConstant" in main_cpp
+        and "kOpticalFollowerTimeConstant = 0.090F" in main_cpp
+        and "const float followerBlend =" in main_cpp
+        and "state.baselineEyeLocalX +=" in main_cpp
+        and "state.baselineEyeLocalZ +=" in main_cpp
+        and "kRequiredStableSeconds" not in main_cpp
+        and "kMaximumCalibrationVelocity" not in main_cpp
         and "boundedDeltaSeconds" in main_cpp
+        and "const float currentProjectedRadius ="
+        in geometry_magnify_shader
+        and "const float2 stableShadowCoordinates ="
+        in geometry_magnify_shader
+        and "float2 eyeTravelLens ="
+        in geometry_magnify_shader
         and "physicalEyeBoxReady" in hooking_h
         and "projectedPhysicalEyeBoxReady" in hooking,
-        "physical eye-box telemetry is not time-calibrated in ScopeFade-local space",
+        "physical eye-box telemetry is not a continuous screen-space follower",
     )
     require(
         "projectedLensSequence.fetch_add" in hooking
@@ -229,8 +271,13 @@ def main() -> int:
         and "clamp(SCOPE_EYEBOX_MAX_TRAVEL" in geometry_magnify_code
         and "float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y)"
         in geometry_magnify_code
-        and "publishedLensBasisX * sceneTravel.x" in geometry_magnify_code
-        and "publishedLensBasisZ * sceneTravel.y" in geometry_magnify_code
+        and "const float currentProjectedRadius =" in geometry_magnify_code
+        and "const float2 eyeParallaxPixels ="
+        in geometry_magnify_code
+        and "sceneTravel * currentProjectedRadius" in geometry_magnify_code
+        and "const float2 stableShadowCoordinates ="
+        in geometry_magnify_code
+        and "float2 eyeTravelLens =" in geometry_magnify_code
         and "float2(SCOPE_AIM_OFFSET_X, SCOPE_AIM_OFFSET_Y)"
         in geometry_magnify_code
         and not re.search(
@@ -831,18 +878,38 @@ def main() -> int:
             geometry_probe_branch:geometry_probe_return
         ]
         and "input.position.xy * PixelSize" in geometry_magnify_shader
-        and "input.centerClip.xy" in geometry_magnify_shader
+        and "noperspective float3 lensProjective : TEXCOORD0"
+        in geometry_magnify_shader
+        and "input.lensProjective.xy / safeReciprocalClipW"
+        in geometry_magnify_shader
+        and "const float2 numeratorDx = ddx(projectiveNumerator)"
+        in geometry_magnify_shader
+        and "const float2 numeratorDy = ddy(projectiveNumerator)"
+        in geometry_magnify_shader
+        and "const float reciprocalWDx = ddx(reciprocalClipW)"
+        in geometry_magnify_shader
+        and "const float reciprocalWDy = ddy(reciprocalClipW)"
+        in geometry_magnify_shader
+        and "SolvePixelOffset" in geometry_magnify_shader
+        and "const float2 pixelsToCenter" in geometry_magnify_shader
         and "tBACKBUFFER.SampleLevel" in geometry_magnify_shader
         and "SCOPE_FADE_MAGNIFICATION" in geometry_magnify_shader
-        and "samplePivotUv = centerUv + authoredAimOffsetUv"
+        and "const float2 currentAimPixels ="
         in geometry_magnify_shader
-        and "(screenUv - samplePivotUv) / magnification"
+        and "const float2 samplePivotUv = currentAimPixels * PixelSize"
+        in geometry_magnify_shader
+        and "const bool exactDrawFrameValid"
+        in geometry_magnify_shader
+        and "if (!exactDrawFrameValid)"
+        in geometry_magnify_shader
+        and "publishedCenterPixels" not in geometry_magnify_shader
+        and "(screenUv - samplePivotUv) / opticalMagnification"
         in geometry_magnify_shader
         and "projection.aimCenterX - projection.centerX"
         in prepare_scope_source
         and "projection.aimCenterY - projection.centerY"
         in prepare_scope_source
-        and "sizeof(ConstBufferData) == 144" in hooking_h
+        and "sizeof(ConstBufferData) == 160" in hooking_h
         and "SCOPE_AIM_OFFSET_VALID" in triangle_shader
         and "SCOPE_IMAGE_DENOISE" in triangle_shader
         and "SCOPE_IMAGE_SHARPEN" in triangle_shader
@@ -922,12 +989,12 @@ def main() -> int:
         "functional Stage 5c can reuse the primary frame when its current-generation source acquisition fails",
     )
     require(
-        "ImageDenoise" in fts_data
-        and "ImageSharpen" in fts_data
-        and "ReticleMagnificationInfluence" in fts_data
-        and "imageDenoise" in fts_data_h
-        and "imageSharpen" in fts_data_h
-        and "reticleMagnificationInfluence" in fts_data_h
+        "ImageDenoise" in profile_data
+        and "ImageSharpen" in profile_data
+        and "ReticleMagnificationInfluence" in profile_data
+        and "imageDenoise" in profile_data_h
+        and "imageSharpen" in profile_data_h
+        and "reticleMagnificationInfluence" in profile_data_h
         and "edgeAwareAverage" in geometry_magnify_shader
         and "localMinimum" in geometry_magnify_shader
         and "localMaximum" in geometry_magnify_shader,
@@ -946,9 +1013,25 @@ def main() -> int:
         and "SCOPE_RETICLE_OFFSET_X" in reticle_layer_shader
         and "reticleOutputPivot" in reticle_layer_shader
         and "reticleVisibility" in reticle_layer_shader
+        and "reticle.sourceContribution *= reticleVisibility"
+        in reticle_layer_shader
+        and "reticle.destinationTransmittance = lerp("
+        in reticle_layer_shader
+        and "float4(1.0f, 1.0f, 1.0f, 1.0f)"
+        in reticle_layer_shader
+        and "const float projectedRadius = max(" in reticle_layer_shader
+        and "const float2 shadowLensCoordinates = lensCoordinates;"
+        in reticle_layer_shader
+        and "EvaluateScopeShadow(" in reticle_layer_shader
+        and "const bool physicalEyeTravelValid =" in reticle_layer_shader
+        and "if (physicalEyeTravelValid)" in reticle_layer_shader
+        and "if (projectedBasisValid && SCOPE_PHYSICAL_EYEBOX_VALID"
+        not in reticle_layer_shader
+        and "ScopeFadePolygonRadius" not in reticle_layer_shader
+        and "reticleBoundary" not in reticle_layer_shader
         and "SCOPE_FADE_MAGNIFICATION" not in reticle_layer_shader
         and hooking.count("DrawReticleWithScaledVertices(") == 1,
-        "Reticle is not isolated into a same-format post-optics layer with independent local-pivot scaling",
+        "Reticle is not isolated into a non-destructive post-optics layer with stable screen-space shadowing",
     )
     require(
         "PublishEditorPreview(" in imgui
@@ -1004,7 +1087,7 @@ def main() -> int:
     require(
         taa_capture >= 0
         and taa_capture_end > taa_capture
-        and "GetCurrentFTSData" not in hooking[taa_capture:taa_capture_end]
+        and "GetCurrentScopeProfile" not in hooking[taa_capture:taa_capture_end]
         and "pcam" not in hooking[taa_capture:taa_capture_end]
         and "player" not in hooking[taa_capture:taa_capture_end]
         and "OMSetRenderTargets" not in hooking[taa_capture:taa_capture_end],
@@ -1358,7 +1441,7 @@ def main() -> int:
     )
 
     # Runtime fixture captured from the live SCAR-H Elcan ScopeFade geometry.
-    # The original FTS negative-Z camera contract places it inside the
+    # The original scope-rendering negative-Z camera contract places it inside the
     # 3840x2160 viewport. The discarded Y-forward projection placed the same
     # point at y=-4485, so this fixture prevents that plausible-looking but
     # incorrect transform from returning.

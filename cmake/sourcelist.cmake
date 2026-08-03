@@ -5,8 +5,8 @@ set(SOURCES
 	src/WICTextureLoader11.cpp
 	src/DDSTextureLoader11.h
 	src/DDSTextureLoader11.cpp
-	src/FTSData.h
-	src/FTSData.cpp
+	src/ScopeProfile.h
+	src/ScopeProfile.cpp
 	src/ImGuiImpl.h
 	src/ImGuiImpl.cpp
 #	src/InputUtil.h

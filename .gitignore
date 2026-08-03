@@ -20,5 +20,12 @@
 
 /vcpkg_installed*
 
+# Deployed-artifact snapshots taken before each in-game candidate, and the
+# local copies of third-party material kept only for comparison. Both are
+# large binary trees that must never enter history.
+/deployment_backups/
+/_reference/
+*.pdb
+
 /tests/**/bin/
 /tests/**/obj/

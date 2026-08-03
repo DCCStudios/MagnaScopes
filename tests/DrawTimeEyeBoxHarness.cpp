@@ -1,6 +1,7 @@
 #include "DrawTimeEyeBoxMath.h"
 #include "EyeBoxRecentering.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -17,7 +18,12 @@ namespace
 	using MagnaScope::DrawTimeEyeBox::ProjectLensCoordinates;
 	using MagnaScope::DrawTimeEyeBox::SolveLensCoordinates;
 	using MagnaScope::DrawTimeEyeBox::Vec2;
+	using MagnaScope::EyeBoxRecentering::CalculateAxialEyeRelief;
 	using MagnaScope::EyeBoxRecentering::CalculateBlend;
+	using MagnaScope::EyeBoxRecentering::CalculateEyeReliefDistance;
+	using MagnaScope::EyeBoxRecentering::CalculateResponseAlpha;
+	using MagnaScope::EyeBoxRecentering::CalculateScreenEyeOffset;
+	using MagnaScope::EyeBoxRecentering::ProjectLocalEyeOffsetToScreen;
 
 	constexpr float kWidth = 1920.0F;
 	constexpr float kHeight = 1080.0F;
@@ -176,6 +182,128 @@ int main()
 	Require(
 		Near(CalculateBlend(3.0F, 1.0F / 60.0F, 4.0F), 0.0F),
 		"large offset was absorbed while the optic was still moving");
+
+	// The separately filtered renderer output must follow every finite target
+	// continuously. A step or sign reversal may change direction immediately,
+	// but one update can never snap to or overshoot the new target.
+	const float responseAlpha60 =
+		CalculateResponseAlpha(1.0F / 60.0F, 0.090F);
+	Require(
+		responseAlpha60 > 0.0F && responseAlpha60 < 1.0F,
+		"eye-box output follower used a discontinuous response step");
+	float followedOutput = 0.0F;
+	for (int frame = 0; frame < 4; ++frame) {
+		const float previousOutput = followedOutput;
+		followedOutput += (1.0F - followedOutput) * responseAlpha60;
+		Require(
+			followedOutput > previousOutput && followedOutput < 1.0F,
+			"eye-box output follower snapped or overshot a positive target");
+	}
+	for (int frame = 0; frame < 8; ++frame) {
+		const float previousOutput = followedOutput;
+		followedOutput += (-1.0F - followedOutput) * responseAlpha60;
+		Require(
+			followedOutput < previousOutput && followedOutput > -1.0F,
+			"eye-box output follower snapped or overshot after sign reversal");
+	}
+
+	const auto followForDuration = [](float frameSeconds) {
+		float output = 0.0F;
+		float elapsed = 0.0F;
+		while (elapsed < 0.25F) {
+			const float step = std::min(frameSeconds, 0.25F - elapsed);
+			output += (1.0F - output) *
+				CalculateResponseAlpha(step, 0.090F);
+			elapsed += step;
+		}
+		return output;
+	};
+	const float followed30 = followForDuration(1.0F / 30.0F);
+	const float followed60 = followForDuration(1.0F / 60.0F);
+	const float followed144 = followForDuration(1.0F / 144.0F);
+	Require(
+		Near(followed30, followed60, 0.0002F) &&
+			Near(followed60, followed144, 0.0002F),
+		"eye-box output follower changed with frame rate");
+	Require(
+		Near(CalculateResponseAlpha(0.0F, 0.090F), 0.0F) &&
+			CalculateResponseAlpha(0.25F, 0.090F) < 1.0F,
+		"eye-box output follower accepted an invalid or snapping frame step");
+
+	// ScopeFade local Y is its plane normal. The producer must measure eye
+	// relief only on that axis after transforming the camera into aperture
+	// space; projected screen X/Z motion therefore cannot change the result.
+	const float centeredDistance = CalculateEyeReliefDistance(-22.0F, 0.0F);
+	const float samePlaneDistance = CalculateEyeReliefDistance(-22.0F, 0.0F);
+	Require(
+		Near(centeredDistance, 22.0F) &&
+			Near(samePlaneDistance, centeredDistance) &&
+			Near(CalculateEyeReliefDistance(-18.0F, 0.0F), 18.0F) &&
+			Near(CalculateEyeReliefDistance(22.0F, 0.0F), 22.0F) &&
+			Near(CalculateEyeReliefDistance(NAN, 0.0F), 0.0F),
+		"ScopeFade-local eye-relief distance is not sign-safe and axial-only");
+	const auto fartherRelief =
+		CalculateAxialEyeRelief(centeredDistance, 20.0F);
+	const auto sameDepthDifferentHeading =
+		CalculateAxialEyeRelief(samePlaneDistance, 20.0F);
+	const auto nearerRelief =
+		CalculateAxialEyeRelief(18.0F, 20.0F);
+	Require(
+		fartherRelief.valid && sameDepthDifferentHeading.valid &&
+			nearerRelief.valid &&
+			Near(fartherRelief.normalizedDelta, 0.10F) &&
+			Near(
+				sameDepthDifferentHeading.normalizedDelta,
+				fartherRelief.normalizedDelta) &&
+			Near(nearerRelief.normalizedDelta, -0.10F),
+		"ScopeFade-local axial eye relief changed with lateral pose or sign");
+	Require(
+		Near(
+			CalculateAxialEyeRelief(40.0F, 20.0F)
+				.normalizedDelta,
+			0.10F) &&
+		!CalculateAxialEyeRelief(0.0F, 20.0F).valid,
+		"axial eye-relief safety bound or invalid-distance rejection failed");
+
+	// The shipping depth baseline is a continuous follower. A fore/aft impulse
+	// therefore decays monotonically and never snaps to zero on its final frame.
+	float axialBaseline = 20.0F;
+	float previousRelief = 1.0F;
+	for (int frame = 0; frame < 90; ++frame) {
+		axialBaseline += (22.0F - axialBaseline) *
+			CalculateResponseAlpha(1.0F / 60.0F, 0.090F);
+		const auto relief =
+			CalculateAxialEyeRelief(22.0F, axialBaseline);
+		Require(
+			relief.valid && relief.normalizedDelta >= 0.0F &&
+				relief.normalizedDelta <= previousRelief,
+			"axial eye relief snapped, overshot, or reversed while recentering");
+		previousRelief = relief.normalizedDelta;
+	}
+	Require(
+		previousRelief < 0.0001F,
+		"axial eye relief did not smoothly recenter");
+
+	// Mirror the shipping 90 ms pose follower followed by its 10 ms noise
+	// filter. Every published sample must lie between the previous output and
+	// the current finite target, including the turn back toward zero.
+	float followerBaseline = 0.0F;
+	float publishedOffset = 0.0F;
+	for (int frame = 0; frame < 90; ++frame) {
+		followerBaseline += (1.0F - followerBaseline) *
+			CalculateResponseAlpha(1.0F / 60.0F, 0.090F);
+		const float targetOffset = -(1.0F - followerBaseline);
+		const float previousOffset = publishedOffset;
+		publishedOffset += (targetOffset - publishedOffset) *
+			CalculateResponseAlpha(1.0F / 60.0F, 0.010F);
+		Require(
+			publishedOffset >= std::min(previousOffset, targetOffset) &&
+				publishedOffset <= std::max(previousOffset, targetOffset),
+			"combined eye-box follower snapped or overshot its finite target");
+	}
+	Require(
+		std::abs(publishedOffset) < 0.001F,
+		"combined eye-box follower did not converge continuously to center");
 
 	// Horizontal and vertical motion are evaluated from the frame supplied to
 	// this exact iteration. A deliberately different previous frame proves
@@ -390,10 +518,75 @@ int main()
 				0.0002F),
 		"projective eye travel did not preserve authored reticle offset");
 
+	// The runtime producer measures camera-to-ScopeFade displacement in the
+	// optic's authored local X/Z plane, then projects it through the current
+	// basis. A rigid look rotation leaves local coordinates unchanged and must
+	// therefore remain exactly centered at every heading and pitch.
+	const auto rigidUnrolled = ProjectLocalEyeOffsetToScreen(
+		2.0F, -1.0F, 2.0F, -1.0F, 10.0F,
+		240.0F, 0.0F, 0.0F, 240.0F, 240.0F);
+	const auto rigidRolled = ProjectLocalEyeOffsetToScreen(
+		2.0F, -1.0F, 2.0F, -1.0F, 10.0F,
+		0.0F, 240.0F, -240.0F, 0.0F, 240.0F);
+	Require(
+		rigidUnrolled.valid && rigidRolled.valid &&
+			Near(rigidUnrolled.x, 0.0F) && Near(rigidUnrolled.y, 0.0F) &&
+			Near(rigidRolled.x, 0.0F) && Near(rigidRolled.y, 0.0F),
+		"rigid camera/optic rotation created false eye-box motion");
+
+	// The same local eye displacement rotates with the projected optic basis,
+	// and inversion of that basis recovers the same local result. This is the
+	// direction-independence contract consumed by the draw-time shader.
+	const auto movedUnrolled = ProjectLocalEyeOffsetToScreen(
+		0.0F, 1.0F, 2.0F, 0.0F, 10.0F,
+		240.0F, 0.0F, 0.0F, 240.0F, 240.0F);
+	const auto movedRolled = ProjectLocalEyeOffsetToScreen(
+		0.0F, 1.0F, 2.0F, 0.0F, 10.0F,
+		0.0F, 240.0F, -240.0F, 0.0F, 240.0F);
+	Require(
+		movedUnrolled.valid && movedRolled.valid &&
+			Near(movedUnrolled.x, -0.2F) && Near(movedUnrolled.y, 0.1F) &&
+			Near(movedRolled.x, -0.1F) && Near(movedRolled.y, -0.2F),
+		"optic-local eye motion did not follow the current projected basis");
+	Require(
+		!ProjectLocalEyeOffsetToScreen(
+			0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+			1.0F, 0.0F, 0.0F, 1.0F, 1.0F)
+			.valid,
+		"invalid local aperture radius was accepted");
+
+	// Retain the standalone screen-opposition primitive as a safety contract
+	// for callers that already have a measured display-space delta.
+	const auto requireScreenOpposition = [](
+		float deltaX,
+		float deltaY,
+		float radius,
+		const char* message) {
+		const auto screen = CalculateScreenEyeOffset(deltaX, deltaY, radius);
+		Require(screen.valid, message);
+		Require(
+			Near(screen.x * radius, -deltaX, 0.002F) &&
+				Near(screen.y * radius, -deltaY, 0.002F),
+			message);
+	};
+	requireScreenOpposition(
+		48.0F, -18.0F, 240.0F,
+		"unrolled screen-local inertia changed direction");
+	requireScreenOpposition(
+		48.0F, -18.0F, 240.0F,
+		"quarter-rolled screen-local inertia changed direction");
+	requireScreenOpposition(
+		48.0F, -18.0F, 240.0F,
+		"extreme-pitch sheared inertia changed direction");
+	Require(
+		!CalculateScreenEyeOffset(10.0F, 5.0F, 0.0F).valid,
+		"invalid projected aperture radius was accepted");
+
 	std::cout << std::format(
 		"Draw-time eye-box PASSED: current=({:.3f}, {:.3f}), "
 		"rolled=({:.3f}, {:.3f}), activation=({:.3f}, {:.3f}); "
-		"projective/sheared frame and no previous-frame input PASSED\n",
+		"projective/sheared frame, optic-local orientation invariance, "
+		"and no previous-frame input PASSED\n",
 		currentTravel.x,
 		currentTravel.y,
 		rolledTravel.x,

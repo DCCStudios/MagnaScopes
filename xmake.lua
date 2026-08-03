@@ -48,10 +48,6 @@ target("MagnaScope")
     add_packages("nlohmann_json", "minhook")
     add_files("src/**.cpp")
     remove_files("src/MathUtils.cpp")
-    -- The retired Stage 5 auxiliary renderer hooked broad world-render
-    -- entry points. Keep its source for forensic reference, but do not link
-    -- it into the production DLL.
-    remove_files("src/WorldOnlyScopeRenderer.cpp")
     add_headerfiles("src/**.h")
     add_includedirs(
         "src",
@@ -131,8 +127,8 @@ target("MagnaScope")
             path.join(os.projectdir(), "Compile", "F4SE", "Plugins", "MagnaScope.ini")
         )
         os.cp(
-            path.join(os.projectdir(), "FTSConfig.json"),
-            path.join(os.projectdir(), "Compile", "F4SE", "Plugins", "FTSConfig.json")
+            path.join(os.projectdir(), "MagnaScopeConfig.json"),
+            path.join(os.projectdir(), "Compile", "F4SE", "Plugins", "MagnaScopeConfig.json")
         )
 
         local function stage_runtime(root)
@@ -149,8 +145,8 @@ target("MagnaScope")
                 path.join(plugin_dir, "MagnaScope.ini")
             )
             os.cp(
-                path.join(os.projectdir(), "FTSConfig.json"),
-                path.join(plugin_dir, "FTSConfig.json")
+                path.join(os.projectdir(), "MagnaScopeConfig.json"),
+                path.join(plugin_dir, "MagnaScopeConfig.json")
             )
             for shader, _ in pairs(shader_profiles) do
                 os.cp(

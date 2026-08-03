@@ -78,9 +78,13 @@ namespace
 		float reticleSize = 4.0F;
 		float reticleOffsetX = 0.0F;
 		float reticleOffsetY = 0.0F;
-		float reticlePadding = 0.0F;
+		float eyeReliefDelta = 0.0F;
+		float reticleShadowStrength = 0.0F;
+		float reticleParallaxStrength = 1.0F;
+		float lensCenterX = 0.0F;
+		float lensCenterY = 0.0F;
 	};
-	static_assert(sizeof(ResolutionConstants) == 144);
+	static_assert(sizeof(ResolutionConstants) == 160);
 
 	void Check(HRESULT result, std::string_view operation)
 	{
@@ -791,6 +795,8 @@ Output main(Input input)
 		(kCenterNdcX * 0.5F + 0.5F) * static_cast<float>(kWidth);
 	resolution.aimCenterY =
 		(0.5F - kCenterNdcY * 0.5F) * static_cast<float>(kHeight);
+	resolution.lensCenterX = resolution.aimCenterX;
+	resolution.lensCenterY = resolution.aimCenterY;
 	resolution.lensBasisXX = 0.80F * 0.5F * static_cast<float>(kWidth);
 	resolution.lensBasisXY = 0.0F;
 	resolution.lensBasisZX = 0.0F;
@@ -807,6 +813,52 @@ Output main(Input input)
 			nullptr,
 			resolutionBuffer.GetAddressOf()),
 		"CreateBuffer(resolution)");
+
+	// ScopeEffectData is the b5 companion cbuffer used by the production
+	// shader for the configurable lens and shadow depth separation.  Keep the
+	// harness bound exactly like the live compositor so the shader never reads
+	// an unbound cbuffer during WARP validation.
+	std::array<float, 88> scopeEffectConstants{};
+	scopeEffectConstants[86] = 1.0F;
+	scopeEffectConstants[87] = 1.0F;
+	D3D11_BUFFER_DESC scopeEffectDescription{};
+	scopeEffectDescription.ByteWidth =
+		static_cast<UINT>(scopeEffectConstants.size() * sizeof(float));
+	// Scene depth and shadow depth are independently tunable optical controls,
+	// so the fixture must be able to rewrite them between draws.
+	scopeEffectDescription.Usage = D3D11_USAGE_DYNAMIC;
+	scopeEffectDescription.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	scopeEffectDescription.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	const D3D11_SUBRESOURCE_DATA scopeEffectData{
+		scopeEffectConstants.data(),
+		0U,
+		0U
+	};
+	ComPtr<ID3D11Buffer> scopeEffectBuffer;
+	Check(
+		device->CreateBuffer(
+			&scopeEffectDescription,
+			&scopeEffectData,
+			scopeEffectBuffer.GetAddressOf()),
+		"CreateBuffer(scope effect)");
+	const auto updateScopeEffect = [&](float sceneDepth, float shadowDepth) {
+		scopeEffectConstants[86] = sceneDepth;
+		scopeEffectConstants[87] = shadowDepth;
+		D3D11_MAPPED_SUBRESOURCE effectMapping{};
+		Check(
+			context->Map(
+				scopeEffectBuffer.Get(),
+				0,
+				D3D11_MAP_WRITE_DISCARD,
+				0,
+				&effectMapping),
+			"Map(scope effect)");
+		std::memcpy(
+			effectMapping.pData,
+			scopeEffectConstants.data(),
+			scopeEffectConstants.size() * sizeof(float));
+		context->Unmap(scopeEffectBuffer.Get(), 0);
+	};
 
 	const auto updateResolution = [&](const ResolutionConstants& constants) {
 		D3D11_MAPPED_SUBRESOURCE constantMapping{};
@@ -831,9 +883,11 @@ Output main(Input input)
 	ID3D11ShaderResourceView* boundSource = sourceView.Get();
 	ID3D11SamplerState* boundSampler = sampler.Get();
 	ID3D11Buffer* boundResolution = resolutionBuffer.Get();
+	ID3D11Buffer* boundScopeEffect = scopeEffectBuffer.Get();
 	context->PSSetShaderResources(4, 1, &boundSource);
 	context->PSSetSamplers(0, 1, &boundSampler);
 	context->PSSetConstantBuffers(4, 1, &boundResolution);
+	context->PSSetConstantBuffers(5, 1, &boundScopeEffect);
 	context->DrawIndexed(static_cast<UINT>(indices.size()), 0, 0);
 
 	context->CopyResource(staging.Get(), renderTarget.Get());
@@ -1004,6 +1058,38 @@ Output main(Input input)
 			maximumFacetDelta);
 		return 1;
 	}
+	int maximumSeamDelta = 0;
+	for (std::size_t segment = 0; segment < kSegments; ++segment) {
+		const std::size_t first = segment * 3U;
+		for (std::size_t channel = 0; channel < 3U; ++channel) {
+			maximumSeamDelta = std::max(
+				maximumSeamDelta,
+				std::abs(
+					static_cast<int>(packedFacetSamples[first][channel]) -
+					static_cast<int>(packedFacetSamples[first + 2U][channel])));
+		}
+	}
+	int maximumCenterFillDelta = 0;
+	const std::size_t centerSampleBegin = kSegments * 3U;
+	for (std::size_t sample = centerSampleBegin + 1U;
+		 sample < packedFacetSamples.size();
+		 ++sample) {
+		for (std::size_t channel = 0; channel < 3U; ++channel) {
+			maximumCenterFillDelta = std::max(
+				maximumCenterFillDelta,
+				std::abs(
+					static_cast<int>(packedFacetSamples[sample][channel]) -
+					static_cast<int>(
+						packedFacetSamples[centerSampleBegin][channel])));
+		}
+	}
+	if (maximumSeamDelta > 2 || maximumCenterFillDelta > 3) {
+		std::cerr << std::format(
+			"ScopeFade facet seam detected: seamDelta={}, centerDelta={}\n",
+			maximumSeamDelta,
+			maximumCenterFillDelta);
+		return 1;
+	}
 
 	D3D11_MAPPED_SUBRESOURCE restoreMapping{};
 	Check(
@@ -1028,6 +1114,8 @@ Output main(Input input)
 	resolution.aimOffsetY = 4.0F / 51.2F;
 	resolution.aimCenterX = 85.0F;
 	resolution.aimCenterY = 66.0F;
+	resolution.lensCenterX = 77.0F;
+	resolution.lensCenterY = 70.0F;
 	updateResolution(resolution);
 	context->ClearRenderTargetView(renderTargetView.Get(), clear);
 	context->DrawIndexed(static_cast<UINT>(indices.size()), 0, 0);
@@ -1158,6 +1246,12 @@ Output main(Input input)
 	resolution.aimOffsetY = projectiveAimZ;
 	resolution.aimCenterX = projectivePivotX;
 	resolution.aimCenterY = projectivePivotY;
+	resolution.lensCenterX =
+		(projectiveCenter.x / projectiveCenter.w * 0.5F + 0.5F) *
+		static_cast<float>(kWidth);
+	resolution.lensCenterY =
+		(0.5F - projectiveCenter.y / projectiveCenter.w * 0.5F) *
+		static_cast<float>(kHeight);
 	resolution.physicalEyeBoxValid = 0.0F;
 	// This fixture isolates projective pivot recovery. Keep the fallback rim
 	// outside the synthetic aperture so optical darkening cannot change the
@@ -1179,7 +1273,6 @@ Output main(Input input)
 		"Map(staging projective frame)");
 	const auto projectivePivot =
 		Pixel(mapped, projectiveSampleX, projectiveSampleY);
-	context->Unmap(staging.Get(), 0);
 	const int expectedProjectiveRed =
 		static_cast<int>(std::lround(projectivePivotX * 2.0F));
 	const int expectedProjectiveGreen =
@@ -1200,6 +1293,157 @@ Output main(Input input)
 			expectedProjectiveGreen,
 			projectivePivotX,
 			projectivePivotY);
+		context->Unmap(staging.Get(), 0);
+		return 1;
+	}
+
+	// One correct pivot sample does not prove that every primitive recovered
+	// the same projective center. The former shader differentiated normalized
+	// perspective-correct lens coordinates. That is only a local linearization
+	// of a rational mapping, so the inferred aim point drifted across the lens
+	// and exposed triangle facets. Sample several separated local points under
+	// strong W gradients and require the same draw-wide 2x optical mapping.
+	constexpr std::array<std::array<float, 2>, 6> projectiveLocalSamples{
+		std::array<float, 2>{ 0.00F, 0.00F },
+		std::array<float, 2>{ 0.22F, 0.12F },
+		std::array<float, 2>{ -0.24F, 0.18F },
+		std::array<float, 2>{ 0.34F, -0.20F },
+		std::array<float, 2>{ -0.18F, -0.30F },
+		std::array<float, 2>{ 0.48F, 0.06F }
+	};
+	int maximumProjectiveMappingError = 0;
+	for (const auto& local : projectiveLocalSamples) {
+		const Vertex sampleClip{
+			projectiveCenter.x +
+				projectiveColumnX.x * local[0] +
+				projectiveColumnZ.x * local[1],
+			projectiveCenter.y +
+				projectiveColumnX.y * local[0] +
+				projectiveColumnZ.y * local[1],
+			projectiveCenter.z +
+				projectiveColumnX.z * local[0] +
+				projectiveColumnZ.z * local[1],
+			projectiveCenter.w +
+				projectiveColumnX.w * local[0] +
+				projectiveColumnZ.w * local[1]
+		};
+		const float displayX =
+			(sampleClip.x / sampleClip.w * 0.5F + 0.5F) *
+			static_cast<float>(kWidth);
+		const float displayY =
+			(0.5F - sampleClip.y / sampleClip.w * 0.5F) *
+			static_cast<float>(kHeight);
+		const auto pixelX = static_cast<std::uint32_t>(std::lround(displayX));
+		const auto pixelY = static_cast<std::uint32_t>(std::lround(displayY));
+		const auto sample = Pixel(mapped, pixelX, pixelY);
+		const float expectedSourceX =
+			projectivePivotX +
+			(static_cast<float>(pixelX) - projectivePivotX) * 0.5F;
+		const float expectedSourceY =
+			projectivePivotY +
+			(static_cast<float>(pixelY) - projectivePivotY) * 0.5F;
+		maximumProjectiveMappingError = std::max(
+			maximumProjectiveMappingError,
+			std::abs(
+				static_cast<int>(sample[0]) -
+				static_cast<int>(std::lround(expectedSourceX * 2.0F))));
+		maximumProjectiveMappingError = std::max(
+			maximumProjectiveMappingError,
+			std::abs(
+				static_cast<int>(sample[1]) -
+				static_cast<int>(std::lround(expectedSourceY * 2.0F))));
+	}
+	context->Unmap(staging.Get(), 0);
+	if (maximumProjectiveMappingError > 5) {
+		std::cerr << std::format(
+			"Projective ScopeFade mapping varied across primitives: "
+			"maximum channel error={}\n",
+			maximumProjectiveMappingError);
+		return 1;
+	}
+
+	// The replayed ScopeFade geometry is the current optical frame. Deliberately
+	// corrupt every CPU-projected center and basis value while keeping the exact
+	// draw unchanged; interior output must remain identical. This catches a
+	// regression to mixing a previous game-thread projection with current
+	// recoil, pitch, or weapon-inertia geometry.
+	submitLensPose(-kCenterNdcX, -kCenterNdcY);
+	resolution.magnification = 3.0F;
+	resolution.aimOffsetValid = 1.0F;
+	resolution.aimOffsetX = 0.20F;
+	resolution.aimOffsetY = -0.15F;
+	resolution.aimCenterX = 74.24F;
+	resolution.aimCenterY = 71.68F;
+	resolution.lensCenterX = 64.0F;
+	resolution.lensCenterY = 64.0F;
+	resolution.lensBasisXX = 51.2F;
+	resolution.lensBasisXY = 0.0F;
+	resolution.lensBasisZX = 0.0F;
+	resolution.lensBasisZY = -51.2F;
+	resolution.physicalEyeBoxValid = 0.0F;
+	resolution.sceneParallaxStrength = 0.0F;
+	resolution.fishEyeStrength = 0.0F;
+	resolution.edgeRefractionStrength = 0.0F;
+	const auto captureMagnifiedOutput = [&]() {
+		updateResolution(resolution);
+		context->ClearRenderTargetView(renderTargetView.Get(), clear);
+		context->DrawIndexed(static_cast<UINT>(indices.size()), 0, 0);
+		context->CopyResource(staging.Get(), renderTarget.Get());
+		Check(
+			context->Map(
+				staging.Get(),
+				0,
+				D3D11_MAP_READ,
+				0,
+				&mapped),
+			"Map(staging exact replay)");
+		std::vector<std::uint8_t> output(
+			static_cast<std::size_t>(kWidth) * kHeight * 4U);
+		for (std::uint32_t y = 0; y < kHeight; ++y) {
+			const auto* sourceRow =
+				static_cast<const std::uint8_t*>(mapped.pData) +
+				y * mapped.RowPitch;
+			std::memcpy(
+				output.data() + static_cast<std::size_t>(y) * kWidth * 4U,
+				sourceRow,
+				kWidth * 4U);
+		}
+		context->Unmap(staging.Get(), 0);
+		return output;
+	};
+	const auto currentProjectionOutput = captureMagnifiedOutput();
+	resolution.aimCenterX = -4096.0F;
+	resolution.aimCenterY = 8192.0F;
+	resolution.lensCenterX = 16384.0F;
+	resolution.lensCenterY = -8192.0F;
+	resolution.lensBasisXX = 51.2F;
+	resolution.lensBasisXY = 0.0F;
+	resolution.lensBasisZX = 51.2F;
+	resolution.lensBasisZY = 0.0000005F;
+	const auto staleProjectionOutput = captureMagnifiedOutput();
+	int maximumStaleProjectionDelta = 0;
+	for (int y = 34; y <= 94; ++y) {
+		for (int x = 34; x <= 94; ++x) {
+			const int dx = x - 64;
+			const int dy = y - 64;
+			if (dx * dx + dy * dy > 30 * 30) {
+				continue;
+			}
+			const auto offset =
+				(static_cast<std::size_t>(y) * kWidth + x) * 4U;
+			for (std::size_t channel = 0; channel < 3U; ++channel) {
+				maximumStaleProjectionDelta = std::max(
+					maximumStaleProjectionDelta,
+					std::abs(
+						static_cast<int>(currentProjectionOutput[offset + channel]) -
+						static_cast<int>(staleProjectionOutput[offset + channel])));
+			}
+		}
+	}
+	if (maximumStaleProjectionDelta > 1) {
+		std::cerr << std::format(
+			"Exact ScopeFade replay used stale CPU projection: maximum delta={}\n",
+			maximumStaleProjectionDelta);
 		return 1;
 	}
 
@@ -1219,6 +1463,8 @@ Output main(Input input)
 	resolution.lensBasisXY = 0.0F;
 	resolution.lensBasisZX = 0.0F;
 	resolution.lensBasisZY = 40.0F;
+	resolution.lensCenterX = 0.5F * static_cast<float>(kWidth);
+	resolution.lensCenterY = 0.5F * static_cast<float>(kHeight);
 	resolution.eyeBoxRadius = 2.0F;
 	resolution.vignetteReach = 9.0F;
 	resolution.vignetteSharpness = 3.0F;
@@ -1299,10 +1545,116 @@ Output main(Input input)
 		return 1;
 	}
 
+	// A screen-right displacement must ignore the older CPU-projected basis.
+	// Rotate it, then collapse its determinant below the historical validity
+	// threshold while retaining finite column lengths. Exact draw-time replay
+	// must preserve the same optical sample in all three cases.
+	resolution.eyeOffsetX = 0.30F;
+	resolution.eyeOffsetY = -0.20F;
+	resolution.opticalLagStrength = 1.0F;
+	resolution.lensBasisXX = 40.0F;
+	resolution.lensBasisXY = 0.0F;
+	resolution.lensBasisZX = 0.0F;
+	resolution.lensBasisZY = 40.0F;
+	const auto headingZeroSample = renderOpticalLagSample();
+
+	resolution.lensBasisXX = 0.0F;
+	resolution.lensBasisXY = 40.0F;
+	resolution.lensBasisZX = -40.0F;
+	resolution.lensBasisZY = 0.0F;
+	const auto headingQuarterTurnSample = renderOpticalLagSample();
+
+	resolution.lensBasisXX = 32.0F;
+	resolution.lensBasisXY = 24.0F;
+	resolution.lensBasisZX = -24.0F;
+	resolution.lensBasisZY = 32.0F;
+	const auto pitchedHeadingSample = renderOpticalLagSample();
+
+	resolution.lensBasisXX = 40.0F;
+	resolution.lensBasisXY = 0.0F;
+	resolution.lensBasisZX = 40.0F;
+	resolution.lensBasisZY = 0.000001F;
+	const auto nearCollinearCpuBasisSample = renderOpticalLagSample();
+
+	const auto samplesMatch = [&](const auto& left, const auto& right) {
+		return channelDifference(left[0], right[0]) <= 2 &&
+		       channelDifference(left[1], right[1]) <= 2 &&
+		       channelDifference(left[2], right[2]) <= 2;
+	};
+	if (!samplesMatch(headingZeroSample, headingQuarterTurnSample) ||
+		!samplesMatch(headingZeroSample, pitchedHeadingSample) ||
+		!samplesMatch(headingZeroSample, nearCollinearCpuBasisSample)) {
+		std::cerr << std::format(
+			"Heading-invariant optical lag failed: zero=({}, {}, {}), "
+			"quarter=({}, {}, {}), pitched=({}, {}, {}), "
+			"nearCollinear=({}, {}, {})\n",
+			headingZeroSample[0],
+			headingZeroSample[1],
+			headingZeroSample[2],
+			headingQuarterTurnSample[0],
+			headingQuarterTurnSample[1],
+			headingQuarterTurnSample[2],
+			pitchedHeadingSample[0],
+			pitchedHeadingSample[1],
+			pitchedHeadingSample[2],
+			nearCollinearCpuBasisSample[0],
+			nearCollinearCpuBasisSample[1],
+			nearCollinearCpuBasisSample[2]);
+		return 1;
+	}
+
+	// Now rotate and projectively shear the replayed geometry itself. The lens
+	// frame must follow that exact draw, but display-X/Y eye travel must retain
+	// its screen direction and magnitude at the optical center.
+	const Vertex replayCenter{ 0.0F, 0.0F, 0.5F, 1.0F };
+	const Vertex replayUnrolledX{ 0.80F, 0.0F, 0.0F, 0.0F };
+	const Vertex replayUnrolledZ{ 0.0F, 0.80F, 0.0F, 0.0F };
+	submitProjectiveLensPose(
+		replayCenter,
+		replayUnrolledX,
+		replayUnrolledZ);
+	const auto exactUnrolledSample = renderOpticalLagSample();
+
+	const Vertex replayQuarterTurnX{ 0.0F, 0.80F, 0.0F, 0.0F };
+	const Vertex replayQuarterTurnZ{ -0.80F, 0.0F, 0.0F, 0.0F };
+	submitProjectiveLensPose(
+		replayCenter,
+		replayQuarterTurnX,
+		replayQuarterTurnZ);
+	const auto exactQuarterTurnSample = renderOpticalLagSample();
+
+	const Vertex replayPitchedX{ 0.64F, 0.48F, 0.0F, 0.12F };
+	const Vertex replayPitchedZ{ -0.16F, 0.7838367F, 0.0F, -0.08F };
+	submitProjectiveLensPose(
+		replayCenter,
+		replayPitchedX,
+		replayPitchedZ);
+	const auto exactPitchedSample = renderOpticalLagSample();
+	if (!samplesMatch(exactUnrolledSample, exactQuarterTurnSample) ||
+		!samplesMatch(exactUnrolledSample, exactPitchedSample)) {
+		std::cerr << std::format(
+			"Exact replay rotated screen-space optical lag: "
+			"unrolled=({}, {}, {}), quarter=({}, {}, {}), "
+			"pitched=({}, {}, {})\n",
+			exactUnrolledSample[0],
+			exactUnrolledSample[1],
+			exactUnrolledSample[2],
+			exactQuarterTurnSample[0],
+			exactQuarterTurnSample[1],
+			exactQuarterTurnSample[2],
+			exactPitchedSample[0],
+			exactPitchedSample[1],
+			exactPitchedSample[2]);
+		return 1;
+	}
+
+	// Restore the centered affine fixture for the pupil-shadow checks below.
+	submitLensPose(-kCenterNdcX, -kCenterNdcY);
+
 	// ScopeFade vertices define the current physical lens frame, but absolute
 	// screen position must not create eye travel. Moving the entire optic while
 	// leaving the local-motion constants at zero therefore remains centered.
-	// A separate +0.30-radius local eye displacement must create the one-sided
+	// A separate +0.80-radius local eye displacement must create the one-sided
 	// shadow. This is the production contract that lets pitch/yaw recenter
 	// while recoil and first-person inertia remain visible.
 	//
@@ -1342,13 +1694,92 @@ Output main(Input input)
 	resolution.lensBasisXY = 0.0F;
 	resolution.lensBasisZX = 0.0F;
 	resolution.lensBasisZY = 40.0F;
-	// Use a deliberately constrained exit pupil so a 0.30-radius synthetic
+	resolution.lensCenterX = 0.5F * static_cast<float>(kWidth);
+	resolution.lensCenterY = 0.5F * static_cast<float>(kHeight);
+	// Use a deliberately constrained exit pupil so a 0.80-radius synthetic
 	// lens displacement produces a measurable one-sided shadow. Production's
 	// wider default is tested for stability rather than maximum contrast.
-	resolution.eyeBoxRadius = 1.5F;
+	resolution.eyeBoxRadius = 1.0F;
 	resolution.vignetteReach = 10.0F;
 	resolution.vignetteSharpness = 3.0F;
 	resolution.eyeBoxMaxTravel = 1.0F;
+	// Eye Box Radius is travel forgiveness, not the resting pupil radius.  The
+	// authored default must leave the optical center clear while Vignette Reach
+	// creates a visible rim at rest.  Pure axial eye relief may alter that rim
+	// only slightly; it must never create a centered black disk.
+	const auto renderAuthoredPupilEdge = [&](float eyeReliefDelta) {
+		resolution.eyeOffsetX = 0.0F;
+		resolution.eyeOffsetY = 0.0F;
+		resolution.eyeBoxRadius = 1.55F;
+		resolution.eyeReliefDelta = eyeReliefDelta;
+		updateResolution(resolution);
+		submitLensPose(-kCenterNdcX, -kCenterNdcY);
+		context->ClearRenderTargetView(renderTargetView.Get(), clear);
+		context->DrawIndexed(static_cast<UINT>(indices.size()), 0, 0);
+		context->CopyResource(staging.Get(), renderTarget.Get());
+		Check(
+			context->Map(
+				staging.Get(),
+				0,
+				D3D11_MAP_READ,
+				0,
+				&mapped),
+			"Map(staging authored pupil edge)");
+		const auto center = Pixel(mapped, 64, 64);
+		// The replay fixture's true outer radius is about 51 pixels. Sample
+		// inside that authored boundary rather than the older 40-pixel CPU
+		// proxy, which is intentionally no longer authoritative at draw time.
+		const auto edge = Pixel(mapped, 112, 64);
+		context->Unmap(staging.Get(), 0);
+		return std::pair{ center, edge };
+	};
+	const auto pupilAtRest = renderAuthoredPupilEdge(0.0F);
+	const auto pupilFarther = renderAuthoredPupilEdge(0.10F);
+	const auto pupilCloser = renderAuthoredPupilEdge(-0.10F);
+	resolution.vignetteReach = 0.0F;
+	const auto pupilLowReach = renderAuthoredPupilEdge(0.0F);
+	resolution.vignetteReach = 14.0F;
+	const auto pupilHighReach = renderAuthoredPupilEdge(0.0F);
+	resolution.vignetteReach = 7.0F;
+	const auto pupilBrightness = [](const std::array<std::uint8_t, 4>& pixel) {
+		return static_cast<unsigned>(pixel[0]) +
+		       static_cast<unsigned>(pixel[1]) +
+		       static_cast<unsigned>(pixel[2]);
+	};
+	if (pupilBrightness(pupilAtRest.first) < 500U ||
+		pupilBrightness(pupilFarther.first) < 500U ||
+		pupilBrightness(pupilCloser.first) < 500U ||
+		pupilBrightness(pupilAtRest.second) + 100U >=
+			pupilBrightness(pupilAtRest.first) ||
+		pupilBrightness(pupilHighReach.second) + 40U >=
+			pupilBrightness(pupilLowReach.second)) {
+		std::cerr << std::format(
+			"Resting pupil contract failed: center=({}, {}, {}), "
+			"edge=({}, {}, {}), farther-center=({}, {}, {}), "
+			"closer-center=({}, {}, {}), low-reach-edge=({}, {}, {}), "
+			"high-reach-edge=({}, {}, {})\n",
+			pupilAtRest.first[0],
+			pupilAtRest.first[1],
+			pupilAtRest.first[2],
+			pupilAtRest.second[0],
+			pupilAtRest.second[1],
+			pupilAtRest.second[2],
+			pupilFarther.first[0],
+			pupilFarther.first[1],
+			pupilFarther.first[2],
+			pupilCloser.first[0],
+			pupilCloser.first[1],
+			pupilCloser.first[2],
+			pupilLowReach.second[0],
+			pupilLowReach.second[1],
+			pupilLowReach.second[2],
+			pupilHighReach.second[0],
+			pupilHighReach.second[1],
+			pupilHighReach.second[2]);
+		return 1;
+	}
+	resolution.eyeBoxRadius = 1.0F;
+	resolution.eyeReliefDelta = 0.0F;
 	updateResolution(resolution);
 	submitLensPose(-kCenterNdcX, -kCenterNdcY);
 	context->ClearRenderTargetView(renderTargetView.Get(), clear);
@@ -1373,6 +1804,9 @@ Output main(Input input)
 	// The outer radius is 0.80 NDC, so 0.24 NDC translates the whole lens by
 	// 0.30 local radii. Zero local eye motion must remain centered.
 	submitLensPose(-kCenterNdcX + 0.24F, -kCenterNdcY);
+	resolution.lensCenterX +=
+		0.24F * 0.5F * static_cast<float>(kWidth);
+	updateResolution(resolution);
 	context->ClearRenderTargetView(renderTargetView.Get(), clear);
 	context->DrawIndexed(static_cast<UINT>(indices.size()), 0, 0);
 	context->CopyResource(staging.Get(), renderTarget.Get());
@@ -1391,7 +1825,7 @@ Output main(Input input)
 	// Now publish actual local eye/optic motion without moving the authored
 	// geometry again. The exit pupil and scene parallax must respond to this
 	// transient signal rather than to the lens's monitor-space position.
-	resolution.eyeOffsetX = 0.30F;
+	resolution.eyeOffsetX = 0.80F;
 	updateResolution(resolution);
 	context->ClearRenderTargetView(renderTargetView.Get(), clear);
 	context->DrawIndexed(static_cast<UINT>(indices.size()), 0, 0);
@@ -1452,13 +1886,222 @@ Output main(Input input)
 		return 1;
 	}
 
+	// ------------------------------------------------------------------
+	// Priority 0 scope-shadow contract.
+	//
+	// In-game testing reported the shadow darkening most or all of the
+	// optical image. The cause was an exit pupil displaced without any bound
+	// relative to its own radius: published travel is limited only by Eye Box
+	// Max Travel (four aperture radii by default) while the lit disc has
+	// radius one, so the whole aperture fell outside the pupil and the shader
+	// multiplied every pixel by zero.
+	//
+	// These checks assert the repaired contract against rendered output
+	// rather than against source text, at deliberately extreme settings:
+	//   1. the aligned lens centre keeps full brightness at maximum travel;
+	//   2. the resting rim touches only the outer band, never mid-lens;
+	//   3. displacement produces a one-sided crescent, not a global dim;
+	//   4. Eye Box Radius and Shadow Depth are live controls in the scene
+	//      shader, which Eye Box Radius previously was not.
+	// ------------------------------------------------------------------
+	const auto restoreCenteredShadowFixture = [&]() {
+		resolution.magnification = 1.0F;
+		resolution.aimOffsetValid = 0.0F;
+		resolution.aimOffsetX = 0.0F;
+		resolution.aimOffsetY = 0.0F;
+		resolution.fishEyeStrength = 0.0F;
+		resolution.edgeRefractionStrength = 0.0F;
+		resolution.edgeChromaticAberration = 0.0F;
+		resolution.imageDenoise = 0.0F;
+		resolution.imageSharpen = 0.0F;
+		resolution.sceneParallaxStrength = 0.0F;
+		resolution.opticalLagStrength = 1.0F;
+		resolution.eyeReliefDelta = 0.0F;
+		resolution.physicalEyeBoxValid = 1.0F;
+		resolution.activationProgress = 1.0F;
+		resolution.eyeOffsetX = 0.0F;
+		resolution.eyeOffsetY = 0.0F;
+		resolution.lensRadiusX = 40.0F;
+		resolution.lensRadiusY = 40.0F;
+		resolution.lensBasisXX = 40.0F;
+		resolution.lensBasisXY = 0.0F;
+		resolution.lensBasisZX = 0.0F;
+		resolution.lensBasisZY = 40.0F;
+		resolution.aimCenterX = 0.5F * static_cast<float>(kWidth);
+		resolution.aimCenterY = 0.5F * static_cast<float>(kHeight);
+		resolution.lensCenterX = 0.5F * static_cast<float>(kWidth);
+		resolution.lensCenterY = 0.5F * static_cast<float>(kHeight);
+	};
+
+	// The source is the uniform 192-grey fixture installed above, so any
+	// brightness change is shadow rather than a different scene sample.
+	constexpr unsigned kUnshadowedBrightness = 192U * 3U;
+	const auto renderShadowSamples = [&]() {
+		updateResolution(resolution);
+		submitLensPose(-kCenterNdcX, -kCenterNdcY);
+		context->ClearRenderTargetView(renderTargetView.Get(), clear);
+		context->DrawIndexed(static_cast<UINT>(indices.size()), 0, 0);
+		context->CopyResource(staging.Get(), renderTarget.Get());
+		Check(
+			context->Map(
+				staging.Get(),
+				0,
+				D3D11_MAP_READ,
+				0,
+				&mapped),
+			"Map(staging scope shadow contract)");
+		// The fixture's outer radius is 0.80 NDC on a 128-pixel target, so
+		// the authored aperture radius is about 51 pixels about (64, 64).
+		struct ShadowSamples
+		{
+			unsigned center;
+			unsigned midLeft;
+			unsigned midRight;
+			unsigned edgeLeft;
+			unsigned edgeRight;
+		};
+		const auto sample = [&](std::uint32_t x, std::uint32_t y) {
+			const auto pixel = Pixel(mapped, x, y);
+			return static_cast<unsigned>(pixel[0]) +
+			       static_cast<unsigned>(pixel[1]) +
+			       static_cast<unsigned>(pixel[2]);
+		};
+		// Pixel centres sit at x + 0.5 while the aperture centre is exactly
+		// 64.0, so the left and right samples must straddle it by the same
+		// half-pixel distance. Mirroring 16 onto 112 instead of 111 put the
+		// two edge samples at 47.5 and 48.5 pixels, which is a visible
+		// difference on the steep rim ramp and reads as a false asymmetry.
+		const ShadowSamples samples{
+			sample(64, 64),   // r = 0.00
+			sample(39, 64),   // r = 0.48, left  (24.5 px)
+			sample(88, 64),   // r = 0.48, right (24.5 px)
+			sample(16, 64),   // r = 0.93, left  (47.5 px)
+			sample(111, 64)   // r = 0.93, right (47.5 px)
+		};
+		context->Unmap(staging.Get(), 0);
+		return samples;
+	};
+
+	// 1 and 3: maximum travel with an extremely narrow exit pupil. The raw
+	// displacement here is 40 aperture radii before limiting, which is well
+	// past the value that used to black the lens out completely.
+	restoreCenteredShadowFixture();
+	updateScopeEffect(1.0F, 1.0F);
+	resolution.vignetteReach = 9.0F;
+	resolution.vignetteSharpness = 3.0F;
+	resolution.eyeBoxMaxTravel = 4.0F;
+	resolution.eyeBoxRadius = 0.10F;
+	resolution.eyeOffsetX = 4.0F;
+	const auto extremeTravel = renderShadowSamples();
+
+	// 2: rim reach at its maximum must still leave everything inside 0.75
+	// radii untouched.
+	restoreCenteredShadowFixture();
+	resolution.vignetteReach = 20.0F;
+	resolution.vignetteSharpness = 3.0F;
+	resolution.eyeBoxMaxTravel = 4.0F;
+	resolution.eyeBoxRadius = 2.0F;
+	const auto maximumReach = renderShadowSamples();
+
+	// 4a: Eye Box Radius must change the scene shadow. A forgiving pupil at
+	// the same travel has to leave the far side brighter than a narrow one.
+	restoreCenteredShadowFixture();
+	resolution.vignetteReach = 9.0F;
+	resolution.vignetteSharpness = 3.0F;
+	resolution.eyeBoxMaxTravel = 1.0F;
+	resolution.eyeOffsetX = 0.35F;
+	resolution.eyeBoxRadius = 0.35F;
+	const auto narrowPupil = renderShadowSamples();
+	resolution.eyeBoxRadius = 6.0F;
+	const auto widePupil = renderShadowSamples();
+
+	// 4b: Shadow Depth is the eye-relief multiplier and must behave the same
+	// way from the opposite direction.
+	restoreCenteredShadowFixture();
+	resolution.vignetteReach = 9.0F;
+	resolution.vignetteSharpness = 3.0F;
+	resolution.eyeBoxMaxTravel = 1.0F;
+	resolution.eyeBoxRadius = 2.0F;
+	resolution.eyeOffsetX = 0.60F;
+	updateScopeEffect(1.0F, 0.10F);
+	const auto shallowRelief = renderShadowSamples();
+	updateScopeEffect(1.0F, 4.0F);
+	const auto deepRelief = renderShadowSamples();
+	updateScopeEffect(1.0F, 1.0F);
+
+	const auto isUnshadowed = [](unsigned brightness) {
+		// One least-significant unit per channel of rounding slack.
+		return brightness + 3U >= kUnshadowedBrightness;
+	};
+	const bool centerSurvivesMaximumTravel =
+		isUnshadowed(extremeTravel.center);
+	// A saturated pupil displacement is one-sided by construction: the near
+	// side stays lit while the far side is fully shadowed.
+	const bool extremeTravelIsOneSided =
+		isUnshadowed(extremeTravel.midRight) &&
+		extremeTravel.midLeft + 200U < extremeTravel.midRight;
+	const bool rimSparesMidLens =
+		isUnshadowed(maximumReach.center) &&
+		isUnshadowed(maximumReach.midLeft) &&
+		isUnshadowed(maximumReach.midRight) &&
+		maximumReach.edgeLeft + 100U < maximumReach.center &&
+		maximumReach.edgeRight + 100U < maximumReach.center;
+	const bool restingRimIsSymmetric =
+		maximumReach.edgeLeft + 8U > maximumReach.edgeRight &&
+		maximumReach.edgeRight + 8U > maximumReach.edgeLeft;
+	const bool eyeBoxRadiusIsLive =
+		narrowPupil.midLeft + 60U < widePupil.midLeft &&
+		isUnshadowed(narrowPupil.center) &&
+		isUnshadowed(widePupil.center);
+	const bool shadowDepthIsLive =
+		deepRelief.midLeft + 60U < shallowRelief.midLeft &&
+		isUnshadowed(shallowRelief.center) &&
+		isUnshadowed(deepRelief.center);
+	if (!centerSurvivesMaximumTravel ||
+		!extremeTravelIsOneSided ||
+		!rimSparesMidLens ||
+		!restingRimIsSymmetric ||
+		!eyeBoxRadiusIsLive ||
+		!shadowDepthIsLive) {
+		std::cerr << std::format(
+			"Scope shadow contract failed (unshadowed={}): "
+			"extremeTravel[center={}, midLeft={}, midRight={}], "
+			"maximumReach[center={}, midLeft={}, midRight={}, "
+			"edgeLeft={}, edgeRight={}], "
+			"narrowPupil[center={}, midLeft={}], "
+			"widePupil[center={}, midLeft={}], "
+			"shallowRelief[center={}, midLeft={}], "
+			"deepRelief[center={}, midLeft={}]\n",
+			kUnshadowedBrightness,
+			extremeTravel.center,
+			extremeTravel.midLeft,
+			extremeTravel.midRight,
+			maximumReach.center,
+			maximumReach.midLeft,
+			maximumReach.midRight,
+			maximumReach.edgeLeft,
+			maximumReach.edgeRight,
+			narrowPupil.center,
+			narrowPupil.midLeft,
+			widePupil.center,
+			widePupil.midLeft,
+			shallowRelief.center,
+			shallowRelief.midLeft,
+			deepRelief.center,
+			deepRelief.midLeft);
+		return 1;
+	}
+
 	std::cout << std::format(
 		"ScopeFade geometry fill PASSED: center=({}, {}, {}), "
 		"annulus=({}, {}, {}), outside=({}, {}, {}); "
 		"2x magnification PASSED: right=({}, {}, {}), "
 		"top=({}, {}, {}); reticle pivot, 1x identity, projective "
-		"lens frame, optical lag, stationary recentering, "
-		"local-motion eye-box direction, and packed ScopeFade "
+		"lens frame, heading-invariant optical lag, stationary recentering, "
+		"authored pupil radius, bounded axial breathing, local-motion "
+		"eye-box direction, bounded exit-pupil shadow (aligned centre "
+		"survives maximum travel, rim spares mid-lens, live Eye Box Radius "
+		"and Shadow Depth), and packed ScopeFade "
 		"continuity (maximum channel delta={}) PASSED\n",
 		center[0],
 		center[1],

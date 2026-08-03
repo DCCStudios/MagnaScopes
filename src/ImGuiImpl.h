@@ -4,7 +4,7 @@
 #pragma warning(disable: 4099)
 #include "../../F4SE-Menu-Framework-3/resources/F4SEMenuFramework.h"
 #pragma warning(pop)
-#include "FTSData.h"
+#include "ScopeProfile.h"
 
 #include <atomic>
 #include <cstdint>
@@ -205,12 +205,16 @@ namespace ImGuiImpl
 		float reticleSize = 4.0F;
 		float reticleOffsetX = 0.0F;
 		float reticleOffsetY = 0.0F;
+		float reticleShadowStrength = 0.0F;
+		float reticleParallaxStrength = 1.0F;
 		float eyeBoxRadius = 2.0F;
 		float vignetteReach = 9.0F;
 		float vignetteSharpness = 3.0F;
 		float eyeBoxMaxTravel = 4.0F;
 		float sceneParallaxStrength = 0.0F;
 		float opticalLagStrength = 1.0F;
+		float sceneDepth = 1.0F;
+		float shadowDepth = 1.0F;
 		bool active = false;
 	};
 
@@ -264,13 +268,17 @@ namespace ImGuiImpl
 		float vignetteSharpness,
 		float eyeBoxMaxTravel,
 		float sceneParallaxStrength,
-		float opticalLagStrength);
+		float opticalLagStrength,
+		float reticleShadowStrength,
+		float reticleParallaxStrength,
+		float sceneDepth,
+		float shadowDepth);
 	[[nodiscard]] EditorPreviewSnapshot GetEditorPreviewSnapshot();
 	void ClearEditorPreview();
 	void RequestProfileAction(ProfileRequest request);
 	[[nodiscard]] ProfileRequest ConsumeProfileAction();
-	void RequestProfileSave(const ScopeData::FTSData& profile);
-	[[nodiscard]] std::unique_ptr<ScopeData::FTSData> ConsumeProfileSave();
+	void RequestProfileSave(const ScopeData::ScopeProfile& profile);
+	[[nodiscard]] std::unique_ptr<ScopeData::ScopeProfile> ConsumeProfileSave();
 
 	class ImGuiImplClass
 	{
@@ -308,12 +316,16 @@ namespace ImGuiImpl
 		float imageDenoise_UI;
 		float imageSharpen_UI;
 		float reticleMagnification_UI = 1.0F;
+		float reticleShadowStrength_UI = 0.0F;
+		float reticleParallaxStrength_UI = 1.0F;
 		float radius_UI;
 		float relativeFogRadius_UI;
 		float scopeSwayAmount_UI;
 		float maxTravel_UI;
 		float sceneParallaxStrength_UI;
 		float opticalLagStrength_UI = 1.0F;
+		float sceneDepth_UI = 1.0F;
+		float shadowDepth_UI = 1.0F;
 		std::uint64_t selectionRevision_UI = 0;
 
 		bool bEnableFG;

@@ -14,6 +14,7 @@
 
 #include "Settings.h"
 #include "ReticleVertexScaling.h"
+#include "WorldOnlyScopeRenderer.h"
 #include "hookingStruct.h"
 #include <MathUtils.h>
 #include <renderdoc_app.h>
@@ -914,7 +915,7 @@ namespace
 {
 	HMODULE DetectUpscalerOrFrameGeneration()
 	{
-		// The original FTS knew only the old Fallout4Upscaler DLL name. LoreOut
+		// The original scope-rendering knew only the old Fallout4Upscaler DLL name. LoreOut
 		// uses the newer Streamline "Upscaling.dll" plus AAA Frame Generation,
 		// so treating this configuration as native TAA is incorrect.
 		const char* modules[] = {
@@ -1027,19 +1028,6 @@ namespace Hook
 			return hr;
 		}
 
-		// Existing FTS installations place the same compiled shaders in the
-		// XiFeiLi directory. Probe that location before compiling source.
-		if (csoFileNameInOut) {
-			std::wstring legacyPath(csoFileNameInOut);
-			if (const auto position = legacyPath.find(L"MagnaScope"); position != std::wstring::npos) {
-				legacyPath.replace(position, std::wstring_view(L"MagnaScope").size(), L"XiFeiLi");
-				if (D3DReadFileToBlob(legacyPath.c_str(), ppBlobOut) == S_OK) {
-					logger::info("Loaded legacy FTS shader {}", std::filesystem::path(legacyPath).string());
-					return S_OK;
-				}
-			}
-		}
-
 		if (hlslFileName && std::filesystem::exists(hlslFileName)) {
 			DWORD dwShaderFlags = D3DCOMPILE_ENABLE_STRICTNESS;
 #ifdef _DEBUG
@@ -1103,7 +1091,7 @@ namespace Hook
 		// common context wrappers: AAAFrameGeneration returned an invalid
 		// non-null entry here and Release() crashed on ADS. Preserve the shader
 		// object itself, which is the state used by Fallout and the original
-		// Fake Through Scope implementation.
+		// MagnaScope implementation.
 		pContext->VSGetShader(&state.pVS, nullptr, nullptr);
 		pContext->VSGetConstantBuffers(0, MAX_CB_SLOTS, state.pVSCBuffers);
 		pContext->VSGetShaderResources(0, MAX_SRV_SLOTS, state.pVSSRVs);
@@ -1246,7 +1234,7 @@ namespace Hook
 		// coordinates. HUDMenuUtils::WorldPtToScreenPt3 therefore returned
 		// (0,0,0) even with the correct function signature.
 		//
-		// Preserve the original FTS camera contract exactly where it matters:
+		// Preserve the original scope-rendering camera contract exactly where it matters:
 		// NiMatrix3 stores the first-person Camera rotation in the convention
 		// consumed by `camera.world.rotate * (point - camera.translation)`.
 		// In that resulting view space, negative Z is forward, X is horizontal,
@@ -1261,7 +1249,7 @@ namespace Hook
 			};
 		}
 
-		const auto projectOriginalFTS = [&](const RE::NiPoint3& cameraPoint) {
+		const auto projectScopeAnchor = [&](const RE::NiPoint3& cameraPoint) {
 			const float aspect =
 				static_cast<float>(windowWidth) / static_cast<float>(windowHeight);
 			const float fovRadians = std::clamp(
@@ -1292,7 +1280,7 @@ namespace Hook
 		const RE::NiPoint3 objectWorld = worldPoint;
 		const RE::NiPoint3 delta = objectWorld - cam->world.translate;
 		const RE::NiPoint3 cameraView = cam->world.rotate * delta;
-		const RE::NiPoint3 projected = projectOriginalFTS(cameraView);
+		const RE::NiPoint3 projected = projectScopeAnchor(cameraView);
 
 		if (player &&
 			(player->gunState == RE::GUN_STATE::kSighted ||
@@ -1300,7 +1288,7 @@ namespace Hook
 			static std::once_flag loggedProjectionContract;
 			std::call_once(loggedProjectionContract, [&] {
 				logger::info(
-					"First-person aperture projection (original FTS camera contract): cameraView=({:.4f}, {:.4f}, {:.4f}), pixel=({:.2f}, {:.2f}, depth={:.4f}), viewport={}x{}",
+					"First-person aperture projection (original scope-rendering camera contract): cameraView=({:.4f}, {:.4f}, {:.4f}), pixel=({:.2f}, {:.2f}, depth={:.4f}), viewport={}x{}",
 					cameraView.x,
 					cameraView.y,
 					cameraView.z,
@@ -1356,7 +1344,7 @@ namespace Hook
 		}
 
 		// worldBound.fRadius is already scaled into world units. Transform the
-		// bound center once through the verified original FTS camera contract,
+		// bound center once through the verified original scope-rendering camera contract,
 		// then offset it along camera X and Y. A sphere has the same radius in
 		// every orientation, so no scene-graph basis reconstruction is needed.
 		const RE::NiPoint3 cameraCenter =
@@ -1508,7 +1496,7 @@ namespace Hook
 		// Create an initial set on Fallout's advertised renderer device. The
 		// exact DrawIndexed path verifies and, when necessary, rebuilds these
 		// children on the device returned by that draw context. This is the
-		// D3D11 ownership contract used by the original FTS interception path
+		// D3D11 ownership contract used by the original scope-rendering interception path
 		// and remains correct through ENB and upscaler proxy interfaces.
 		if (!EnsureGeometryProbeDeviceResources(g_Device.Get())) {
 			logger::error(
@@ -1568,9 +1556,7 @@ namespace Hook
 		mAutomaticSTSReticleSuppressionSourceBlend.Reset();
 		mAutomaticSTSReticleColorSuppressionBlend.Reset();
 		mAutomaticSTSReticleSuppressionSourceWasNull = false;
-		mAutomaticSTSReticleLayerAuthoredDepthState.Reset();
 		mAutomaticSTSReticleLayerReadOnlyDepthState.Reset();
-		mAutomaticSTSReticleLayerAuthoredDepthWasNull = false;
 		mAutomaticSTSReticleLayerCaptureGeneration = 0U;
 		mAutomaticSTSReticleLayerGeneration = 0U;
 		mAutomaticSTSReticleLayerResourceGeneration = 0U;
@@ -1972,6 +1958,10 @@ namespace Hook
 				projection.radiusX * projectionScaleX;
 			resolution.lensRadiusY =
 				projection.radiusY * projectionScaleY;
+			resolution.lensCenterX =
+				projection.centerX * projectionScaleX;
+			resolution.lensCenterY =
+				projection.centerY * projectionScaleY;
 			resolution.aimCenterX =
 				projection.aimCenterX * projectionScaleX;
 			resolution.aimCenterY =
@@ -2013,12 +2003,24 @@ namespace Hook
 			scopeOpticalLagStrength.load(std::memory_order_acquire),
 			0.0F,
 			4.0F);
+		resolution.reticleShadowStrength = std::clamp(
+			scopeReticleShadowStrength.load(std::memory_order_acquire),
+			0.0F,
+			1.0F);
+		resolution.reticleParallaxStrength = std::clamp(
+			scopeReticleParallaxStrength.load(std::memory_order_acquire),
+			0.0F,
+			4.0F);
 		if (validProjection && projection.physicalEyeBoxReady) {
 			// Convert the game-thread projection into this render target's
 			// pixel space. The basis carries ScopeFade roll and perspective,
 			// so the shader never assumes a screen-aligned optic.
 			resolution.eyeOffsetX = projection.eyeOffsetX;
 			resolution.eyeOffsetY = projection.eyeOffsetY;
+			resolution.eyeReliefDelta = std::clamp(
+				projection.eyeReliefDelta,
+				-0.25F,
+				0.25F);
 			resolution.physicalEyeBoxValid = std::clamp(
 				projection.physicalEyeBoxBlend,
 				0.0F,
@@ -2752,18 +2754,13 @@ namespace Hook
 			}
 		}
 
-		// Private captures use a read-only clone. The authored draw is replayed
-		// once afterward with only displayed color disabled, so its original
-		// depth and stencil mutations remain part of Fallout's frame contract.
-		ComPtr<ID3D11DepthStencilState> authoredDepthState;
-		UINT stencilReference = 0U;
-		context->OMGetDepthStencilState(
-			authoredDepthState.GetAddressOf(),
-			&stencilReference);
-		D3D11_DEPTH_STENCIL_DESC authoredDepthDescription{};
-		if (authoredDepthState.Get()) {
-			authoredDepthState->GetDesc(&authoredDepthDescription);
-		}
+		// Private captures reconstruct the complete reticle surface. They must
+		// not inherit the live first-person depth buffer: at extreme pitch the
+		// scope housing can occlude part of the reticle mesh before the late
+		// ScopeFade aperture clip gets a chance to constrain it. The authored
+		// draw is replayed once afterward with displayed color suppressed, so
+		// Fallout still receives its original depth/stencil mutations exactly
+		// once.
 
 		const auto resourceGeneration =
 			mScopeFadeResourceGeneration.load(std::memory_order_acquire);
@@ -2779,9 +2776,7 @@ namespace Hook
 			mAutomaticSTSReticleSuppressionSourceBlend.Reset();
 			mAutomaticSTSReticleColorSuppressionBlend.Reset();
 			mAutomaticSTSReticleSuppressionSourceWasNull = false;
-			mAutomaticSTSReticleLayerAuthoredDepthState.Reset();
 			mAutomaticSTSReticleLayerReadOnlyDepthState.Reset();
-			mAutomaticSTSReticleLayerAuthoredDepthWasNull = false;
 			mAutomaticSTSReticleLayerCaptureGeneration = 0U;
 			mAutomaticSTSReticleLayerResourceGeneration =
 				resourceGeneration;
@@ -2941,67 +2936,31 @@ namespace Hook
 			whiteBackground ?
 				mAutomaticSTSReticleLayerWhiteRTV.Get() :
 				mAutomaticSTSReticleLayerRTV.Get();
-		context->OMSetRenderTargets(1U, &layerTarget, sourceDepth);
+		context->OMSetRenderTargets(1U, &layerTarget, nullptr);
 
-		// A private capture must observe the live depth/stencil tests without
-		// changing them. Otherwise the black pass can consume depth and make the
-		// white pass (or the game's fail-open authored draw) disappear. A null
-		// state means D3D11's write-enabled default, so it also needs a cached
-		// write-disabled clone.
-		const bool authoredDepthWasNull = !authoredDepthState.Get();
-		const bool currentStateIsOurReadOnlyClone =
-			authoredDepthState.Get() &&
-			mAutomaticSTSReticleLayerReadOnlyDepthState.Get() &&
-			HaveSameCOMIdentity(
-				authoredDepthState.Get(),
-				mAutomaticSTSReticleLayerReadOnlyDepthState.Get());
-		const bool cachedDepthStateMatches =
-			currentStateIsOurReadOnlyClone || (authoredDepthWasNull ?
-			(mAutomaticSTSReticleLayerAuthoredDepthWasNull &&
-				!mAutomaticSTSReticleLayerAuthoredDepthState.Get()) :
-			(mAutomaticSTSReticleLayerAuthoredDepthState.Get() &&
-				HaveSameCOMIdentity(
-					authoredDepthState.Get(),
-					mAutomaticSTSReticleLayerAuthoredDepthState.Get())));
-		if (!cachedDepthStateMatches ||
-			!mAutomaticSTSReticleLayerReadOnlyDepthState.Get()) {
+		// The private target has no depth attachment, and an explicit disabled
+		// state avoids inheriting a depth/stencil contract from the live draw.
+		if (!mAutomaticSTSReticleLayerReadOnlyDepthState.Get()) {
 			D3D11_DEPTH_STENCIL_DESC readOnlyDescription{};
-			if (authoredDepthState.Get()) {
-				authoredDepthState->GetDesc(&readOnlyDescription);
-			} else {
-				// D3D11's null depth/stencil state uses these defaults.
-				readOnlyDescription.DepthEnable = TRUE;
-				readOnlyDescription.DepthWriteMask =
-					D3D11_DEPTH_WRITE_MASK_ALL;
-				readOnlyDescription.DepthFunc = D3D11_COMPARISON_LESS;
-				readOnlyDescription.StencilEnable = FALSE;
-				readOnlyDescription.StencilReadMask =
-					D3D11_DEFAULT_STENCIL_READ_MASK;
-				readOnlyDescription.StencilWriteMask =
-					D3D11_DEFAULT_STENCIL_WRITE_MASK;
-			}
+			readOnlyDescription.DepthEnable = FALSE;
 			readOnlyDescription.DepthWriteMask =
 				D3D11_DEPTH_WRITE_MASK_ZERO;
+			readOnlyDescription.DepthFunc = D3D11_COMPARISON_ALWAYS;
+			readOnlyDescription.StencilEnable = FALSE;
+			readOnlyDescription.StencilReadMask =
+				D3D11_DEFAULT_STENCIL_READ_MASK;
 			readOnlyDescription.StencilWriteMask = 0U;
 			mAutomaticSTSReticleLayerReadOnlyDepthState.Reset();
 			if (FAILED(device->CreateDepthStencilState(
 					&readOnlyDescription,
 					mAutomaticSTSReticleLayerReadOnlyDepthState
 						.ReleaseAndGetAddressOf()))) {
-				mAutomaticSTSReticleLayerAuthoredDepthState.Reset();
-				mAutomaticSTSReticleLayerAuthoredDepthWasNull = false;
 				return false;
-			}
-			if (!currentStateIsOurReadOnlyClone) {
-				mAutomaticSTSReticleLayerAuthoredDepthState =
-					authoredDepthState;
-				mAutomaticSTSReticleLayerAuthoredDepthWasNull =
-					authoredDepthWasNull;
 			}
 		}
 		context->OMSetDepthStencilState(
 			mAutomaticSTSReticleLayerReadOnlyDepthState.Get(),
-			stencilReference);
+			0U);
 		// Preserve the complete authored draw contract, including its original
 		// blend state. The paired backgrounds let the late pass recover both the
 		// source contribution and destination transmittance, so no capture-time
@@ -3429,9 +3388,7 @@ namespace Hook
 			mAutomaticSTSReticleSuppressionSourceBlend.Reset();
 			mAutomaticSTSReticleColorSuppressionBlend.Reset();
 			mAutomaticSTSReticleSuppressionSourceWasNull = false;
-			mAutomaticSTSReticleLayerAuthoredDepthState.Reset();
 			mAutomaticSTSReticleLayerReadOnlyDepthState.Reset();
-			mAutomaticSTSReticleLayerAuthoredDepthWasNull = false;
 			mAutomaticSTSReticleLayerReady = false;
 			mAutomaticSTSReticleLayerCaptureGeneration = 0U;
 			mAutomaticSTSReticleLayerGeneration = 0U;
@@ -3460,7 +3417,7 @@ namespace Hook
 			return;
 		}
 
-		std::wstring defaultPath = L"Data/Textures/FTS/Empty.dds";
+		std::wstring defaultPath = L"Data/Textures/MagnaScope/Empty.dds";
 		const wchar_t* tempPath = GetWC(path.c_str());
 
 		HRESULT result = CreateDDSTextureFromFile(
@@ -3518,10 +3475,10 @@ namespace Hook
 		CopyVector3(dst.eyeTranslationLerp, src.VirTransLerp);
 
 		// 二维坐标
-		dst.FTS_ScreenPos = { src.ftsScreenPos.x, src.ftsScreenPos.y };
+		dst.ScopeScreenPos = { src.scopeScreenPos.x, src.scopeScreenPos.y };
 	}
 
-	void D3D::UpdateScene(FTSData* currData)
+	void D3D::UpdateScene(ScopeProfile* currData)
 	{
 		if (bChangeAimTexture) {
 			LoadAimTexture(currData->ZoomNodePath);
@@ -3597,6 +3554,16 @@ namespace Hook
 			scopeData.FishEyeStrength = shaderData.fishEyeStrength;
 			scopeData.FishEyePower = shaderData.fishEyePower;
 		}
+		scopeData.scopeDepth = {
+			std::clamp(
+				scopeSceneDepth.load(std::memory_order_acquire),
+				0.0F,
+				4.0F),
+			std::clamp(
+				scopeShadowDepth.load(std::memory_order_acquire),
+				0.0F,
+				4.0F)
+		};
 #pragma endregion
 
 		// 区域5: 统一更新常量缓冲区
@@ -3749,7 +3716,7 @@ namespace Hook
 	{
 		if (!bIsFirst && isEnableRender) {
 			const auto* currentProfile =
-				ScopeData::ScopeDataHandler::GetSingleton()->GetCurrentFTSData();
+				ScopeData::ScopeDataHandler::GetSingleton()->GetCurrentScopeProfile();
 			if (currentProfile &&
 				currentProfile->autoProfile &&
 				MagnaScope::GetSettings().AllowsGeometryMagnification()) {
@@ -3767,19 +3734,35 @@ namespace Hook
 					return false;
 				}
 
-				// Fake Through Scope's stable contract is: record the aperture
-				// draw, let the complete weapon and world finish, copy the
-				// coherent late color target, then replay only the aperture
-				// with depth disabled. Sampling at ScopeFade's original draw
-				// observes first-person depth before all first-person color is
-				// complete, which creates the missing-gun silhouette and
-				// stable projected-object artifacts seen in Stage 5c.
+				// Replay the exact aperture against the composite target's own
+				// content rather than the retired pre-first-person RT4
+				// snapshot.
+				//
+				// That snapshot is taken at the RenderBatches boundary, which is
+				// before Fallout's image-space and tone-mapping work. The
+				// composite runs at the TAA or Present anchor, whose target is
+				// the finished display-encoded frame. Sampling one into the
+				// other applied no conversion at all, so the complete optical
+				// image was uniformly darker than the surrounding scene no
+				// matter what the shadow, magnification or cleanup controls were
+				// set to. Runtime telemetry showed it directly: with the
+				// composite target at format 28 (R8G8B8A8_UNORM, Present
+				// anchor), the world source probed 23/29/33 at the aperture
+				// centre while the same pixel of the displayed frame was bright.
+				//
+				// Passing no preferred source makes PrepareScopeFadeSceneSource
+				// copy the composite target itself into the private coherent
+				// texture, so source and destination are guaranteed to share one
+				// colour encoding. See Through Scopes has already drawn the
+				// world through the authored aperture by this point, so the
+				// region being magnified is the correct optical image. First
+				// person geometry is deliberately no longer excluded.
 				ID3D11RenderTargetView* const compositeTarget =
 					renderedAtTAAThisFrame ?
 						nullptr :
 						m_pRenderTargetView.Get();
 				const bool replayed = ReplayAutomaticSTSScopeFade(
-					mShaderResourceView.Get(),
+					nullptr,
 					compositeTarget);
 				if (replayed) {
 					const bool reticleComposited =
@@ -4013,7 +3996,11 @@ namespace Hook
 		if (bSelfDraw) {
 			return oldFuncs.phookD3D11DrawIndexed(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
 		}
-		const auto* activeProfile = ScopeData::ScopeDataHandler::GetSingleton()->GetCurrentFTSData();
+		if (MagnaScope::GetSettings().AllowsWorldColorCapture()) {
+			(void)MagnaScope::WorldOnlyScopeRenderer::GetSingleton()
+				.CaptureBeforeFirstPersonDraw(pContext);
+		}
+		const auto* activeProfile = ScopeData::ScopeDataHandler::GetSingleton()->GetCurrentScopeProfile();
 		if (activeProfile && activeProfile->autoProfile) {
 			const auto& verification = MagnaScope::GetSettings();
 			// ScopeFade is a child of STS's ScopeAiming branch. The actual draw is therefore the authoritative visibility signal.
@@ -4091,7 +4078,6 @@ namespace Hook
 								expectedVertexDataOffset)) &&
 					(currentIndexOffset == expectedIndexDataOffset ||
 						effectiveIndexOffset == expectedIndexDataOffset);
-
 				const bool exactReticleMatch =
 					MatchesAutomaticSTSReticleSet(
 						currentVertexBuffer.Get(),
@@ -4277,6 +4263,17 @@ namespace Hook
 				}
 
 				if (exactGeometryMatch && exactSuballocationMatch) {
+					const bool magnificationStage =
+						verification.AllowsGeometryMagnification();
+					// The retired pre-first-person world snapshot used to gate
+					// this branch: without a valid snapshot the aperture draw
+					// was neither recorded nor suppressed. The optical source is
+					// now the composite target's own content, which is always
+					// available at replay time, so requiring that snapshot here
+					// only suppressed the effect entirely -- the aperture was
+					// never captured, the replay never armed, and the lens fell
+					// through to ordinary See Through Scopes.
+
 					// Resource rebinding and the replacement draw form one
 					// transaction. This prevents a concurrent wrapped
 					// DrawIndexed call from replacing device children while
@@ -4289,11 +4286,8 @@ namespace Hook
 					automaticSTSLastScopeFadeOrdinal.store(
 						drawOrdinal,
 						std::memory_order_relaxed);
-					const bool magnificationStage =
-						verification.AllowsGeometryMagnification();
-
 					if (magnificationStage) {
-						// Fake Through Scope does not magnify the partially
+						// MagnaScope does not magnify the partially
 						// rendered target at the aperture's original draw.
 						// It records the aperture draw, lets the full weapon
 						// and world finish, then replays the aperture over a
@@ -4449,7 +4443,7 @@ namespace Hook
 				}
 			}
 
-			// STS owns its 3D reticle. Suppressing the inherited FTS
+			// STS owns its 3D reticle. Suppressing the inherited MagnaScope
 			// fingerprinted draw here would make the reticle disappear in
 			// automatic mode.
 			return oldFuncs.phookD3D11DrawIndexed(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
@@ -4553,8 +4547,12 @@ namespace Hook
 			callOriginal();
 			return;
 		}
+		if (MagnaScope::GetSettings().AllowsWorldColorCapture()) {
+			(void)MagnaScope::WorldOnlyScopeRenderer::GetSingleton()
+				.CaptureBeforeFirstPersonDraw(pContext);
+		}
 		const auto* activeProfile =
-			ScopeData::ScopeDataHandler::GetSingleton()->GetCurrentFTSData();
+			ScopeData::ScopeDataHandler::GetSingleton()->GetCurrentScopeProfile();
 		const auto& verification = MagnaScope::GetSettings();
 		if (!activeProfile || !activeProfile->autoProfile ||
 			!verification.AllowsScopeFadeGeometry() ||
@@ -4923,7 +4921,7 @@ namespace Hook
 		}
 
 		// This runs inside Fallout 4's TAA Render callback. Query only the
-		// render-thread D3D state that the original FTS contract relies on.
+		// render-thread D3D state that the original scope-rendering contract relies on.
 		// No camera, weapon, scene graph, or profile object is touched here.
 		auto* context =
 			static_cast<ID3D11DeviceContext*>(static_cast<void*>(rendererData->context));
@@ -4997,12 +4995,12 @@ namespace Hook
 				if (!isEnableRender || !pcam || !player) {
 					return;
 				}
-				const auto* currData = sdh->GetCurrentFTSData();
+				const auto* currData = sdh->GetCurrentScopeProfile();
 				if (!currData || !currData->containAlladditionalKeywords) {
 					return;
 				}
 
-				// The original FTS callback runs after the game's TAA Render
+				// The original scope-rendering callback runs after the game's TAA Render
 				// method. At that point its output remains bound to the output
 				// merger. Read those references without changing any state,
 				// choose the same RT1-preferred source contract as upstream,
@@ -5148,13 +5146,13 @@ namespace Hook
 			}
 
 			if (isEnableRender && pcam && player) {
-				auto currData = sdh->GetCurrentFTSData();
+				auto currData = sdh->GetCurrentScopeProfile();
 
 				if (!currData || !currData->containAlladditionalKeywords)
 					return;
 
 				if (!verification.AllowsComposite()) {
-					// Stage 3a is intentionally smaller than the original FTS
+					// Stage 3a is intentionally smaller than the original scope-rendering
 					// render contract. It validates only the displayed
 					// back-buffer identity and a GPU copy issued from F4SE Menu
 					// Framework's before-render callback. It creates no RTV or
@@ -5260,7 +5258,7 @@ namespace Hook
 				// draw, and probes the composite target after the draw. If the
 				// two probes match, the pass changed no pixels and the problem
 				// is in the draw itself, not in what reaches the screen later.
-				static const ScopeData::FTSData* diagnosedProfile = nullptr;
+				static const ScopeData::ScopeProfile* diagnosedProfile = nullptr;
 				static int diagCountdown = 30;
 				if (diagnosedProfile != currData) {
 					diagnosedProfile = currData;
@@ -5290,16 +5288,16 @@ namespace Hook
 							// The two off-center blocks must change at zoom > 1.
 							const auto* base = static_cast<const std::uint8_t*>(mapped.pData);
 							const bool validX =
-								scopeData.FTS_ScreenPos.x >= 0.0F &&
-								scopeData.FTS_ScreenPos.x < stagingDesc.Width;
+								scopeData.ScopeScreenPos.x >= 0.0F &&
+								scopeData.ScopeScreenPos.x < stagingDesc.Width;
 							const bool validY =
-								scopeData.FTS_ScreenPos.y >= 0.0F &&
-								scopeData.FTS_ScreenPos.y < stagingDesc.Height;
+								scopeData.ScopeScreenPos.y >= 0.0F &&
+								scopeData.ScopeScreenPos.y < stagingDesc.Height;
 							const int lensX = validX ?
-							                      static_cast<int>(scopeData.FTS_ScreenPos.x) :
+							                      static_cast<int>(scopeData.ScopeScreenPos.x) :
 							                      static_cast<int>(stagingDesc.Width / 2);
 							const int lensY = validY ?
-							                      static_cast<int>(scopeData.FTS_ScreenPos.y) :
+							                      static_cast<int>(scopeData.ScopeScreenPos.y) :
 							                      static_cast<int>(stagingDesc.Height / 2);
 							const int radius = std::max(
 								16,
@@ -5373,8 +5371,8 @@ namespace Hook
 						scopeData.EnableMerge,
 						scopeData.ScopeEffect_Size.x,
 						scopeData.ScopeEffect_Size.y,
-						scopeData.FTS_ScreenPos.x,
-						scopeData.FTS_ScreenPos.y);
+						scopeData.ScopeScreenPos.x,
+						scopeData.ScopeScreenPos.y);
 					sourceProbe = probeLens(mCurRTTexture.Get(), "source");
 				}
 
@@ -5389,9 +5387,8 @@ namespace Hook
 						targetVertexConstBufferOutPut &&
 						targetIndexCount > 0;
 				}
-				// A failed legacy call remains eligible for a later verified
-				// frame anchor. Explicit non-legacy FTS profiles retain their
-				// existing handling contract.
+				// A failed automatic STS call remains eligible for a later verified
+				// frame anchor.
 				renderPassHandledThisFrame =
 					bLegacyMode ? lastRenderProducedComposite : true;
 
@@ -5533,6 +5530,11 @@ namespace Hook
 
 	D3D::LensProjectionSnapshot D3D::GetLensProjectionSnapshot() const
 	{
+		// The game thread publishes this snapshot through a small seqlock while
+		// the render thread consumes it. A retry collision is not a semantic
+		// invalidation. Reusing the last coherent snapshot for that draw keeps a
+		// sharp camera move from producing a one-frame center snap.
+		static thread_local LensProjectionSnapshot lastCoherentSnapshot{};
 		for (std::uint32_t attempt = 0U; attempt < 3U; ++attempt) {
 			const auto sequenceBefore =
 				projectedLensSequence.load(std::memory_order_acquire);
@@ -5589,14 +5591,12 @@ namespace Hook
 				projectedLensSequence.load(std::memory_order_acquire);
 			if (sequenceBefore == sequenceAfter &&
 				(sequenceAfter & 1U) == 0U) {
+				lastCoherentSnapshot = result;
 				return result;
 			}
 		}
 
-		// A writer remained active through every bounded retry. Failing closed
-		// for one draw is safer than pairing an aperture with another frame's
-		// eye displacement during recoil.
-		return {};
+		return lastCoherentSnapshot;
 	}
 
 	void D3D::PublishAutomaticSTSGeometry(
@@ -5618,9 +5618,9 @@ namespace Hook
 										 std::atomic_uint32_t& publishedIndexDataOffset,
 										 std::atomic_bool& publishedReady,
 										 const char* label,
-										 std::atomic_uint32_t* publishedVertexCount = nullptr,
-										 std::atomic_uint64_t* publishedVertexDescriptor = nullptr,
-										 std::atomic_uint64_t* publishedGeneration = nullptr) {
+									 std::atomic_uint32_t* publishedVertexCount = nullptr,
+									 std::atomic_uint64_t* publishedVertexDescriptor = nullptr,
+									 std::atomic_uint64_t* publishedGeneration = nullptr) {
 			auto* triShape = object ? object->IsTriShape() : nullptr;
 			auto* rendererShape =
 				triShape && triShape->rendererData ?
@@ -6291,7 +6291,7 @@ namespace Hook
 				D3D::isEnableRender.load(std::memory_order_acquire);
 			if (verification.AllowsComposite() && renderEnabled &&
 				isActive_TAA && !renderPassHandledThisFrame) {
-				// Preserve the original FTS Stage 4 behavior behind the
+				// Preserve the original scope-rendering Stage 4 behavior behind the
 				// composite gate. It is not reachable during Stage 3b.
 				if (!upscalerMod) {
 					renderedAtTAAThisFrame = true;
@@ -6625,12 +6625,16 @@ namespace Hook
 	std::atomic<float> D3D::scopeReticleSize{ 4.0F };
 	std::atomic<float> D3D::scopeReticleOffsetX{ 0.0F };
 	std::atomic<float> D3D::scopeReticleOffsetY{ 0.0F };
+	std::atomic<float> D3D::scopeReticleShadowStrength{ 0.0F };
+	std::atomic<float> D3D::scopeReticleParallaxStrength{ 1.0F };
 	std::atomic<float> D3D::scopeEyeBoxRadius{ 2.0F };
 	std::atomic<float> D3D::scopeVignetteReach{ 9.0F };
 	std::atomic<float> D3D::scopeVignetteSharpness{ 3.0F };
 	std::atomic<float> D3D::scopeEyeBoxMaxTravel{ 4.0F };
 	std::atomic<float> D3D::scopeSceneParallaxStrength{ 0.0F };
 	std::atomic<float> D3D::scopeOpticalLagStrength{ 1.0F };
+	std::atomic<float> D3D::scopeSceneDepth{ 1.0F };
+	std::atomic<float> D3D::scopeShadowDepth{ 1.0F };
 	bool D3D::bLegacyMode;
 
 	std::once_flag D3D::flagOnce;

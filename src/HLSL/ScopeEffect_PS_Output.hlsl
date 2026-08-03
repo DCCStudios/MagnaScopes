@@ -10,11 +10,11 @@ float4 main(float4 position : SV_Position ,float2 texcoord : TEXCOORD0) : SV_Tar
     adjTex *= rcp(2.0F);
     adjTex += float2(0.5, 0.5);
     float2 pos = adjTex / PixelSize;
-    float2 FTS_ScreenPosInPixel = FTS_ScreenPos * PixelSize;
-    float2 FTS_ScreenPosInPixelForDisplay = FTS_ScreenPos * PixelSize;
+    float2 ScopeScreenPosInPixel = ScopeScreenPos * PixelSize;
+    float2 ScopeScreenPosInPixelForDisplay = ScopeScreenPos * PixelSize;
 
     float2 basePos = float2(0.5, 0.5) + ScopeEffect_OriPositionOffset * float2(-1, 1);
-    float2 texcoordOffset = (basePos - FTS_ScreenPosInPixel) * camDepth;
+    float2 texcoordOffset = (basePos - ScopeScreenPosInPixel) * camDepth;
     float2 screenSize = float2(BUFFER_WIDTH, BUFFER_HEIGHT);
 
     float2 ScopeEffect_OffsetA = (ScopeEffect_Offset);

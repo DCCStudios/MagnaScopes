@@ -22,7 +22,6 @@ namespace
 {
 	constexpr std::uint32_t kWidth = 128U;
 	constexpr std::uint32_t kHeight = 128U;
-	constexpr float kSafeApertureRadius = 0.9914448614F;
 
 	// Byte-for-byte mirror of ResolutionConstantData in Triangle.hlsli. The
 	// post-composite reticle shader intentionally reads only the reticle pivot,
@@ -72,9 +71,13 @@ namespace
 		float reticleSize = 4.0F;
 		float reticleOffsetX = 0.0F;
 		float reticleOffsetY = 0.0F;
-		float reticlePadding = 0.0F;
+		float eyeReliefDelta = 0.0F;
+		float reticleShadowStrength = 0.0F;
+		float reticleParallaxStrength = 1.0F;
+		float lensCenterX = 64.5F;
+		float lensCenterY = 64.5F;
 	};
-	static_assert(sizeof(ResolutionConstants) == 144U);
+	static_assert(sizeof(ResolutionConstants) == 160U);
 
 	struct PixelMetrics
 	{
@@ -333,6 +336,29 @@ Output main(uint vertexId : SV_VertexID)
 					constantBuffer.GetAddressOf()),
 				"CreateBuffer(constants)");
 
+			// The production reticle layer reads the lens and shadow depth
+			// separation from ScopeEffectData at b5. Bind a valid fixture buffer
+			// rather than relying on undefined state from an unbound slot.
+			std::array<float, 88> scopeEffectConstants{};
+			scopeEffectConstants[86] = 1.0F;
+			scopeEffectConstants[87] = 1.0F;
+			D3D11_BUFFER_DESC scopeEffectDescription{};
+			scopeEffectDescription.ByteWidth =
+				static_cast<UINT>(scopeEffectConstants.size() * sizeof(float));
+			scopeEffectDescription.Usage = D3D11_USAGE_IMMUTABLE;
+			scopeEffectDescription.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+			const D3D11_SUBRESOURCE_DATA scopeEffectData{
+				scopeEffectConstants.data(),
+				0U,
+				0U
+			};
+			Check(
+				device->CreateBuffer(
+					&scopeEffectDescription,
+					&scopeEffectData,
+					scopeEffectBuffer.GetAddressOf()),
+				"CreateBuffer(scope effect)");
+
 			D3D11_SAMPLER_DESC samplerDescription{};
 			samplerDescription.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
 			samplerDescription.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -435,7 +461,9 @@ Output main(uint vertexId : SV_VertexID)
 			context->GSSetShader(nullptr, nullptr, 0U);
 			context->PSSetShader(pixelShader.Get(), nullptr, 0U);
 			ID3D11Buffer* constantsBuffer = constantBuffer.Get();
+			ID3D11Buffer* scopeEffectConstantsBuffer = scopeEffectBuffer.Get();
 			context->PSSetConstantBuffers(4U, 1U, &constantsBuffer);
+			context->PSSetConstantBuffers(5U, 1U, &scopeEffectConstantsBuffer);
 			ID3D11ShaderResourceView* sources[2]{
 				blackSource.Get(),
 				whiteSource.Get()
@@ -480,6 +508,7 @@ Output main(uint vertexId : SV_VertexID)
 		ComPtr<ID3D11RenderTargetView> renderTargetView;
 		ComPtr<ID3D11Texture2D> staging;
 		ComPtr<ID3D11Buffer> constantBuffer;
+		ComPtr<ID3D11Buffer> scopeEffectBuffer;
 		ComPtr<ID3D11SamplerState> sampler;
 		ComPtr<ID3D11BlendState> dualSourceBlend;
 	};
@@ -570,27 +599,6 @@ Output main(uint vertexId : SV_VertexID)
 		}
 	}
 
-	std::array<float, 2> SolveLensCoordinates(
-		float pixelX,
-		float pixelY,
-		float centerX,
-		float centerY,
-		const ResolutionConstants& constants)
-	{
-		const float determinant =
-			constants.lensBasisXX * constants.lensBasisZY -
-			constants.lensBasisXY * constants.lensBasisZX;
-		const float displacementX = pixelX - centerX;
-		const float displacementY = pixelY - centerY;
-		return {
-			(displacementX * constants.lensBasisZY -
-				displacementY * constants.lensBasisZX) /
-				determinant,
-			(-displacementX * constants.lensBasisXY +
-				displacementY * constants.lensBasisXX) /
-				determinant
-		};
-	}
 }
 
 int wmain(int argc, wchar_t** argv)
@@ -799,24 +807,109 @@ try {
 	const auto movingOneMetrics = AnalyzeDifference(movingOneX);
 	movingConstants.sceneMagnification = 4.0F;
 	const auto movingFourX = fixture.Render(movingConstants, centeredLayer);
+	// Scene parallax saturates through ScopeShadowSoftLimitVector at one
+	// aperture radius, the same limiter the magnified replay applies, so the
+	// two layers stay locked together. Deriving the expectation from that
+	// formula keeps this test honest if the limit is ever retuned; the
+	// retired 1/(1 + 2m) form produced 14.0 pixels here, discarding nearly
+	// half of an ordinary half-radius shift.
+	constexpr double kTravel = 0.5;
+	const double expectedTravelPixels =
+		kTravel / std::sqrt(1.0 + kTravel * kTravel) * 56.0;
 	if (movingOneX != movingFourX ||
-		std::abs(movingOneMetrics.centerX - AnalyzeDifference(oneX).centerX - 14.0) > 0.15) {
+		std::abs(
+			movingOneMetrics.centerX -
+			AnalyzeDifference(oneX).centerX -
+			expectedTravelPixels) > 0.15) {
 		throw std::runtime_error(
 			"reticle optical translation depended on scene zoom or used wrong sign");
 	}
 
-	// A fully closed exit pupil must turn the dual-source reticle blend into
-	// identity so the reticle cannot paint over the already-dark scope shadow.
-	ResolutionConstants shadowedConstants{};
-	shadowedConstants.sceneParallaxStrength = 0.0F;
-	shadowedConstants.eyeOffsetX = 2.0F;
-	shadowedConstants.eyeBoxRadius = 0.1F;
-	shadowedConstants.vignetteReach = 10.0F;
-	shadowedConstants.vignetteSharpness = 3.0F;
+	// Eye motion is already expressed in display X/Y. Rotating the published
+	// CPU basis, or making its determinant nearly zero while retaining finite
+	// column lengths, must not rotate or suppress the reticle follower. The
+	// determinant remains relevant only when inverting lens coordinates.
+	ResolutionConstants rotatedMotion = movingConstants;
+	rotatedMotion.sceneMagnification = 1.0F;
+	rotatedMotion.lensBasisXX = 0.0F;
+	rotatedMotion.lensBasisXY = 56.0F;
+	rotatedMotion.lensBasisZX = -56.0F;
+	rotatedMotion.lensBasisZY = 0.0F;
+	const auto rotatedMotionOutput = fixture.Render(rotatedMotion, centeredLayer);
+	RequirePixelsNear(
+		rotatedMotionOutput,
+		movingOneX,
+		1,
+		"reticle motion rotated with the stale CPU basis");
+
+	ResolutionConstants nearCollinearMotion = movingConstants;
+	nearCollinearMotion.sceneMagnification = 1.0F;
+	nearCollinearMotion.lensBasisXX = 56.0F;
+	nearCollinearMotion.lensBasisXY = 0.0F;
+	nearCollinearMotion.lensBasisZX = 56.0F;
+	nearCollinearMotion.lensBasisZY = 0.0000005F;
+	const auto nearCollinearMotionOutput =
+		fixture.Render(nearCollinearMotion, centeredLayer);
+	RequirePixelsNear(
+		nearCollinearMotionOutput,
+		movingOneX,
+		1,
+		"near-collinear CPU basis disabled the reticle follower");
+
+	// The exit pupil is displaced by a bounded amount that can never carry the
+	// aligned lens centre outside the lit disc, so an aligned optic keeps a
+	// bright centre no matter how much travel the game thread publishes. The
+	// reticle must follow that contract exactly: at maximum travel through a
+	// deliberately narrow exit pupil, an aligned reticle stays fully composited
+	// because the magnified scene beneath it is also still lit. The retired
+	// unbounded formulation blacked out the whole lens here, which is the
+	// defect in-game testers reported.
+	ResolutionConstants alignedMaximumTravel{};
+	alignedMaximumTravel.sceneParallaxStrength = 0.0F;
+	alignedMaximumTravel.eyeOffsetX = 4.0F;
+	alignedMaximumTravel.eyeBoxMaxTravel = 4.0F;
+	alignedMaximumTravel.eyeBoxRadius = 0.1F;
+	alignedMaximumTravel.vignetteReach = 10.0F;
+	alignedMaximumTravel.vignetteSharpness = 3.0F;
+	alignedMaximumTravel.reticleShadowStrength = 1.0F;
+	const auto alignedMaximumTravelOutput =
+		fixture.Render(alignedMaximumTravel, centeredLayer);
+	{
+		// The authored red dot sits at (68, 60), well inside the lit disc.
+		constexpr std::size_t redDotOffset = (60U * kWidth + 68U) * 4U;
+		for (std::size_t channel = 0U; channel < 4U; ++channel) {
+			if (std::abs(
+					static_cast<int>(
+						alignedMaximumTravelOutput[redDotOffset + channel]) -
+					static_cast<int>(oneX[redDotOffset + channel])) > 1) {
+				throw std::runtime_error(
+					"bounded exit pupil still darkened an aligned reticle at "
+					"maximum published eye travel");
+			}
+		}
+	}
+
+	// Where the crescent has genuinely darkened the scene the reticle must
+	// still vanish, so it can never paint over scope shadow. Placing the
+	// physical lens 0.9 radii away puts the authored reticle on the far side
+	// of the same displaced pupil.
+	ResolutionConstants shadowedConstants = alignedMaximumTravel;
+	shadowedConstants.lensCenterX = 64.5F + 0.9F * 56.0F;
 	const auto shadowedOutput = fixture.Render(shadowedConstants, centeredLayer);
 	if (AnalyzeDifference(shadowedOutput).count != 0U) {
 		throw std::runtime_error(
-			"reticle remained visible over a fully closed scope shadow");
+			"reticle remained visible inside the displaced pupil crescent");
+	}
+	ResolutionConstants nearCollinearShadow = shadowedConstants;
+	nearCollinearShadow.lensBasisXX = 56.0F;
+	nearCollinearShadow.lensBasisXY = 0.0F;
+	nearCollinearShadow.lensBasisZX = 56.0F;
+	nearCollinearShadow.lensBasisZY = 0.0000005F;
+	const auto nearCollinearShadowOutput =
+		fixture.Render(nearCollinearShadow, centeredLayer);
+	if (AnalyzeDifference(nearCollinearShadowOutput).count != 0U) {
+		throw std::runtime_error(
+			"near-collinear CPU basis disabled reticle scope shadow");
 	}
 
 	// A projection publication gap must preserve the authored layer instead
@@ -835,74 +928,78 @@ try {
 		1,
 		"invalid projection did not fail open to the authored blend");
 
-	// Move the reticle close to a rolled and sheared aperture edge, then scale
-	// it until part would cover the housing without clipping.
-	ResolutionConstants clippedConstants{};
-	clippedConstants.lensBasisXX = 28.0F;
-	clippedConstants.lensBasisXY = 6.0F;
-	clippedConstants.lensBasisZX = -5.0F;
-	clippedConstants.lensBasisZY = 24.0F;
-	clippedConstants.aimOffsetX = 0.70F;
-	clippedConstants.aimOffsetY = 0.0F;
-	const float lensCenterX = 64.5F;
-	const float lensCenterY = 64.5F;
-	clippedConstants.aimCenterX =
-		lensCenterX + clippedConstants.lensBasisXX *
-						  clippedConstants.aimOffsetX;
-	clippedConstants.aimCenterY =
-		lensCenterY + clippedConstants.lensBasisXY *
-						  clippedConstants.aimOffsetX;
-	clippedConstants.reticleMagnification = 4.0F;
-	const auto edgeLayer = MakeReticleCapturePair(
-		static_cast<std::uint32_t>(clippedConstants.aimCenterX),
-		static_cast<std::uint32_t>(clippedConstants.aimCenterY));
-	const auto clippedOutput = fixture.Render(clippedConstants, edgeLayer);
-	const auto clippedMetrics = AnalyzeDifference(clippedOutput);
-	if (clippedMetrics.count == 0U) {
-		throw std::runtime_error(
-			"aperture clipping removed the complete reticle");
-	}
-	for (std::uint32_t y = 0U; y < kHeight; ++y) {
-		for (std::uint32_t x = 0U; x < kWidth; ++x) {
-			const auto offset = (y * kWidth + x) * 4U;
-			const auto changed =
-				std::abs(
-					static_cast<int>(clippedOutput[offset]) -
-					static_cast<int>(kDestinationColor[0])) > 2 ||
-				std::abs(
-					static_cast<int>(clippedOutput[offset + 1U]) -
-					static_cast<int>(kDestinationColor[1])) > 2 ||
-				std::abs(
-					static_cast<int>(clippedOutput[offset + 2U]) -
-					static_cast<int>(kDestinationColor[2])) > 2;
-			if (!changed) {
-				continue;
-			}
-			const auto local = SolveLensCoordinates(
-				static_cast<float>(x) + 0.5F,
-				static_cast<float>(y) + 0.5F,
-				lensCenterX,
-				lensCenterY,
-				clippedConstants);
-			if (local[0] * local[0] + local[1] * local[1] >
-				kSafeApertureRadius * kSafeApertureRadius + 0.0001F) {
-				throw std::runtime_error(
-					"reticle layer wrote outside the physical aperture");
-			}
+	// ScopeFade geometry is not an ownership mask for the authored reticle.
+	// STS authors can align the reticle independently from the lens, and the
+	// projected lens center can move far outside the render target during a
+	// transition or a sharp inertia impulse. With no physical eye translation
+	// and no requested reticle shadow, neither lens transform may crop, move,
+	// or otherwise alter the complete late reticle layer.
+	struct LensTransform
+	{
+		float basisXX;
+		float basisXY;
+		float basisZX;
+		float basisZY;
+		float centerX;
+		float centerY;
+	};
+	constexpr float diagonal = 39.5979805F;
+	constexpr std::array hostileLensTransforms{
+		LensTransform{ 56.0F, 0.0F, 0.0F, 56.0F, -2048.0F, 4096.0F },
+		LensTransform{
+			diagonal,
+			diagonal,
+			-diagonal,
+			diagonal,
+			8192.0F,
+			-4096.0F },
+		LensTransform{ 0.0F, 56.0F, -56.0F, 0.0F, -8192.0F, -8192.0F },
+		LensTransform{ 48.4974213F, -28.0F, 28.0F, 48.4974213F, 16384.0F, 64.5F }
+	};
+	for (const auto& transform : hostileLensTransforms) {
+		ResolutionConstants transformedConstants{};
+		transformedConstants.sceneParallaxStrength = 2.0F;
+		transformedConstants.opticalLagStrength = 4.0F;
+		transformedConstants.eyeOffsetX = 0.0F;
+		transformedConstants.eyeOffsetY = 0.0F;
+		transformedConstants.reticleShadowStrength = 0.0F;
+		transformedConstants.lensBasisXX = transform.basisXX;
+		transformedConstants.lensBasisXY = transform.basisXY;
+		transformedConstants.lensBasisZX = transform.basisZX;
+		transformedConstants.lensBasisZY = transform.basisZY;
+		transformedConstants.lensCenterX = transform.centerX;
+		transformedConstants.lensCenterY = transform.centerY;
+		const auto transformedOutput =
+			fixture.Render(transformedConstants, centeredLayer);
+		if (AnalyzeDifference(transformedOutput).count == 0U) {
+			throw std::runtime_error(
+				"lens transform removed the complete reticle layer");
+		}
+		if (transformedOutput != oneX) {
+			throw std::runtime_error(std::format(
+				"lens transform changed the independently authored reticle: "
+				"basis=({}, {})/({}, {}), center=({}, {})",
+				transform.basisXX,
+				transform.basisXY,
+				transform.basisZX,
+				transform.basisZY,
+				transform.centerX,
+				transform.centerY));
 		}
 	}
 
 	std::cout << std::format(
 		"Reticle layer shader PASSED: scene 1x/2x/4x invariant; "
 		"reticle 0.5x={}x{}, 1x={}x{}, 2x={}x{}; "
-		"size/offset/motion/shadow verified; clippedPixels={}\n",
+		"size/offset/motion/shadow verified; "
+		"non-destructive lens transforms={}\n",
 		halfMetrics.Width(),
 		halfMetrics.Height(),
 		pivotOneMetrics.Width(),
 		pivotOneMetrics.Height(),
 		twoMetrics.Width(),
 		twoMetrics.Height(),
-		clippedMetrics.count);
+		hostileLensTransforms.size());
 	return 0;
 } catch (const std::exception& error) {
 	std::cerr << "Reticle layer shader FAILED: " << error.what() << '\n';

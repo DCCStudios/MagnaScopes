@@ -1,7 +1,7 @@
 """Production safety contracts for MagnaScope's late ScopeFade replay.
 
 Stage 5c's private world-render detours are intentionally not part of this
-contract.  The production path follows Fake Through Scope's demonstrated
+contract.  The production path follows MagnaScope's demonstrated
 ordering instead: record the authored aperture draw, let Fallout finish the
 weapon and world color, then replay only that aperture against a coherent late
 color copy after TAA or immediately before Present.
@@ -73,8 +73,8 @@ def main() -> int:
     hooking_raw = (project / "src" / "hooking.cpp").read_text(encoding="utf-8")
     hooking_h = (project / "src" / "hooking.h").read_text(encoding="utf-8")
     main_raw = (project / "src" / "main.cpp").read_text(encoding="utf-8")
-    data_h = (project / "src" / "FTSData.h").read_text(encoding="utf-8")
-    data_cpp = (project / "src" / "FTSData.cpp").read_text(encoding="utf-8")
+    data_h = (project / "src" / "ScopeProfile.h").read_text(encoding="utf-8")
+    data_cpp = (project / "src" / "ScopeProfile.cpp").read_text(encoding="utf-8")
     settings = (project / "src" / "Settings.h").read_text(encoding="utf-8")
     xmake = (project / "xmake.lua").read_text(encoding="utf-8")
     shader = (
@@ -88,6 +88,12 @@ def main() -> int:
     ).read_text(encoding="utf-8")
     triangle_shader = (
         project / "src" / "HLSL" / "Triangle.hlsli"
+    ).read_text(encoding="utf-8")
+    shadow_shader = (
+        project / "src" / "HLSL" / "ScopeShadow.hlsli"
+    ).read_text(encoding="utf-8")
+    eyebox_header = (
+        project / "src" / "EyeBoxRecentering.h"
     ).read_text(encoding="utf-8")
     stage5d = (
         project / "tests" / "config" / "MagnaScope.Stage5d.ini"
@@ -124,17 +130,17 @@ def main() -> int:
     ):
         require(setting in package_ini, f"production package missing {setting}")
 
-    # The crash-producing Stage 5c renderer is absent from the production
-    # translation units and explicitly excluded from the DLL. Keeping its
-    # source as forensic evidence must not make it callable or linkable.
+    # The retired nested-world renderer remains disabled, but its safe
+    # two-hook pre-first-person color snapshot is linked and explicitly used.
+    # This path never invokes a second Render_PreUI, Z pre-pass, or Umbra pass.
     require(
-        "WorldOnlyScopeRenderer" not in main_cpp
-        and "WorldOnlyScopeRenderer" not in hooking,
-        "production code still references the retired auxiliary renderer",
+        "WorldOnlyScopeRenderer::GetSingleton().InstallHooks()" in main_cpp
+        and "WorldOnlyScopeRenderer::GetSingleton()" in hooking,
+        "production code does not wire the safe world-color snapshot",
     )
     require(
-        'remove_files("src/WorldOnlyScopeRenderer.cpp")' in xmake,
-        "production build can still link the retired auxiliary renderer",
+        'remove_files("src/WorldOnlyScopeRenderer.cpp")' not in xmake,
+        "production build still excludes the safe world-color snapshot",
     )
     require(
         "return false;" in function_body(
@@ -153,16 +159,16 @@ def main() -> int:
         "void __stdcall D3D::DrawIndexedInstancedHook(",
     )
     require(
-        "CaptureBeforeFirstPersonDraw(" not in draw
-        and "CaptureBeforeFirstPersonDraw(" not in draw_instanced,
-        "D3D draw hooks still capture a partial pre-first-person color target",
+        "CaptureBeforeFirstPersonDraw(pContext)" in draw
+        and "CaptureBeforeFirstPersonDraw(pContext)" in draw_instanced,
+        "D3D draw hooks do not capture the verified pre-first-person color target",
     )
     require(
-        "AcquireColorSRV(" not in draw
+        "AllowsWorldColorCapture()" in draw
+        and "AllowsWorldColorCapture()" in draw_instanced
         and "AllowsAuxiliaryWorldPass(" not in draw
-        and "AcquireColorSRV(" not in draw_instanced
         and "AllowsAuxiliaryWorldPass(" not in draw_instanced,
-        "D3D draw hooks retain an auxiliary world-color source",
+        "D3D draw hooks do not gate the safe snapshot independently of the retired auxiliary pass",
     )
 
     capture = function_body(
@@ -186,7 +192,7 @@ def main() -> int:
             draw,
             flags=re.DOTALL,
         ),
-        "exact ScopeFade draw is not captured and color-suppressed like FTS",
+        "exact ScopeFade draw is not captured and color-suppressed like MagnaScope",
     )
     require(
         "PrepareScopeFadeSceneSource(" not in capture
@@ -195,13 +201,29 @@ def main() -> int:
         and "CopyResource(" in capture,
         "capture phase modifies pixels or omits private transform snapshots",
     )
+    # The optical source must share one colour encoding with the composite
+    # target. The retired pre-first-person RT4 snapshot was taken before
+    # Fallout's image-space and tone-mapping work while the composite runs
+    # against the finished display-encoded frame, and nothing converted between
+    # them -- the complete optical image was uniformly darker than the scene
+    # around it no matter how the shadow and image controls were set. Passing no
+    # preferred source makes PrepareScopeFadeSceneSource copy the composite
+    # target itself, which cannot mismatch.
     require(
-        "ReplayAutomaticSTSScopeFade(" in render_aperture
-        and "mShaderResourceView.Get()" in render_aperture
+        "ReplayAutomaticSTSScopeFade(\n\t\t\t\t\tnullptr," in render_aperture
+        and "AcquireColorSRV(" not in render_aperture
+        and "worldSource" not in render_aperture
         and "PrepareScopeFadeSceneSource(" in replay
         and "DrawIndexed(" in replay
         and "BSScopeFadeReplaceRGB.Get()" in replay,
-        "late coherent-color ScopeFade replay is incomplete",
+        "optical source is not the composite target's own colour encoding",
+    )
+    require(
+        "return false;" in function_body(
+            settings,
+            "bool AllowsWorldColorCapture() const noexcept",
+        ),
+        "the retired pre-first-person world colour capture can still run",
     )
     exact_ready_start = render_aperture.find("if (!exactScopeFadeReady)")
     exact_ready_end = render_aperture.find(
@@ -294,7 +316,7 @@ def main() -> int:
         "ScopeFade probe still consumes class-instance slots outside returned counts",
     )
 
-    # Fake Through Scope runs after the original TAA callback.  Present is the
+    # MagnaScope runs after the original TAA callback.  Present is the
     # fallback and the replay packet is invalidated only after real Present.
     taa = function_body(hooking, "static void thunk(")
     present = function_body(hooking, "HRESULT __fastcall D3D::PresentHook(")
@@ -317,32 +339,124 @@ def main() -> int:
         "a failed TAA replay cannot fall back to Present",
     )
 
-    # Optical effects operate on one continuous logical ScopeFade coordinate
-    # field.  Never reconstruct a flat frame independently per primitive: the
-    # packed STS rings are not perfectly concentric, and those tiny differences
-    # become visible radial facets and a center star after magnification.
+    # Optical effects operate on one continuous homogeneous ScopeFade field.
+    # The noperspective numerator and reciprocal-W are affine in display space,
+    # so the pixel shader can solve the projective center exactly. Differentiating
+    # normalized perspective-correct coordinates only gives a local tangent and
+    # makes the inferred center vary across triangles.
     require(
-        "float2 lensCoordinates : TEXCOORD0" in geometry_fill_shader
+        "noperspective float3 lensProjective : TEXCOORD0"
+        in geometry_fill_shader
+        and "MakeProjectiveLensCoordinates" in geometry_fill_shader
         and "outerCurrentCoordinates" in geometry_fill_shader
         and "innerCurrentCoordinates" in geometry_fill_shader
         and "float2(0.0f, 0.0f)" in geometry_fill_shader
         and "nointerpolation" not in geometry_fill_shader
-        and "const float2 normalizedLensPosition = input.lensCoordinates"
+        and "noperspective float3 lensProjective : TEXCOORD0" in shader
+        and "input.lensProjective.xy / safeReciprocalClipW"
         in shader
-        and "const float2 publishedAimPixels" in shader
-        and "const float2 samplePivotUv = publishedAimPixels * PixelSize"
-        in shader
+        and "const float2 numeratorDx = ddx(projectiveNumerator)" in shader
+        and "const float2 numeratorDy = ddy(projectiveNumerator)" in shader
+        and "const float reciprocalWDx = ddx(reciprocalClipW)" in shader
+        and "const float reciprocalWDy = ddy(reciprocalClipW)" in shader
+        and "SolvePixelOffset" in shader
+        and "const float2 pixelsToCenter" in shader
+        and "const float2 pixelsToUnitX" in shader
+        and "const float2 pixelsToUnitZ" in shader
+        and "const float2 currentAimPixels" in shader
+        and "const float2 samplePivotUv = currentAimPixels * PixelSize" in shader
+        and "const bool exactDrawFrameValid" in shader
+        and "if (!exactDrawFrameValid)" in shader
+        and "tBACKBUFFER.SampleLevel(gSamLinear, screenUv, 0.0f)" in shader
+        and "publishedCenterPixels" not in shader
         and "float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y)" in shader
-        and "pupilShadow" in shader
-        and "const float pupilRadius" in shader
-        and "rimVisibility" not in shader
-        and "pupilVisibility" not in shader
-        and "SCOPE_EYE_RELIEF_DELTA" not in shader
+        and "EvaluateScopeShadow(" in shader
+        and "shadow.visibility" in shader
+        and "SCOPE_EYE_RELIEF_DELTA" in shader
+        and "const float axialSceneScale" in shader
+        and "const float opticalMagnification" in shader
+        and "const float axialPupilScale" in shader
         and "SCOPE_FISHEYE_STRENGTH" in shader
         and "SCOPE_EDGE_REFRACTION_STRENGTH" in shader
         and "SCOPE_EDGE_CHROMATIC_ABERRATION" in shader
         and "edgeAwareAverage" in shader,
         "shipping shader lost lens-local optics or reintroduced global flicker",
+    )
+    require(
+        "baselineEyeReliefDistance" in main_cpp
+        and "CalculateEyeReliefDistance(" in main_cpp
+        and "CalculateAxialEyeRelief(" in main_cpp
+        and "state.baselineEyeReliefDistance +=" in main_cpp
+        and "axialEyeRelief.valid ? axialEyeRelief.normalizedDelta : 0.0F" in main_cpp
+        and "A malformed or temporarily unavailable depth" in main_raw
+        and "SCOPE_EYE_RELIEF_DELTA" in shader
+        and "const float axialPupilScale" in shader
+        and "axialPupilScale," in shader
+        # The resting rim is computed unconditionally inside the shared
+        # contract, so losing physical eye telemetry can only remove the
+        # moving crescent -- never the authored tube rim.
+        and "layers.restingRim = pow(" in shadow_shader
+        and "if (eyeTravelValid) {" in shadow_shader
+        and "layers.movingCrescent = 0.0f;" in shadow_shader
+        and "max(layers.restingRim, layers.movingCrescent)" in shadow_shader
+        and "physicalEyeTravelValid * activation" not in shader,
+        "optional axial eye relief can still invalidate lateral travel or disable the fixed resting rim",
+    )
+
+    # Priority 0 regression guard. In-game testing showed the exit pupil
+    # darkening the entire optical image. The cause was an unbounded pupil
+    # displacement: published eye travel is limited only by Eye Box Max Travel
+    # (four aperture radii by default) while the lit disc has radius one, so
+    # any travel past roughly 1.16 pushed every pixel -- including the aligned
+    # centre -- outside the pupil and multiplied the whole lens by zero.
+    #
+    # Two structural invariants now prevent that, and both are additionally
+    # asserted against rendered WARP output by ScopeGeometryFillShaderTest:
+    #   * the resting rim starts no lower than 0.75, so it cannot reach the
+    #     centre at any Vignette Reach;
+    #   * the pupil displacement is soft-limited to strictly less than
+    #     (pupilRadius - feather), so the crescent is exactly zero at the
+    #     aligned lens centre for every published travel.
+    require(
+        "ScopeShadowSoftLimit" in shadow_shader
+        and "rsqrt(1.0f + normalized * normalized)" in shadow_shader
+        and "ScopeShadowMaximumPupilOffset" in shadow_shader
+        and "max(pupilRadius - pupilFeather - 0.02f, 0.0f)" in shadow_shader
+        and "ScopeShadowSoftLimitVector(\n"
+        "            rawOffset,\n"
+        "            ScopeShadowMaximumPupilOffset(" in shadow_shader
+        and "return 1.0f - 0.25f * hardnessNormalizedReach;" in shadow_shader
+        # The forgiveness divisor is what makes Eye Box Radius a live control
+        # in the scene shader. It was previously read only by the reticle.
+        and "max(exitPupilForgiveness, 0.10f)" in shadow_shader
+        and "eyeTravel * (max(eyeRelief, 0.0f) / forgiveness)" in shadow_shader
+        # Both optical layers must consume the one shared contract.
+        and '#include "ScopeShadow.hlsli"' in shader
+        and '#include "ScopeShadow.hlsli"' in reticle_shader
+        and "SCOPE_EYEBOX_RADIUS," in shader
+        and "SCOPE_EYEBOX_RADIUS," in reticle_shader
+        # The retired unbounded forms must not return.
+        and "const float2 pupilCenter = eyeTravelLens * shadowDepth;"
+        not in shader
+        and "const float pupilRadius = axialPupilScale;" not in shader,
+        "scope shadow can again darken the aligned optical centre or ignore exit-pupil forgiveness",
+    )
+
+    # The game thread must saturate eye travel with the same smooth shape the
+    # shaders use. A hard clamp put a derivative discontinuity in the middle of
+    # a fast pan, and the raw screen-impulse ratio settled at two to three
+    # aperture radii during ordinary ADS panning, pinning the crescent at its
+    # bound instead of tracking motion.
+    require(
+        "kAngularLagGain" in main_cpp
+        and "SoftLimitVector(" in main_cpp
+        and "inline constexpr float kAngularLagGain" in eyebox_header
+        and "value / std::sqrt(1.0F + normalized * normalized)"
+        in eyebox_header
+        and "state.angularLagX += impulseX;" in main_cpp
+        and "const float scale = maximumTravel / impulseLength;"
+        not in main_cpp,
+        "angular eye-box lag is unbounded, hard-clamped, or uncalibrated",
     )
     require(
         "GetGunStateNibble" in main_cpp
@@ -359,11 +473,23 @@ def main() -> int:
         "transient recoil projection loss can still reset optical activation",
     )
     require(
-        "const float2 stableShadowCoordinates = normalizedLensPosition"
-        in shader
+        "const float currentProjectedRadius =" in shader
+        and "const float2 stableShadowCoordinates =" in shader
+        and "normalizedLensPosition" in shader
+        and "float2 eyeTravelLens =" in shader
+        and "const float2 numeratorAtEye =" in shader
+        and "const float reciprocalWAtEye =" in shader
         and "SCOPE_SCENE_PARALLAX_STRENGTH" in shader
-        and "physicalEyeTravel /" in shader
-        and "1.0f + 2.0f * sceneTravelLength" in shader
+        and (
+            "physicalEyeTravel /" in shader
+            or "const float2 depthTravel = physicalEyeTravel * sceneDepth" in shader
+        )
+        # Scene parallax saturates through the same shared soft limiter the
+        # exit pupil uses, bounded to one aperture radius. The retired
+        # 1/(1 + 2m) form removed roughly 29% of an ordinary 0.2-radius shift
+        # and flattened exactly the motion that conveys optical depth.
+        and "ScopeShadowSoftLimitVector(depthTravel, 1.0f)" in shader
+        and "1.0f + 2.0f * sceneTravelLength" not in shader
         and "sampleDelta -=\n            eyeParallaxPixels" in shader,
         "aperture-derived shadow fit or bounded scene parallax is missing",
     )
@@ -382,15 +508,45 @@ def main() -> int:
         "automatic STS eye-box, authored zoom, scene-parallax, or neutral magnification defaults regressed",
     )
     require(
-        "EyeBoxRecentering::CalculateBlend(" in main_cpp
-        and "state.baselineEyeLocal +=" in main_cpp
-        and "normalizedDisplacement" in main_cpp
+        "EyeBoxRecentering::CalculateResponseAlpha(" in main_cpp
+        and "kOpticalFollowerTimeConstant" in main_cpp
+        and "kOpticalFollowerTimeConstant = 0.090F" in main_cpp
+        and "const float followerBlend =" in main_cpp
+        and "state.baselineEyeLocalX +=" in main_cpp
+        and "state.baselineEyeLocalZ +=" in main_cpp
+        and "ProjectLocalEyeOffsetToScreen(" in main_cpp
+        and "cameraApertureLocal.x" in main_cpp
+        and "cameraApertureLocal.z" in main_cpp
+        and "baselineScreenX" not in main_cpp
         and "planarLength > maximumTravel" in main_cpp
         and "ResetAutomaticSTSEyeBoxTracking();" in main_cpp
+        and "kRequiredStableSeconds" not in main_cpp
+        and "kMaximumCalibrationVelocity" not in main_cpp
+        and "boundedDeltaSeconds,\n\t\t\t0.010F" in main_raw
         and "float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y)" in shader
-        and "absolute distance from screen" in shader
+        and "const float currentProjectedRadius =" in shader
+        and "const float2 stableShadowCoordinates =" in shader
+        and "float2 eyeTravelLens =" in shader
+        and "const float2 numeratorAtEye =" in shader
+        and "const float reciprocalWAtEye =" in shader
         and "CalculateScopeDrawTimeEyeTravel(" not in shader,
-        "eye-box motion is not self-centering or still depends on absolute look direction",
+        "eye-box motion is not self-centering in ScopeFade-local coordinates",
+    )
+    require(
+        "previousCameraPoseReady" in main_cpp
+        and "previousForwardWorld" in main_cpp
+        and "currentForwardWorld" in main_cpp
+        and "previousForwardScreen.x - currentForwardScreen.x" in main_cpp
+        and "previousForwardScreen.y - currentForwardScreen.y" in main_cpp
+        and "kAngularLagDecaySeconds = 0.055F" in main_cpp
+        and "state.angularLagX *= decay" in main_cpp
+        and "state.angularLagY *= decay" in main_cpp
+        # Eye travel still reaches the pupil in exact ScopeFade replay
+        # coordinates rather than through a CPU projection from another frame.
+        and "float2 eyeTravelLens =" in shader
+        and "numeratorAtEye / reciprocalWAtEye" in shader
+        and "eyeTravelLens," in shader,
+        "heading-independent camera-space eye-box inertia or pupil travel regressed",
     )
     # The reticle is a true second layer. The exact authored draw is redirected
     # into same-format black- and white-background private targets only after
@@ -438,7 +594,7 @@ def main() -> int:
         and "whiteBackground ?" in reticle_capture
         and "mAutomaticSTSReticleLayerWhiteRTV.Get()" in reticle_capture
         and "mAutomaticSTSReticleLayerRTV.Get()" in reticle_capture
-        and "OMSetRenderTargets(1U, &layerTarget, sourceDepth)"
+        and "OMSetRenderTargets(1U, &layerTarget, nullptr)"
         in reticle_capture
         and "OMSetBlendState(" not in reticle_capture
         and re.search(
@@ -477,17 +633,19 @@ def main() -> int:
         "reticle composite lost B + destination*T dual-source blending",
     )
     require(
-        "OMGetDepthStencilState(" in reticle_capture
-        and "mAutomaticSTSReticleLayerAuthoredDepthState" in reticle_capture
-        and "mAutomaticSTSReticleLayerAuthoredDepthWasNull" in reticle_capture
+        "OMSetRenderTargets(1U, &layerTarget, nullptr);" in reticle_capture
         and "mAutomaticSTSReticleLayerReadOnlyDepthState" in reticle_capture
+        and "readOnlyDescription.DepthEnable = FALSE;" in reticle_capture
         and "readOnlyDescription.DepthWriteMask =\n\t\t\t\tD3D11_DEPTH_WRITE_MASK_ZERO;"
         in reticle_capture
+        and "readOnlyDescription.DepthFunc = D3D11_COMPARISON_ALWAYS;"
+        in reticle_capture
+        and "readOnlyDescription.StencilEnable = FALSE;" in reticle_capture
         and "readOnlyDescription.StencilWriteMask = 0U;" in reticle_capture
         and "CreateDepthStencilState(" in reticle_capture
         and "OMSetDepthStencilState(\n\t\t\tmAutomaticSTSReticleLayerReadOnlyDepthState.Get(),"
         in reticle_capture,
-        "paired reticle capture no longer preserves authored read-only depth tests",
+        "paired reticle capture no longer reconstructs the complete reticle independently of live depth",
     )
     require(
         "D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT" in reticle_capture
@@ -688,7 +846,7 @@ def main() -> int:
             r"captured\s*,\s*std::memory_order_release\s*\)",
             scopefade_authority,
         ),
-        "reticle ownership authority is not derived from ScopeFade capture",
+        "ScopeFade authority is not exact, generation-local, and capture-derived",
     )
 
     # The optical replay must finish before the known reticle-layer pixel
@@ -762,11 +920,26 @@ def main() -> int:
         and "reticle.sourceContribution *= reticleVisibility"
         in reticle_shader
         and "reticle.destinationTransmittance = lerp(" in reticle_shader
-        and "SCOPE_AIM_OFFSET_VALID" in reticle_shader
-        and "basisX * authoredOffset.x" in reticle_shader
-        and "basisZ * authoredOffset.y" in reticle_shader
-        and "dot(lensCoordinates, lensCoordinates)" in reticle_shader,
-        "reticle layer lost dual-source reconstruction, independent size/offset, optical motion, shadow occlusion, or lens clipping",
+        and "float4(1.0f, 1.0f, 1.0f, 1.0f)" in reticle_shader
+        and "SCOPE_LENS_CENTER_X" in reticle_shader
+        and "SCOPE_LENS_CENTER_Y" in reticle_shader
+        and "outputPixel - lensCenterPixel" in reticle_shader
+        and "const float projectedRadius = max(" in reticle_shader
+        # The reticle shadow is evaluated in the same basis-inverted
+        # optic-local frame the scene replay uses. The retired isotropic
+        # pixel-radius coordinate disagreed with the scene layer whenever the
+        # optic was foreshortened or rolled, so the reticle stayed lit inside
+        # a crescent the scene had already darkened.
+        and "const float2 shadowLensCoordinates = lensCoordinates;"
+        in reticle_shader
+        and "const float2 screenLensCoordinates =" not in reticle_shader
+        and "const bool physicalEyeTravelValid =" in reticle_shader
+        and "if (physicalEyeTravelValid)" in reticle_shader
+        and "if (projectedBasisValid && SCOPE_PHYSICAL_EYEBOX_VALID"
+        not in reticle_shader
+        and "ScopeFadePolygonRadius" not in reticle_shader
+        and "reticleBoundary" not in reticle_shader,
+        "reticle layer lost non-destructive dual-source composition, independent size/offset, stable optical motion, or shadow occlusion",
     )
 
     # The retired paths either modified authored vertices before the scene

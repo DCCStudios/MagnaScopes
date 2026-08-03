@@ -76,7 +76,7 @@ namespace MagnaScope
 		{
 			// Retired after the Stage 5c crash proved that detouring Fallout's
 			// private world/culling path is not an acceptable production
-			// boundary. Automatic STS magnification now follows FTS's stable
+			// boundary. Automatic STS magnification now follows MagnaScope's stable
 			// late coherent-color replay contract instead. Keep the parsed
 			// field only so an old diagnostic INI fails closed below.
 			return false;
@@ -117,6 +117,26 @@ namespace MagnaScope
 			        verificationGeometryMagnification) ||
 			       AllowsAuxiliaryWorldPass();
 		}
+		[[nodiscard]] bool AllowsWorldColorCapture() const noexcept
+		{
+			// Retired. This copied the main color target immediately before
+			// first-person rendering so the magnified image could exclude the
+			// weapon. That boundary is before Fallout's image-space and
+			// tone-mapping work, while the optical composite runs at the TAA or
+			// Present anchor against the finished display-encoded frame. No
+			// conversion existed between the two, so the whole optical image
+			// rendered uniformly darker than the surrounding scene regardless of
+			// every shadow and image control.
+			//
+			// The replay now samples the composite target's own content, which
+			// shares its colour encoding by construction. See Through Scopes has
+			// already drawn the world through the authored aperture at that
+			// point, so excluding first-person geometry is not required.
+			//
+			// The parsed rollout fields and the forwarding hooks remain so an
+			// old diagnostic INI still fails closed.
+			return false;
+		}
 		[[nodiscard]] bool AllowsScopeFadeGeometry() const noexcept
 		{
 			return AllowsGeometryProbe() || AllowsGeometryMagnification();
@@ -128,7 +148,7 @@ namespace MagnaScope
 		}
 		[[nodiscard]] bool AllowsComposite() const noexcept
 		{
-			// Geometry magnification now follows the original FTS late-frame
+			// Geometry magnification now follows the original scope-rendering late-frame
 			// contract. The authored ScopeFade draw is recorded during the
 			// weapon pass, but its magnified replay must run after TAA or at
 			// Present against a fully rendered color source. The cyan geometry
