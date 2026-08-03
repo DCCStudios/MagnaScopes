@@ -85,26 +85,15 @@ ReticleCompositeOutput main(VertexPosHTex input)
     const float2 lensCenterPixel = float2(
         SCOPE_LENS_CENTER_X,
         SCOPE_LENS_CENTER_Y);
-    float2 lensCoordinates = float2(0.0f, 0.0f);
-    if (projectedBasisValid) {
-        const float2 displacement = outputPixel - lensCenterPixel;
-        lensCoordinates = float2(
-            (displacement.x * basisZ.y -
-             displacement.y * basisZ.x) /
-                basisDeterminant,
-            (-displacement.x * basisX.y +
-             displacement.y * basisX.x) /
-                basisDeterminant);
-    } else {
-        // A newly selected scope can briefly lack the projected basis. The
-        // axis-aligned radii are a fail-closed fallback that still prevents
-        // the reticle layer from painting over the weapon housing.
-        const float2 fallbackRadius = max(
-            float2(SCOPE_LENS_RADIUS_X, SCOPE_LENS_RADIUS_Y),
-            float2(1.0f, 1.0f));
-        lensCoordinates =
-            (outputPixel - lensCenterPixel) / fallbackRadius;
-    }
+    // A newly selected scope can briefly lack the projected basis, which would
+    // leave projectedRadius clamped at its one-pixel floor and shadow the whole
+    // layer. The axis-aligned published radii are the fail-closed fallback.
+    const float shadowRadius =
+        projectedBasisValid ?
+            projectedRadius :
+            max(
+                0.5f * (SCOPE_LENS_RADIUS_X + SCOPE_LENS_RADIUS_Y),
+                1.0f);
 
     // Reproduce the scene shader's bounded transient eye motion exactly.
     // The plus sign is the inverse display-space mapping of the scene
@@ -173,28 +162,28 @@ ReticleCompositeOutput main(VertexPosHTex input)
     // beneath scope shadow must interpolate that complete blend operator
     // toward identity. Multiplying only B or T would darken or brighten the
     // already-composited optical scene.
-    // Evaluate the shadow in the same optic-local frame the scene replay uses.
-    // lensCoordinates above is the basis-inverted coordinate, so it carries
-    // ScopeFade roll and foreshortening; the isotropic pixel-radius form this
-    // replaced disagreed with the scene layer whenever the optic was not
-    // square-on to the camera, leaving the reticle lit inside a dark crescent.
+    // The shadow is evaluated in an isotropic screen-space frame.
+    //
+    // The published basis is not a similarity transform: its two columns
+    // foreshorten independently as the optic turns relative to the camera, so
+    // inverting it squashes a circular pupil into a slit. The scene replay
+    // evaluates its mask in the ScopeFade geometry's own lens coordinate, which
+    // is circular by construction, and this has to match it. Both layers are
+    // radially symmetric, so what they need to agree on is the pupil's size and
+    // screen-space displacement, not the optic's roll -- and an isotropic frame
+    // reproduces both.
+    //
     // The authored Lens Center displaces the sight picture and its pupil. The
     // reticle keeps its own independent Reticle Offset, so this is applied only
     // to the shadow coordinate: the reticle must pass behind the same crescent
     // the scene shows, without being dragged off its own alignment.
     const float2 shadowLensCoordinates =
-        lensCoordinates -
+        (outputPixel - lensCenterPixel) / shadowRadius -
         float2(SCOPE_LENS_OFFSET_X, SCOPE_LENS_OFFSET_Y);
-    // Display-X/Y travel becomes optic-local travel through the same basis
-    // inverse the scene replay uses.
+    // Published travel is already normalized in aperture radii, so in that same
+    // isotropic frame it needs no conversion at all.
     float2 eyeTravelLocal = float2(0.0f, 0.0f);
-    if (physicalEyeTravelValid && projectedBasisValid) {
-        eyeTravelLocal = ScopeShadowInvertLensBasis(
-            physicalEyeTravel * projectedRadius,
-            basisX,
-            basisZ,
-            basisDeterminant);
-    } else if (physicalEyeTravelValid) {
+    if (physicalEyeTravelValid) {
         eyeTravelLocal = physicalEyeTravel;
     }
     const float axialPupilScale = clamp(
@@ -207,21 +196,13 @@ ReticleCompositeOutput main(VertexPosHTex input)
         1.04f);
     // Same optical-tube parallax the scene replay applies, so the reticle is
     // occluded by the identical recessed disc rather than a concentric one.
-    const float2 opticalAxisPixels =
-        0.5f * float2(BUFFER_WIDTH, BUFFER_HEIGHT);
-    // Must match the scene replay's parallax exactly. The screen-centre offset
-    // alone is near zero in ADS, so eye-box travel carries the depth cue, and
-    // it goes through the basis inverse rather than a radius division so it
-    // shares the frame of everything else here; see the matching comment in
+    // Must match the scene replay's parallax exactly. Eye-box travel is the
+    // whole of it; the aperture's offset from screen centre was dropped there
+    // and must stay dropped here, or the reticle's pupil would sit a fraction
+    // of a radius away from the scene's. See the matching comment in
     // ScopeGeometryMagnify_PS.hlsl.
     const float2 tubeParallaxLocal =
-        -(ScopeShadowInvertLensBasis(
-              lensCenterPixel - opticalAxisPixels,
-              basisX,
-              basisZ,
-              basisDeterminant) +
-          eyeTravelLocal) *
-        saturate(ScopeTubeDepth);
+        -eyeTravelLocal * saturate(ScopeTubeDepth);
 
     const ScopeShadowLayers shadow = EvaluateScopeShadow(
         shadowLensCoordinates,

@@ -392,9 +392,14 @@ def main() -> int:
         and "SCOPE_LENS_SCALE" in triangle_shader
         # The offset moves the magnification pivot, not just the mask. The
         # pivot is the fixed point of the zoom, so shifting the mask alone
-        # would crop an image still magnified about the old centre.
-        and "publishedLensBasisX * SCOPE_LENS_OFFSET_X" in shader
-        and "stableShadowCoordinates -= lensUserOffset;" in shader
+        # would crop an image still magnified about the old centre. It reaches
+        # the pivot through the same exact projective solve the lens centre
+        # does, never through the published basis, so the content and the mask
+        # cannot move by different amounts.
+        and "const float2 pixelsToLensOffset = SolvePixelOffset(" in shader
+        and "aperturePivotPixels += pixelsToLensOffset - pixelsToCenter;"
+        in shader
+        and "normalizedLensPosition - lensUserOffset" in shader
         and "SCOPE_LENS_SCALE" in shader
         and "SCOPE_LENS_SCALE" in reticle_shader,
         "Lens Center or Lens Size is not wired through to the optics",
@@ -567,30 +572,32 @@ def main() -> int:
     )
     require(
         "const float currentProjectedRadius =" in shader
-        and "float2 stableShadowCoordinates = normalizedLensPosition;"
-        in shader
         # Every input to the scope-shadow mask -- coordinate, eye travel, and
         # tube-parallax offset -- must come from the uniform published lens
         # frame. Any of them read from the per-pixel solve is evaluated per
         # triangle, and the disagreement between wedges shows up as radial
         # spikes at the rim. That includes a validity predicate: a radius
         # agreement guard here made wedges flip frames mid-lens.
-        and "const bool shadowFrameValid =" in shader
         and "publishedFrameMatchesGeometry" not in shader
         and "float2 eyeTravelLens =" in shader
-        and "const float2 numeratorAtEye =" not in shader
-        # Every offset must additionally reach that frame through the basis
-        # inverse, not a plain radius division. Dividing leaves a display-space
-        # vector, and adding one to an optic-local coordinate mixes frames: the
-        # local frame rotates with the weapon while the display term does not,
-        # so the pupil and recessed image spin around the lens as the camera
-        # pans. Both shaders share one helper so this cannot regress in only
-        # one of them.
-        and "ScopeShadowInvertLensBasis(" in shader
-        and "/ publishedRadius" not in shader
-        and "/ projectedRadius" not in reticle_shader
-        and shader.count("ScopeShadowInvertLensBasis(") >= 3
-        and "ScopeShadowInvertLensBasis(" in reticle_shader
+        # The mask's frame must be isotropic, and the published aperture basis
+        # is not: its two columns foreshorten independently as the optic turns,
+        # so inverting it as a matrix squashes the lit disc into a slit whose
+        # narrow axis follows the camera pan. Neither layer may reconstruct a
+        # shadow coordinate from it. The scene uses the geometry's own lens
+        # coordinate; the reticle uses pixels over the mean projected radius.
+        and "ScopeShadowInvertLensBasis(" not in shader
+        and "ScopeShadowInvertLensBasis(" not in reticle_shader
+        and "ScopeShadowInvertLensBasis(" not in shadow_shader
+        and "const float2 stableShadowCoordinates =\n        normalizedLensPosition - lensUserOffset;"
+        in shader
+        and "SCOPE_LENS_BASIS_XX" not in shader.split("float3 opticalColor")[-1]
+        # The aperture's offset from screen centre is gone from the parallax.
+        # It was near zero in ADS and reaching it meant dividing by the solved
+        # radius, a triangle-local quantity that gave each wedge its own disc.
+        and "const float2 axisOffsetLens" not in shader
+        and "opticalAxisPixels" not in shader
+        and "opticalAxisPixels" not in reticle_shader
         and "SCOPE_SCENE_PARALLAX_STRENGTH" in shader
         and (
             "physicalEyeTravel /" in shader
@@ -637,10 +644,9 @@ def main() -> int:
         and "boundedDeltaSeconds,\n\t\t\t0.010F" in main_raw
         and "float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y)" in shader
         and "const float currentProjectedRadius =" in shader
-        and "float2 stableShadowCoordinates = normalizedLensPosition;"
-        in shader
+        and "normalizedLensPosition - lensUserOffset" in shader
         and "float2 eyeTravelLens =" in shader
-        and "physicalEyeTravel * publishedRadius" in shader
+        and "physicalEyeTravel * currentProjectedRadius" in shader
         and "CalculateScopeDrawTimeEyeTravel(" not in shader,
         "eye-box motion is not self-centering in ScopeFade-local coordinates",
     )
@@ -653,24 +659,18 @@ def main() -> int:
         and "kAngularLagDecaySeconds = 0.055F" in main_cpp
         and "state.angularLagX *= decay" in main_cpp
         and "state.angularLagY *= decay" in main_cpp
-        # Eye travel reaches the pupil through the published basis inverse.
-        # It used to run through the replay's derivative frame, which is exact
-        # but triangle-local, so the mask's offset differed from wedge to
-        # wedge and the disagreement read as radial spikes at the rim. The
-        # reticle composite performs the identical conversion, which is what
-        # keeps the two layers' pupils on top of each other.
+        # Eye travel reaches the pupil through the same exact projective solve
+        # the mask coordinate comes from, so the two share one frame by
+        # construction with no basis or convention to be guessed at.
         and "float2 eyeTravelLens =" in shader
-        and "numeratorAtEye / reciprocalWAtEye" not in shader
-        and "physicalEyeTravel * publishedRadius," in shader
-        # Eye travel now carries the optical-tube parallax term. A
-        # recessed image disc that stays concentric with the aperture
-        # only looks smaller; it still tracks the housing one-for-one.
-        # Two circles at different depths separate only when the eye is
-        # off the optical axis, and the eye is the camera, so the axis is
-        # screen centre.
+        and "numeratorAtEye / reciprocalWAtEye" in shader
+        # Eye travel is the whole of the optical-tube parallax. A recessed
+        # image disc that stays concentric with the aperture only looks
+        # smaller; it still tracks the housing one-for-one, and it is eye
+        # travel that carries the eye off the optical axis while aiming.
         and "eyeTravelLens + tubeParallaxLens," in shader
-        and "const float2 opticalAxisPixels = 0.5f * ScreenSize;" in shader
-        and "const float2 tubeParallaxLens =" in shader,
+        and "const float2 tubeParallaxLens =\n        -eyeTravelLens * saturate(ScopeTubeDepth);"
+        in shader,
         "heading-independent camera-space eye-box inertia or pupil travel regressed",
     )
     # The reticle is a true second layer. The exact authored draw is redirected
@@ -1055,10 +1055,14 @@ def main() -> int:
         # pixel-radius coordinate disagreed with the scene layer whenever the
         # optic was foreshortened or rolled, so the reticle stayed lit inside
         # a crescent the scene had already darkened.
+        # The shadow frame must be isotropic so a circular pupil stays circular.
+        # The published basis is not -- its columns foreshorten independently as
+        # the optic turns -- so the reticle uses pixels over the mean projected
+        # radius, matching the circular lens coordinate the scene replay uses.
         # It is displaced by the authored Lens Center so the reticle passes
         # behind the same crescent the scene shows, while keeping its own
         # independent Reticle Offset for alignment.
-        and "const float2 shadowLensCoordinates =\n        lensCoordinates -"
+        and "const float2 shadowLensCoordinates =\n        (outputPixel - lensCenterPixel) / shadowRadius -"
         in reticle_shader
         and "SCOPE_LENS_OFFSET_X" in reticle_shader
         and "const float2 screenLensCoordinates =" not in reticle_shader

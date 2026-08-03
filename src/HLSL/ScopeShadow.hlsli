@@ -69,33 +69,24 @@ float2 ScopeShadowSoftLimitVector(float2 value, float limit)
     return value * (ScopeShadowSoftLimit(magnitude, limit) / magnitude);
 }
 
-// Maps a display-space pixel vector into optic-local lens units through the
-// game thread's published aperture basis.
+// A note on frames, because two attempts to unify them made things worse.
 //
-// Every quantity handed to EvaluateScopeShadow must live in the same frame.
-// The lens coordinate is basis-inverted, so it rotates and foreshortens with
-// the optic; a display-space offset added to it does not, and the mismatch
-// makes the pupil and recessed image appear to spin around the lens as the
-// camera pans. Both shaders route every offset through this one function so
-// that class of bug cannot reappear in only one of them.
+// EvaluateScopeShadow is radially symmetric, so it needs an *isotropic* frame:
+// one where a circle of lens coordinates is a circle on screen. It does not
+// need the optic's roll, because rotating a radially symmetric function does
+// nothing.
 //
-// The basis already carries the aperture's pixel scale, so the result is
-// normalized to aperture radii without a separate radius division.
-float2 ScopeShadowInvertLensBasis(
-    float2 displayPixels,
-    float2 basisX,
-    float2 basisZ,
-    float basisDeterminant)
-{
-    if (abs(basisDeterminant) <= 0.0001f) {
-        return float2(0.0f, 0.0f);
-    }
-    return float2(
-        (displayPixels.x * basisZ.y - displayPixels.y * basisZ.x) /
-            basisDeterminant,
-        (-displayPixels.x * basisX.y + displayPixels.y * basisX.x) /
-            basisDeterminant);
-}
+// The game thread's published aperture basis is not isotropic. It is the
+// optic's world X/Z axes projected to screen, and the two column lengths
+// diverge as the optic turns relative to the camera -- far more than the drawn
+// glass foreshortens. Inverting it as a matrix collapses the lit disc into a
+// slit whose narrow axis follows the camera pan.
+//
+// So each layer uses the isotropic frame it has to hand: the scene replay uses
+// the lens coordinate the geometry shader publishes on the ScopeFade vertices,
+// and the reticle composite uses pixel displacement over the mean projected
+// radius. The two differ by a rotation, which is exactly what does not matter.
+// Do not "unify" them through the published basis.
 
 // Normalized [0, 1] forms of the authored 0..20 editor ranges.
 float ScopeShadowVignetteReach(float authoredReach)

@@ -87,6 +87,12 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
             float2(0.0f, 0.0f);
     const float2 publishedAimPixels =
         float2(SCOPE_AIM_CENTER_X, SCOPE_AIM_CENTER_Y);
+    // Where the sight picture sits inside the housing. STS publishes where its
+    // ScopeFade mesh is, which is not always where a given scope model wants
+    // the optical image, so this is authored per scope in aperture radii along
+    // the optic's own axes.
+    const float2 lensUserOffset =
+        float2(SCOPE_LENS_OFFSET_X, SCOPE_LENS_OFFSET_Y);
     const float reciprocalClipW = input.lensProjective.z;
     const bool reciprocalClipWValid = abs(reciprocalClipW) > 0.000001f;
     const float safeReciprocalClipW =
@@ -129,6 +135,18 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
         aimColumnY,
         aimRightHandSide,
         aimSolveValid);
+
+    // Lens Center is a third point on that same projective plane, so it is
+    // solved the same exact way rather than pushed through the published
+    // aperture basis. That basis is not a similarity transform -- see the mask
+    // comment below -- so using it here would have moved the magnified content
+    // by a different amount than it moved the mask.
+    bool lensOffsetSolveValid = false;
+    const float2 pixelsToLensOffset = SolvePixelOffset(
+        numeratorDx - lensUserOffset * reciprocalWDx,
+        numeratorDy - lensUserOffset * reciprocalWDy,
+        lensUserOffset * reciprocalClipW - projectiveNumerator,
+        lensOffsetSolveValid);
 
     const bool drawFrameValid =
         reciprocalClipWValid && centerSolveValid && aimSolveValid;
@@ -191,11 +209,11 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // pivot is the fixed point of the magnification, so placing it at the
     // authored lens centre is what actually re-centres the sight picture --
     // moving the mask alone would only crop an image still zoomed about the
-    // old point. The optic-local offset returns to pixels through the published
-    // basis, the same rotation the mask coordinate is expressed in.
-    aperturePivotPixels +=
-        publishedLensBasisX * SCOPE_LENS_OFFSET_X +
-        publishedLensBasisZ * SCOPE_LENS_OFFSET_Y;
+    // old point. Both solves share a base pixel, so their difference is the
+    // exact screen displacement from lens (0,0) to lens lensUserOffset.
+    if (lensOffsetSolveValid) {
+        aperturePivotPixels += pixelsToLensOffset - pixelsToCenter;
+    }
     if (physicalEyeTravelValid && imageStillness > 0.0f) {
         const float2 apertureMotionPixels =
             float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y) *
@@ -456,81 +474,50 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // shared contract in ScopeShadow.hlsli so the late reticle composite dims
     // by exactly the same amount at the same optic-local coordinate.
     //
-    // The mask is evaluated in the game thread's published lens frame, not in
-    // the per-pixel solved frame that drives optical sampling.
+    // The mask is evaluated in the coordinate the geometry shader publishes on
+    // the ScopeFade vertices themselves. Do not substitute a frame rebuilt from
+    // the game thread's published centre and basis.
     //
-    // Those two want opposite things. Sampling must be frame-accurate, so it
-    // uses the derivative solve; a CPU frame one frame stale would smear the
-    // magnified image during recoil. The mask is a smooth radial function whose
-    // edge sweeps across many triangles, so a stale frame is imperceptible
-    // while per-triangle disagreement is glaring -- the fabricated centre fan
-    // and the annulus solve slightly different frames, and any mask contour
-    // crossing that boundary picks up the seam as visible faceting.
+    // That basis is the optic's world X/Z axes projected to screen, and its two
+    // column lengths do not stay equal: they foreshorten as the optic turns
+    // relative to the camera, and by far more than the drawn glass does.
+    // Inverting it as a matrix therefore hands the mask an anisotropic frame,
+    // and the lit disc collapses into a slit whose narrow axis tracks whichever
+    // way the camera is panning. The lens coordinate here is circular by
+    // construction, exact under perspective, and continuous across every wedge
+    // and the fabricated centre fan alike, which is everything the mask needs.
     //
-    // Deriving the mask from the published centre and basis removes the
-    // dependency on triangle-local data entirely, so the contour is smooth at
-    // any radius. This is the same basis inversion the reticle composite
-    // already uses, which also keeps the two layers agreeing by construction.
-    const float2 shadowBasisX =
-        float2(SCOPE_LENS_BASIS_XX, SCOPE_LENS_BASIS_XY);
-    const float2 shadowBasisZ =
-        float2(SCOPE_LENS_BASIS_ZX, SCOPE_LENS_BASIS_ZY);
-    const float shadowBasisDeterminant =
-        shadowBasisX.x * shadowBasisZ.y - shadowBasisX.y * shadowBasisZ.x;
-    // Every term the mask consumes below is uniform across the whole draw, and
-    // that is the entire point. It is not enough for the coordinate to come
-    // from the published frame: any predicate, offset, or scale built from the
-    // per-pixel solve is evaluated per triangle, so wedges landing on opposite
-    // sides of it select or shift the mask differently. A radius-agreement
-    // guard tried here did exactly that, and the flip showed up as 24 radial
-    // spikes reaching in from the rim, where the pupil falloff is steepest and
-    // the smallest coordinate disagreement is most visible.
-    //
-    // So the only validity test is whether the published basis is invertible.
-    // The reticle composite has always trusted it on those terms; the two
-    // layers agreeing with each other matters more than either agreeing with a
-    // frame-exact rim, and a one-frame-stale mask is invisible on a smooth
-    // radial function.
-    const bool shadowFrameValid =
-        abs(shadowBasisDeterminant) > 0.0001f;
-    const float publishedRadius = max(
-        0.5f * (length(shadowBasisX) + length(shadowBasisZ)),
-        1.0f);
-    const float2 shadowCenterPixels =
-        float2(SCOPE_LENS_CENTER_X, SCOPE_LENS_CENTER_Y);
-    // Where the sight picture sits inside the housing. STS publishes where its
-    // ScopeFade mesh is, which is not always where a given scope model wants
-    // the optical image, so this is authored per scope. It is in aperture radii
-    // along the optic's own axes, which is why it is subtracted from the
-    // optic-local coordinate rather than from screen pixels: it then rolls and
-    // foreshortens with the lens instead of sliding across it.
-    const float2 lensUserOffset =
-        float2(SCOPE_LENS_OFFSET_X, SCOPE_LENS_OFFSET_Y);
-    float2 stableShadowCoordinates = normalizedLensPosition;
-    if (shadowFrameValid) {
-        stableShadowCoordinates = ScopeShadowInvertLensBasis(
-            input.position.xy - shadowCenterPixels,
-            shadowBasisX,
-            shadowBasisZ,
-            shadowBasisDeterminant);
-    }
-    stableShadowCoordinates -= lensUserOffset;
-    // Display-X/Y travel becomes optic-local travel through the published basis
-    // inverse. This used to run through the derivative frame, which made the
-    // mask's offset differ from wedge to wedge -- the same faceting the
-    // coordinate change above removes, arriving by a second route. It is now
-    // the identical conversion the reticle composite performs, so both layers
-    // shift their pupil by the same amount by construction.
+    // The faceting that motivated abandoning it was never this coordinate. It
+    // came from the *offsets* subtracted from it: a validity predicate built on
+    // the per-pixel solve, which made adjacent wedges select different frames
+    // outright, and a screen-centre axis term divided by the solved radius,
+    // which gave each wedge its own disc. Both are gone. Anything added to this
+    // coordinate must be uniform across the draw or vary smoothly with it.
+    const float2 stableShadowCoordinates =
+        normalizedLensPosition - lensUserOffset;
+    // Display-X/Y travel becomes lens-local travel through the same exact
+    // projective solve the coordinate above comes from, so the two are in one
+    // frame by construction and no basis, radius, or convention has to be
+    // guessed at to relate them.
     float2 eyeTravelLens = float2(0.0f, 0.0f);
     if (physicalEyeTravelValid) {
+        const float2 eyeTravelPixels =
+            physicalEyeTravel * currentProjectedRadius;
+        const float reciprocalWAtCenter =
+            reciprocalClipW +
+            reciprocalWDx * pixelsToCenter.x +
+            reciprocalWDy * pixelsToCenter.y;
+        const float2 numeratorAtEye =
+            numeratorDx * eyeTravelPixels.x +
+            numeratorDy * eyeTravelPixels.y;
+        const float reciprocalWAtEye =
+            reciprocalWAtCenter +
+            reciprocalWDx * eyeTravelPixels.x +
+            reciprocalWDy * eyeTravelPixels.y;
         eyeTravelLens =
-            shadowFrameValid ?
-                ScopeShadowInvertLensBasis(
-                    physicalEyeTravel * publishedRadius,
-                    shadowBasisX,
-                    shadowBasisZ,
-                    shadowBasisDeterminant) :
-                physicalEyeTravel;
+            abs(reciprocalWAtEye) > 0.000001f ?
+                numeratorAtEye / reciprocalWAtEye :
+                float2(0.0f, 0.0f);
     }
     // Positive relief moved the eyepiece farther away, so the lit disc
     // contracts slightly. The bound keeps ordinary breathing subtle and stops
@@ -567,27 +554,17 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // being measured: sway, recoil, and the weapon's own inertia carry the eye
     // off the axis constantly. Driving depth from that gives the image a second
     // helping of the same displacement the exit pupil gets, which is exactly
-    // what a recessed image does -- it swings further than the rear glass. The
-    // residual screen-centre offset is kept, since it is genuinely off-axis
-    // when the optic is not centred, but it is no longer the only source.
+    // what a recessed image does -- it swings further than the rear glass.
     //
-    // Measured in the published frame for the same reason as everything else
-    // here: the solved centre and radius are triangle-local, so driving the
-    // disc's offset from them gave each wedge its own recessed circle.
-    //
-    // It also has to go through the basis inverse rather than a plain division
-    // by the radius. Dividing gives a display-space vector, and adding that to
-    // optic-local eye travel mixes two frames: as the weapon rolls, the local
-    // frame turns under a term that does not, so the recessed image appeared to
-    // rotate around the lens whenever the camera panned.
-    const float2 opticalAxisPixels = 0.5f * ScreenSize;
-    const float2 axisOffsetLens = ScopeShadowInvertLensBasis(
-        shadowCenterPixels - opticalAxisPixels,
-        shadowBasisX,
-        shadowBasisZ,
-        shadowBasisDeterminant);
+    // The aperture's own distance from screen centre used to be added here as a
+    // second off-axis source. It is removed: it is within a pixel or two of
+    // zero in ADS, which is the only time any of this is visible, and reaching
+    // it meant dividing a screen-space vector by the solved aperture radius --
+    // a triangle-local quantity, which gave every wedge its own recessed disc
+    // and drew 24 radial spikes in from the rim. It bought nothing and cost the
+    // one property the mask cannot do without.
     const float2 tubeParallaxLens =
-        -(axisOffsetLens + eyeTravelLens) * saturate(ScopeTubeDepth);
+        -eyeTravelLens * saturate(ScopeTubeDepth);
 
     const ScopeShadowLayers shadow = EvaluateScopeShadow(
         stableShadowCoordinates,
