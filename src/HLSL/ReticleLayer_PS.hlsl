@@ -204,8 +204,12 @@ ReticleCompositeOutput main(VertexPosHTex input)
     // occluded by the identical recessed disc rather than a concentric one.
     const float2 opticalAxisPixels =
         0.5f * float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+    // Must match the scene replay's parallax exactly. The screen-centre offset
+    // alone is near zero in ADS, so eye-box travel carries the depth cue; see
+    // the matching comment in ScopeGeometryMagnify_PS.hlsl.
     const float2 tubeParallaxLocal =
-        -((lensCenterPixel - opticalAxisPixels) / projectedRadius) *
+        -(((lensCenterPixel - opticalAxisPixels) / projectedRadius) +
+          eyeTravelLocal) *
         saturate(ScopeTubeDepth);
 
     const ScopeShadowLayers shadow = EvaluateScopeShadow(
@@ -214,7 +218,7 @@ ReticleCompositeOutput main(VertexPosHTex input)
         physicalEyeTravelValid || saturate(ScopeTubeDepth) > 0.0f,
         SCOPE_EYEBOX_RADIUS,
         clamp(ScopeShadowDepth, 0.0f, 4.0f),
-        axialPupilScale,
+        axialPupilScale * lerp(1.0f, 0.6f, saturate(ScopeTubeDepth)),
         SCOPE_VIGNETTE_REACH,
         SCOPE_VIGNETTE_SHARPNESS);
     const float pupilShadow = 1.0f - shadow.visibility;

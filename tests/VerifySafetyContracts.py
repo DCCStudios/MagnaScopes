@@ -532,8 +532,15 @@ def main() -> int:
     )
     require(
         "const float currentProjectedRadius =" in shader
-        and "const float2 stableShadowCoordinates =" in shader
-        and "normalizedLensPosition" in shader
+        and "float2 stableShadowCoordinates = normalizedLensPosition;"
+        in shader
+        # The mask uses the published lens frame so its contour cannot pick up
+        # per-triangle seams, but only while that frame agrees with the
+        # aperture actually drawn; otherwise the shadow ring would sit visibly
+        # inside or outside the glass.
+        and "publishedFrameMatchesGeometry" in shader
+        and "abs(publishedRadius / currentProjectedRadius - 1.0f) < 0.15f"
+        in shader
         and "float2 eyeTravelLens =" in shader
         and "const float2 numeratorAtEye =" in shader
         and "const float reciprocalWAtEye =" in shader
@@ -583,7 +590,8 @@ def main() -> int:
         and "boundedDeltaSeconds,\n\t\t\t0.010F" in main_raw
         and "float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y)" in shader
         and "const float currentProjectedRadius =" in shader
-        and "const float2 stableShadowCoordinates =" in shader
+        and "float2 stableShadowCoordinates = normalizedLensPosition;"
+        in shader
         and "float2 eyeTravelLens =" in shader
         and "const float2 numeratorAtEye =" in shader
         and "const float reciprocalWAtEye =" in shader

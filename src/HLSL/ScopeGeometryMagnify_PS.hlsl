@@ -447,12 +447,52 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // shared contract in ScopeShadow.hlsli so the late reticle composite dims
     // by exactly the same amount at the same optic-local coordinate.
     //
-    // Scope shadow is evaluated in the exact logical coordinates emitted by
-    // the ScopeFade replay. Display-X/Y eye travel is converted through the
-    // current derivative frame only for the pupil displacement, so the
-    // aperture itself can neither drift nor breathe when the CPU projection
-    // changes with heading or pitch.
-    const float2 stableShadowCoordinates = normalizedLensPosition;
+    // The mask is evaluated in the game thread's published lens frame, not in
+    // the per-pixel solved frame that drives optical sampling.
+    //
+    // Those two want opposite things. Sampling must be frame-accurate, so it
+    // uses the derivative solve; a CPU frame one frame stale would smear the
+    // magnified image during recoil. The mask is a smooth radial function whose
+    // edge sweeps across many triangles, so a stale frame is imperceptible
+    // while per-triangle disagreement is glaring -- the fabricated centre fan
+    // and the annulus solve slightly different frames, and any mask contour
+    // crossing that boundary picks up the seam as visible faceting.
+    //
+    // Deriving the mask from the published centre and basis removes the
+    // dependency on triangle-local data entirely, so the contour is smooth at
+    // any radius. This is the same basis inversion the reticle composite
+    // already uses, which also keeps the two layers agreeing by construction.
+    const float2 shadowBasisX =
+        float2(SCOPE_LENS_BASIS_XX, SCOPE_LENS_BASIS_XY);
+    const float2 shadowBasisZ =
+        float2(SCOPE_LENS_BASIS_ZX, SCOPE_LENS_BASIS_ZY);
+    const float shadowBasisDeterminant =
+        shadowBasisX.x * shadowBasisZ.y - shadowBasisX.y * shadowBasisZ.x;
+    // Fail back to the solved frame if the published basis does not describe
+    // the aperture actually being drawn. A mask circle that disagrees with the
+    // rim would put the shadow ring visibly inside or outside the glass, which
+    // is far worse than the faint wedge seams this replaces. Both radii are
+    // smooth across the lens, so this decision is uniform in practice rather
+    // than flipping from triangle to triangle.
+    const float publishedRadius = max(
+        0.5f * (length(shadowBasisX) + length(shadowBasisZ)),
+        1.0f);
+    const bool publishedFrameMatchesGeometry =
+        abs(publishedRadius / currentProjectedRadius - 1.0f) < 0.15f;
+    float2 stableShadowCoordinates = normalizedLensPosition;
+    if (publishedFrameMatchesGeometry &&
+        abs(shadowBasisDeterminant) > 0.0001f) {
+        const float2 shadowDisplacement =
+            input.position.xy -
+            float2(SCOPE_LENS_CENTER_X, SCOPE_LENS_CENTER_Y);
+        stableShadowCoordinates = float2(
+            (shadowDisplacement.x * shadowBasisZ.y -
+             shadowDisplacement.y * shadowBasisZ.x) /
+                shadowBasisDeterminant,
+            (-shadowDisplacement.x * shadowBasisX.y +
+             shadowDisplacement.y * shadowBasisX.x) /
+                shadowBasisDeterminant);
+    }
     float2 eyeTravelLens = float2(0.0f, 0.0f);
     if (physicalEyeTravelValid) {
         const float2 eyeTravelPixels =
@@ -480,32 +520,35 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
         1.0f - axialEyeRelief * axialBreathing,
         0.96f,
         1.04f);
-    // The lit disc is the full aperture, scaled only by axial eye relief.
-    //
-    // Tube depth must not shrink it. A small bright circle ringed by black is
-    // what an optic looks like when the eye is at the wrong distance, not when
-    // the image sits deep in the tube: with the eye correctly placed, a
-    // recessed image still fills the ocular. Driving the radius from tube depth
-    // made that porthole permanent and independent of where the eye actually
-    // was. Depth belongs in the parallax term below, which is what makes the
-    // image slide against the housing and opens the crescent off-axis.
-    const float imageDiscRadius = axialPupilScale;
+    // The image sits forward in the tube, so it subtends less than the rear
+    // glass and a ring of tube wall shows around it. That ring is the depth
+    // cue. The mask no longer reads triangle-local data, so this contour is
+    // smooth at any radius -- previously a 0.45 floor put it inside the
+    // fabricated centre fan, where it picked up the fan's coordinate seam and
+    // came out visibly faceted. The floor is 0.6 rather than 0.45 so a fully
+    // recessed image still reads as a sight picture and not a porthole.
+    const float imageDiscRadius =
+        axialPupilScale * lerp(1.0f, 0.6f, saturate(ScopeTubeDepth));
     // Optical-tube parallax.
     //
-    // Recessing the image disc alone only makes it smaller; it stays centred on
-    // the aperture and therefore still tracks the housing exactly. Two circles
-    // at different depths separate only when the eye leaves the optical axis --
-    // and here the eye is the camera, so the axis is screen centre. However far
-    // the aperture sits from screen centre is how far off-axis the shooter is
-    // looking, and the recessed disc shifts the opposite way in proportion to
-    // how deep in the tube it sits. That is what stops the magnified image from
-    // moving one-for-one with the rear glass, and it needs no temporal filter:
-    // it is a property of where the optic currently is, not of how it got there.
+    // Two circles at different depths separate when the eye leaves the optical
+    // axis. The previous form measured that offset as the aperture's distance
+    // from screen centre, which is very nearly zero in ADS -- the whole point of
+    // aiming is to put the optic on the axis -- so the term collapsed exactly
+    // where it was supposed to work and tube depth felt inert.
+    //
+    // The quantity that does move while aiming is the eye-box travel already
+    // being measured: sway, recoil, and the weapon's own inertia carry the eye
+    // off the axis constantly. Driving depth from that gives the image a second
+    // helping of the same displacement the exit pupil gets, which is exactly
+    // what a recessed image does -- it swings further than the rear glass. The
+    // residual screen-centre offset is kept, since it is genuinely off-axis
+    // when the optic is not centred, but it is no longer the only source.
     const float2 opticalAxisPixels = 0.5f * ScreenSize;
     const float2 axisOffsetLens =
         (centerPixels - opticalAxisPixels) / currentProjectedRadius;
     const float2 tubeParallaxLens =
-        -axisOffsetLens * saturate(ScopeTubeDepth);
+        -(axisOffsetLens + eyeTravelLens) * saturate(ScopeTubeDepth);
 
     const ScopeShadowLayers shadow = EvaluateScopeShadow(
         stableShadowCoordinates,

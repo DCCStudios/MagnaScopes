@@ -1459,10 +1459,10 @@ Output main(Input input)
 	resolution.physicalEyeBoxValid = 1.0F;
 	resolution.lensRadiusX = 40.0F;
 	resolution.lensRadiusY = 40.0F;
-	resolution.lensBasisXX = 40.0F;
+	resolution.lensBasisXX = 51.2F;
 	resolution.lensBasisXY = 0.0F;
 	resolution.lensBasisZX = 0.0F;
-	resolution.lensBasisZY = 40.0F;
+	resolution.lensBasisZY = 51.2F;
 	resolution.lensCenterX = 0.5F * static_cast<float>(kWidth);
 	resolution.lensCenterY = 0.5F * static_cast<float>(kHeight);
 	resolution.eyeBoxRadius = 2.0F;
@@ -1552,10 +1552,10 @@ Output main(Input input)
 	resolution.eyeOffsetX = 0.30F;
 	resolution.eyeOffsetY = -0.20F;
 	resolution.opticalLagStrength = 1.0F;
-	resolution.lensBasisXX = 40.0F;
+	resolution.lensBasisXX = 51.2F;
 	resolution.lensBasisXY = 0.0F;
 	resolution.lensBasisZX = 0.0F;
-	resolution.lensBasisZY = 40.0F;
+	resolution.lensBasisZY = 51.2F;
 	const auto headingZeroSample = renderOpticalLagSample();
 
 	resolution.lensBasisXX = 0.0F;
@@ -1690,10 +1690,10 @@ Output main(Input input)
 	// render target.
 	resolution.lensRadiusX = 40.0F;
 	resolution.lensRadiusY = 40.0F;
-	resolution.lensBasisXX = 40.0F;
+	resolution.lensBasisXX = 51.2F;
 	resolution.lensBasisXY = 0.0F;
 	resolution.lensBasisZX = 0.0F;
-	resolution.lensBasisZY = 40.0F;
+	resolution.lensBasisZY = 51.2F;
 	resolution.lensCenterX = 0.5F * static_cast<float>(kWidth);
 	resolution.lensCenterY = 0.5F * static_cast<float>(kHeight);
 	// Use a deliberately constrained exit pupil so a 0.80-radius synthetic
@@ -1923,10 +1923,10 @@ Output main(Input input)
 		resolution.eyeOffsetY = 0.0F;
 		resolution.lensRadiusX = 40.0F;
 		resolution.lensRadiusY = 40.0F;
-		resolution.lensBasisXX = 40.0F;
+		resolution.lensBasisXX = 51.2F;
 		resolution.lensBasisXY = 0.0F;
 		resolution.lensBasisZX = 0.0F;
-		resolution.lensBasisZY = 40.0F;
+		resolution.lensBasisZY = 51.2F;
 		resolution.aimCenterX = 0.5F * static_cast<float>(kWidth);
 		resolution.aimCenterY = 0.5F * static_cast<float>(kHeight);
 		resolution.lensCenterX = 0.5F * static_cast<float>(kWidth);
