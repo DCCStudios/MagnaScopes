@@ -4,8 +4,6 @@
 // use independently reconstructed per-primitive frames as pixel-shader data:
 // their small differences become visible radial facets under magnification.
 
-#include "Triangle.hlsli"
-
 struct GeometryInput
 {
     float4 position : SV_Position;
@@ -111,61 +109,22 @@ void main(
     // established fill geometry and winding, but publish one logical origin
     // for every generated center. Overlapping sub-pixel center estimates now
     // sample identical optical coordinates instead of forming a visible star.
+    // This apex is not an approximation of the center and must not be replaced
+    // by a "better" one, including a center published by the game thread.
     //
-    // Extrapolating 2*inner - outer is geometrically correct for an exact
-    // half-radius inner ring, and clip space is affine in world space, so the
-    // arithmetic is sound. What is not sound is doing it per primitive: the
-    // packed inner vertex carries quantization error, the factor of two
-    // doubles it, and each of the 24 wedges lands on a slightly different
-    // apex. All 24 are then labelled lens coordinate zero, so each wedge
-    // interpolates a slightly different screen-to-lens mapping and the seams
-    // show as facets once the pixel shader magnifies the center.
+    // Ask which screen point this wedge's own affine map sends to lens (0,0).
+    // In barycentric terms a*dir + 0.5b*dir + 0.5c*dirNext = 0 with a+b+c = 1.
+    // dir and dirNext are independent, so c = 0, and a + 0.5b = 0 with a+b = 1
+    // gives a = -1, b = 2. Lens (0,0) is therefore at 2*inner - outer exactly.
     //
-    // The game thread already projects the ScopeFade center for the pixel and
-    // reticle shaders. Reusing it here costs nothing and makes every wedge
-    // converge on one screen point, which is the only property that removes
-    // the seam. Depth and w stay local: their per-wedge spread only perturbs
-    // the recovered coordinate to second order, because the apex numerator is
-    // exactly zero regardless of w.
+    // That makes the fabricated fan's projective frame identical to its parent
+    // wedge's, so the mapping is continuous across the shared edge at radius
+    // 0.5. Substituting any other point -- however well centered -- gives the
+    // fan a different frame from the annulus and turns that edge into a visible
+    // faceted circle partway out the lens, which is far worse than the faint
+    // wedge-to-wedge seam that vertex quantization leaves at the center.
     GeometryInput center;
-    const float4 localApex = 2.0f * input[1].position - input[0].position;
-    center.position = localApex;
-
-    const float2 publishedCenterPixels =
-        float2(SCOPE_LENS_CENTER_X, SCOPE_LENS_CENTER_Y);
-    const float projectedRadius = max(
-        0.5f * (length(float2(SCOPE_LENS_BASIS_XX, SCOPE_LENS_BASIS_XY)) +
-                length(float2(SCOPE_LENS_BASIS_ZX, SCOPE_LENS_BASIS_ZY))),
-        1.0f);
-    const bool publishedCenterValid =
-        BUFFER_WIDTH > 0.0f &&
-        BUFFER_HEIGHT > 0.0f &&
-        all(publishedCenterPixels >= 0.0f) &&
-        publishedCenterPixels.x <= BUFFER_WIDTH &&
-        publishedCenterPixels.y <= BUFFER_HEIGHT &&
-        SCOPE_LENS_RADIUS_X > 0.0f &&
-        SCOPE_LENS_RADIUS_Y > 0.0f &&
-        abs(localApex.w) > 0.000001f;
-    if (publishedCenterValid) {
-        const float2 localApexPixels = float2(
-            (localApex.x / localApex.w * 0.5f + 0.5f) * BUFFER_WIDTH,
-            (0.5f - localApex.y / localApex.w * 0.5f) * BUFFER_HEIGHT);
-        // Fail closed. A publication that is stale by a frame or measured
-        // against different geometry would drag the shared apex off the
-        // optical axis and leave a seam at the inner ring instead of at the
-        // wedge boundaries, which is worse than the faceting it replaces.
-        // Below a quarter radius the two agree to within quantization.
-        if (length(publishedCenterPixels - localApexPixels) <=
-            0.25f * projectedRadius) {
-            const float2 publishedNdc = float2(
-                2.0f * publishedCenterPixels.x / BUFFER_WIDTH - 1.0f,
-                1.0f - 2.0f * publishedCenterPixels.y / BUFFER_HEIGHT);
-            center.position = float4(
-                publishedNdc * localApex.w,
-                localApex.z,
-                localApex.w);
-        }
-    }
+    center.position = 2.0f * input[1].position - input[0].position;
     AppendTriangle(
         stream,
         center,

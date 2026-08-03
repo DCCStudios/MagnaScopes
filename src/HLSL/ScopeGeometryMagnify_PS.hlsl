@@ -480,14 +480,16 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
         1.0f - axialEyeRelief * axialBreathing,
         0.96f,
         1.04f);
-    // The magnified image sits toward the front of the tube rather than at the
-    // rear glass, so it subtends a smaller angle than the aperture and a ring
-    // of tube wall shows around it. That empty space is the optical depth cue,
-    // and it is what the exit pupil slides across as the eye leaves the axis.
-    // Zero keeps the historical behaviour of an image that fills the aperture.
-    const float imageDiscRadius =
-        axialPupilScale *
-        lerp(1.0f, 0.45f, saturate(ScopeTubeDepth));
+    // The lit disc is the full aperture, scaled only by axial eye relief.
+    //
+    // Tube depth must not shrink it. A small bright circle ringed by black is
+    // what an optic looks like when the eye is at the wrong distance, not when
+    // the image sits deep in the tube: with the eye correctly placed, a
+    // recessed image still fills the ocular. Driving the radius from tube depth
+    // made that porthole permanent and independent of where the eye actually
+    // was. Depth belongs in the parallax term below, which is what makes the
+    // image slide against the housing and opens the crescent off-axis.
+    const float imageDiscRadius = axialPupilScale;
     // Optical-tube parallax.
     //
     // Recessing the image disc alone only makes it smaller; it stays centred on

@@ -214,7 +214,7 @@ ReticleCompositeOutput main(VertexPosHTex input)
         physicalEyeTravelValid || saturate(ScopeTubeDepth) > 0.0f,
         SCOPE_EYEBOX_RADIUS,
         clamp(ScopeShadowDepth, 0.0f, 4.0f),
-        axialPupilScale * lerp(1.0f, 0.45f, saturate(ScopeTubeDepth)),
+        axialPupilScale,
         SCOPE_VIGNETTE_REACH,
         SCOPE_VIGNETTE_SHARPNESS);
     const float pupilShadow = 1.0f - shadow.visibility;

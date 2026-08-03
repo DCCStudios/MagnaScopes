@@ -962,7 +962,6 @@ struct SavedState
 	// lens center from b4, so its constant buffers must be preserved too or
 	// that binding survives into whatever geometry shader Fallout runs next.
 	ID3D11GeometryShader* pGS;
-	ID3D11Buffer* pGSCBuffers[MAX_CB_SLOTS];
 
 	// PS Stage
 	ID3D11PixelShader* pPS;
@@ -1101,7 +1100,6 @@ namespace Hook
 		pContext->VSGetSamplers(0, MAX_SAMPLER_SLOTS, state.pVSSamplers);
 		// GS Stage
 		pContext->GSGetShader(&state.pGS, nullptr, nullptr);
-		pContext->GSGetConstantBuffers(0, MAX_CB_SLOTS, state.pGSCBuffers);
 		// PS Stage
 		pContext->PSGetShader(&state.pPS, nullptr, nullptr);
 		pContext->PSGetConstantBuffers(0, MAX_CB_SLOTS, state.pPSCBuffers);
@@ -1136,7 +1134,6 @@ namespace Hook
 		pContext->VSSetSamplers(0, MAX_SAMPLER_SLOTS, state.pVSSamplers);
 		// GS Stage
 		pContext->GSSetShader(state.pGS, nullptr, 0);
-		pContext->GSSetConstantBuffers(0, MAX_CB_SLOTS, state.pGSCBuffers);
 		// PS Stage
 		pContext->PSSetShader(state.pPS, nullptr, 0);
 		pContext->PSSetConstantBuffers(0, MAX_CB_SLOTS, state.pPSCBuffers);
@@ -1163,7 +1160,6 @@ namespace Hook
 		SAFE_RELEASE_ARRAY(state.pVSSRVs, MAX_SRV_SLOTS);
 		SAFE_RELEASE_ARRAY(state.pVSSamplers, MAX_SAMPLER_SLOTS);
 		SAFE_RELEASE(state.pGS);
-		SAFE_RELEASE_ARRAY(state.pGSCBuffers, MAX_CB_SLOTS);
 		SAFE_RELEASE(state.pPS);
 		SAFE_RELEASE_ARRAY(state.pPSCBuffers, MAX_CB_SLOTS);
 		SAFE_RELEASE_ARRAY(state.pPSSRVs, MAX_SRV_SLOTS);
@@ -2356,13 +2352,6 @@ namespace Hook
 		if (scopeEffectBuffer) {
 			g_Context->PSSetConstantBuffers(5, 1, &scopeEffectBuffer);
 		}
-		// ScopeFade is an annulus, so the fill geometry shader fabricates the
-		// missing center. Doing that per primitive from quantized ring vertices
-		// gave 24 slightly different apexes and therefore 24 slightly different
-		// screen-to-lens mappings, which is the radial faceting visible at the
-		// center under magnification. b4 carries the published lens center that
-		// lets every wedge converge on one apex.
-		g_Context->GSSetConstantBuffers(4, 1, &resolutionBuffer);
 
 		bSelfDraw = true;
 		g_Context->DrawIndexed(

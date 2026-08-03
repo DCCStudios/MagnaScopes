@@ -358,33 +358,17 @@ def main() -> int:
         "a failed TAA replay cannot fall back to Present",
     )
 
-    # ScopeFade is an annulus, so the fill geometry shader fabricates the
-    # missing center. Fabricating it per primitive from quantized ring vertices
-    # produced 24 slightly different apexes, all labelled lens coordinate zero,
-    # which gave each wedge its own screen-to-lens mapping and showed as radial
-    # faceting once the pixel shader magnified the center. The published lens
-    # center makes every wedge converge on one apex, so the geometry shader must
-    # keep reading b4 and the replay must keep binding it there.
+    # The fabricated center apex is 2*inner - outer because that is the exact
+    # screen point each wedge's own affine map sends to lens (0, 0). It gives
+    # the fan the same projective frame as the annulus, so the shared edge at
+    # radius 0.5 is continuous. Any other apex, including a game-thread lens
+    # center, splits the frame and shows as a faceted circle partway out.
     require(
-        "#include \"Triangle.hlsli\"" in geometry_fill_shader
-        and "SCOPE_LENS_CENTER_X" in geometry_fill_shader
-        and "publishedCenterValid" in geometry_fill_shader
-        and "0.25f * projectedRadius" in geometry_fill_shader
-        and "g_Context->GSSetConstantBuffers(4, 1, &resolutionBuffer);"
-        in hooking,
-        "the ScopeFade center fan must share one published apex",
-    )
-
-    # Binding b4 to the geometry stage leaks into whatever geometry shader
-    # Fallout runs next unless the saved state carries it back.
-    require(
-        "ID3D11Buffer* pGSCBuffers[MAX_CB_SLOTS];" in hooking
-        and "pContext->GSGetConstantBuffers(0, MAX_CB_SLOTS, state.pGSCBuffers);"
-        in hooking
-        and "pContext->GSSetConstantBuffers(0, MAX_CB_SLOTS, state.pGSCBuffers);"
-        in hooking
-        and "SAFE_RELEASE_ARRAY(state.pGSCBuffers, MAX_CB_SLOTS);" in hooking,
-        "geometry-stage constant buffers must be saved and restored",
+        "center.position = 2.0f * input[1].position - input[0].position;"
+        in geometry_fill_shader
+        and "SCOPE_LENS_CENTER_X" not in geometry_fill_shader
+        and "GSSetConstantBuffers(4" not in hooking,
+        "the center fan apex must keep the annulus projective frame",
     )
 
     # The WARP harnesses resolve Compile/Shaders from the working directory.
