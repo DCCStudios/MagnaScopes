@@ -83,8 +83,13 @@ namespace
 		float reticleParallaxStrength = 1.0F;
 		float lensCenterX = 0.0F;
 		float lensCenterY = 0.0F;
+
+		float lensOffsetX = 0.0F;
+		float lensOffsetY = 0.0F;
+		float lensScale = 1.0F;
+		float lensUnused = 0.0F;
 	};
-	static_assert(sizeof(ResolutionConstants) == 160);
+	static_assert(sizeof(ResolutionConstants) == 176);
 
 	void Check(HRESULT result, std::string_view operation)
 	{

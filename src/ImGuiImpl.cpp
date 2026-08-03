@@ -149,7 +149,10 @@ namespace ImGuiImpl
 		float imageStillness,
 		float axialBreathing,
 		float recenterSpeed,
-		float tubeDepth)
+		float tubeDepth,
+		float lensOffsetX,
+		float lensOffsetY,
+		float lensScale)
 	{
 		std::scoped_lock lock(editorPreviewMutex);
 		editorPreview.zoomOverride = zoomOverride;
@@ -209,6 +212,12 @@ namespace ImGuiImpl
 			std::clamp(recenterSpeed, 0.1F, 10.0F);
 		editorPreview.tubeDepth =
 			std::clamp(tubeDepth, 0.0F, 1.0F);
+		editorPreview.lensOffsetX =
+			std::clamp(lensOffsetX, -1.0F, 1.0F);
+		editorPreview.lensOffsetY =
+			std::clamp(lensOffsetY, -1.0F, 1.0F);
+		editorPreview.lensScale =
+			std::clamp(lensScale, 0.25F, 2.0F);
 		editorPreview.active = true;
 	}
 
@@ -453,6 +462,18 @@ namespace ImGuiImpl
 				std::isfinite(data->shaderData.parallax.recenterSpeed) ?
 					std::clamp(data->shaderData.parallax.recenterSpeed, 0.1F, 10.0F) :
 					1.0F;
+			ins->lensOffset_UI[0] =
+				std::isfinite(data->shaderData.lensOffset[0]) ?
+					std::clamp(data->shaderData.lensOffset[0], -1.0F, 1.0F) :
+					0.0F;
+			ins->lensOffset_UI[1] =
+				std::isfinite(data->shaderData.lensOffset[1]) ?
+					std::clamp(data->shaderData.lensOffset[1], -1.0F, 1.0F) :
+					0.0F;
+			ins->lensScale_UI =
+				std::isfinite(data->shaderData.lensScale) ?
+					std::clamp(data->shaderData.lensScale, 0.25F, 2.0F) :
+					1.0F;
 			ins->shadowDepth_UI =
 				std::isfinite(data->shaderData.parallax.shadowDepth) ?
 					std::clamp(data->shaderData.parallax.shadowDepth, 0.0F, 4.0F) :
@@ -570,6 +591,12 @@ namespace ImGuiImpl
 				std::clamp(recenterSpeed_UI, 0.1F, 10.0F);
 			editedProfile.shaderData.parallax.tubeDepth =
 				std::clamp(tubeDepth_UI, 0.0F, 1.0F);
+			editedProfile.shaderData.lensOffset[0] =
+				std::clamp(lensOffset_UI[0], -1.0F, 1.0F);
+			editedProfile.shaderData.lensOffset[1] =
+				std::clamp(lensOffset_UI[1], -1.0F, 1.0F);
+			editedProfile.shaderData.lensScale =
+				std::clamp(lensScale_UI, 0.25F, 2.0F);
 			editedProfile.shaderData.bBoltDisable = bDisableWhileBolt;
 			editedProfile.shaderData.nvIntensity = nvIntensity_UI;
 			editedProfile.shaderData.fovAdjust = fovBase_UI;
@@ -818,6 +845,37 @@ namespace ImGuiImpl
 				"Previews live while aiming in edit mode.");
 			ImGui::DragFloat("Max Scroll Magnification", &maxZoom_UI, 0.01F, 1.0F, 15.0F, "%.2fx");
 			Tip("Upper limit for the mouse wheel zoom while aiming.");
+
+			ImGui::Spacing();
+
+			ImGui::DragFloat(
+				"Lens Size",
+				&lensScale_UI,
+				0.005F,
+				0.25F,
+				2.0F,
+				"%.3f");
+			Tip("Diameter of the sight picture, as a fraction of the scope's\n"
+				"own glass. 1 fills it. Below 1 leaves a ring of tube wall\n"
+				"around the image; above 1 pushes the image past the glass so\n"
+				"the housing crops it and no ring is visible.\n"
+				"For automatic STS scopes this is the control that resizes the\n"
+				"magnified area -- Circle Size under the legacy overlay does\n"
+				"nothing here, because the scope's own geometry is the lens.");
+			ImGui::DragFloat2(
+				"Lens Center",
+				lensOffset_UI,
+				0.002F,
+				-1.0F,
+				1.0F,
+				"%.3f");
+			Tip("Moves the sight picture inside the housing, in units of the\n"
+				"scope's own radius, along the scope's axes -- so it stays put\n"
+				"when the weapon rolls. Use this when the magnified circle sits\n"
+				"off-center in the scope model. Positive X is right, positive Y\n"
+				"is up as the optic is oriented. This moves the magnified image,\n"
+				"its shadow, and the exit pupil together; the reticle keeps its\n"
+				"own Reticle Offset.");
 
 			ImGui::Spacing();
 
@@ -1215,7 +1273,10 @@ namespace ImGuiImpl
 			instance->imageStillness_UI,
 			instance->axialBreathing_UI,
 			instance->recenterSpeed_UI,
-			instance->tubeDepth_UI);
+			instance->tubeDepth_UI,
+			instance->lensOffset_UI[0],
+			instance->lensOffset_UI[1],
+			instance->lensScale_UI);
 
 		ImGui::PopItemWidth();
 	}

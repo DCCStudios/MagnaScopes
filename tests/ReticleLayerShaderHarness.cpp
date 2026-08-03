@@ -76,8 +76,13 @@ namespace
 		float reticleParallaxStrength = 1.0F;
 		float lensCenterX = 64.5F;
 		float lensCenterY = 64.5F;
+
+		float lensOffsetX = 0.0F;
+		float lensOffsetY = 0.0F;
+		float lensScale = 1.0F;
+		float lensUnused = 0.0F;
 	};
-	static_assert(sizeof(ResolutionConstants) == 160U);
+	static_assert(sizeof(ResolutionConstants) == 176U);
 
 	struct PixelMetrics
 	{

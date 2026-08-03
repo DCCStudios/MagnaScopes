@@ -371,6 +371,35 @@ def main() -> int:
         "the center fan apex must keep the annulus projective frame",
     )
 
+    # Lens Center and Lens Size are the geometry-path replacements for the
+    # legacy Circle Size / Circle Position controls, which drive the old overlay
+    # only and are inert on automatic STS profiles because the scope's own mesh
+    # is the lens. Each has to survive the whole path -- profile, JSON, editor
+    # preview, game-thread publish, constant buffer, both shaders -- or it
+    # becomes another dead slider.
+    require(
+        "float lensOffset[2]" in data_h
+        and "float lensScale = 1.0F;" in data_h
+        and '"LensOffset"' in data_cpp
+        and '"LensScale"' in data_cpp
+        and "scopeLensOffsetX" in hooking_h
+        and "scopeLensScale" in hooking_h
+        and "resolution.lensOffsetX" in hooking
+        and "resolution.lensScale" in hooking
+        and "Hook::D3D::scopeLensScale.store(" in main_cpp
+        and "editorPreview.lensScale" in main_cpp
+        and "SCOPE_LENS_OFFSET_X" in triangle_shader
+        and "SCOPE_LENS_SCALE" in triangle_shader
+        # The offset moves the magnification pivot, not just the mask. The
+        # pivot is the fixed point of the zoom, so shifting the mask alone
+        # would crop an image still magnified about the old centre.
+        and "publishedLensBasisX * SCOPE_LENS_OFFSET_X" in shader
+        and "stableShadowCoordinates -= lensUserOffset;" in shader
+        and "SCOPE_LENS_SCALE" in shader
+        and "SCOPE_LENS_SCALE" in reticle_shader,
+        "Lens Center or Lens Size is not wired through to the optics",
+    )
+
     # The WARP harnesses resolve Compile/Shaders from the working directory.
     # Starting them in build/tests let a stale shader tree shadow the freshly
     # built one and report failures that do not exist in the real output.
@@ -549,10 +578,19 @@ def main() -> int:
         and "const bool shadowFrameValid =" in shader
         and "publishedFrameMatchesGeometry" not in shader
         and "float2 eyeTravelLens =" in shader
-        and "physicalEyeTravel * publishedRadius" in shader
         and "const float2 numeratorAtEye =" not in shader
-        and "(shadowCenterPixels - opticalAxisPixels) / publishedRadius"
-        in shader
+        # Every offset must additionally reach that frame through the basis
+        # inverse, not a plain radius division. Dividing leaves a display-space
+        # vector, and adding one to an optic-local coordinate mixes frames: the
+        # local frame rotates with the weapon while the display term does not,
+        # so the pupil and recessed image spin around the lens as the camera
+        # pans. Both shaders share one helper so this cannot regress in only
+        # one of them.
+        and "ScopeShadowInvertLensBasis(" in shader
+        and "/ publishedRadius" not in shader
+        and "/ projectedRadius" not in reticle_shader
+        and shader.count("ScopeShadowInvertLensBasis(") >= 3
+        and "ScopeShadowInvertLensBasis(" in reticle_shader
         and "SCOPE_SCENE_PARALLAX_STRENGTH" in shader
         and (
             "physicalEyeTravel /" in shader
@@ -623,7 +661,7 @@ def main() -> int:
         # keeps the two layers' pupils on top of each other.
         and "float2 eyeTravelLens =" in shader
         and "numeratorAtEye / reciprocalWAtEye" not in shader
-        and "eyeTravelPixels.x * shadowBasisZ.y" in shader
+        and "physicalEyeTravel * publishedRadius," in shader
         # Eye travel now carries the optical-tube parallax term. A
         # recessed image disc that stays concentric with the aperture
         # only looks smaller; it still tracks the housing one-for-one.
@@ -1017,8 +1055,12 @@ def main() -> int:
         # pixel-radius coordinate disagreed with the scene layer whenever the
         # optic was foreshortened or rolled, so the reticle stayed lit inside
         # a crescent the scene had already darkened.
-        and "const float2 shadowLensCoordinates = lensCoordinates;"
+        # It is displaced by the authored Lens Center so the reticle passes
+        # behind the same crescent the scene shows, while keeping its own
+        # independent Reticle Offset for alignment.
+        and "const float2 shadowLensCoordinates =\n        lensCoordinates -"
         in reticle_shader
+        and "SCOPE_LENS_OFFSET_X" in reticle_shader
         and "const float2 screenLensCoordinates =" not in reticle_shader
         and "const bool physicalEyeTravelValid =" in reticle_shader
         and "if (physicalEyeTravelValid)" in reticle_shader

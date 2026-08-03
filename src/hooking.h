@@ -130,9 +130,19 @@ namespace Hook
 			float reticleParallaxStrength = 1.0F;
 			float lensCenterX = 0.0F;
 			float lensCenterY = 0.0F;
+
+			// User placement of the optical assembly inside the authored
+			// housing, in aperture radii along the optic's own X/Z axes, plus
+			// a multiplier for the lit-image radius. MagnaScope owns this
+			// buffer's creation, so the row is appended rather than stolen
+			// from an existing field.
+			float lensOffsetX = 0.0F;
+			float lensOffsetY = 0.0F;
+			float lensScale = 1.0F;
+			float lensUnused = 0.0F;
 		};
 		static_assert(
-			sizeof(ConstBufferData) == 160,
+			sizeof(ConstBufferData) == 176,
 			"ScopeFade constant buffer must match Triangle.hlsli");
 
 	public:
@@ -548,6 +558,13 @@ namespace Hook
 		static std::atomic<float> scopeRecenterSpeed;
 		static std::atomic<float> scopeApertureScaleRatio;
 		static std::atomic<float> scopeTubeDepth;
+		// Where the sight picture sits inside the authored housing, and how
+		// large it is. STS publishes the ScopeFade mesh's own centre and
+		// radius, which need not be where a given scope model wants the
+		// optical image.
+		static std::atomic<float> scopeLensOffsetX;
+		static std::atomic<float> scopeLensOffsetY;
+		static std::atomic<float> scopeLensScale;
 		static std::atomic_bool isEnableRender;
 		static bool frameworkRenderAnchor;
 		static std::atomic<float> projectedLensX;

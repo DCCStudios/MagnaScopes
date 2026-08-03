@@ -113,6 +113,16 @@ namespace ScopeData
 		float reticleShadowStrength = 0.0F;
 		float reticleParallaxStrength = 1.0F;
 
+		// Placement and size of the sight picture inside the authored housing,
+		// for the geometry-replay path. See Through Scopes publishes where its
+		// ScopeFade mesh sits, which is not always where a given scope model
+		// wants the optical image; the legacy Size/PositionOffset fields above
+		// drive the old overlay path only and do nothing here. The offset is in
+		// aperture radii along the optic's own X/Z axes so it rolls with the
+		// weapon.
+		float lensOffset[2] = { 0.0F, 0.0F };
+		float lensScale = 1.0F;
+
 		float fovAdjust = 0;
 		Parallax parallax;
 	};

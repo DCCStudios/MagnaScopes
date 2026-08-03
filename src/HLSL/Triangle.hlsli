@@ -60,6 +60,16 @@ cbuffer ResolutionConstantData : register(b4){
 	float SCOPE_RETICLE_PARALLAX_STRENGTH;
 	float SCOPE_LENS_CENTER_X;
 	float SCOPE_LENS_CENTER_Y;
+
+	// User placement of the optical assembly inside the authored housing.
+	// STS publishes where the ScopeFade mesh is, which is not always where the
+	// sight picture should sit in a given scope model. The offset is in
+	// aperture radii along the optic's own X/Z axes, so it rolls with the
+	// weapon; the scale multiplies the lit-image radius.
+	float SCOPE_LENS_OFFSET_X;
+	float SCOPE_LENS_OFFSET_Y;
+	float SCOPE_LENS_SCALE;
+	float SCOPE_LENS_UNUSED;
 };
 
 cbuffer ScopeEffectData : register(b5)

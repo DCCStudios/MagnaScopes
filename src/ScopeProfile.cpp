@@ -144,6 +144,8 @@ namespace ScopeData
 			j.value("ReticleShadowStrength", 0.0F);
 		s.reticleParallaxStrength =
 			j.value("ReticleParallaxStrength", 1.0F);
+		ReadFloatArray(j, "LensOffset", s.lensOffset, { "x", "y" });
+		s.lensScale = j.value("LensScale", 1.0F);
 		s.fovAdjust = j.value("fovAdjust", 0.0F);
 		s.parallax = j.value("Parallax", Parallax());
 	}
@@ -243,6 +245,8 @@ namespace ScopeData
 			{ "ReticleMagnification", s.reticleMagnification },
 			{ "ReticleShadowStrength", s.reticleShadowStrength },
 			{ "ReticleParallaxStrength", s.reticleParallaxStrength },
+			{ "LensOffset", { { "x", s.lensOffset[0] }, { "y", s.lensOffset[1] } } },
+			{ "LensScale", s.lensScale },
 			{ "fovAdjust", s.fovAdjust },
 			//
 			{ "Parallax", s.parallax }
@@ -785,6 +789,12 @@ namespace ScopeData
 		profile->shaderData.reticleMagnification = 1.0F;
 		profile->shaderData.reticleShadowStrength = 0.0F;
 		profile->shaderData.reticleParallaxStrength = 1.0F;
+		// Neutral placement: the sight picture starts exactly on the ScopeFade
+		// aperture STS authored, which is correct for most optics and is the
+		// only sane starting point for a per-scope adjustment.
+		profile->shaderData.lensOffset[0] = 0.0F;
+		profile->shaderData.lensOffset[1] = 0.0F;
+		profile->shaderData.lensScale = 1.0F;
 		const float diameter = std::clamp(defaultDiameter, 64.0F, 2160.0F);
 		profile->shaderData.Size[0] = diameter;
 		profile->shaderData.Size[1] = diameter;

@@ -1969,6 +1969,21 @@ namespace Hook
 			resolution.aimCenterY =
 				projection.aimCenterY * projectionScaleY;
 		}
+		// Bounded so a malformed profile can shift the sight picture off the
+		// aperture or collapse it, but never place it outside the housing
+		// entirely or shrink it to a pinhole.
+		resolution.lensOffsetX = std::clamp(
+			scopeLensOffsetX.load(std::memory_order_acquire),
+			-1.0F,
+			1.0F);
+		resolution.lensOffsetY = std::clamp(
+			scopeLensOffsetY.load(std::memory_order_acquire),
+			-1.0F,
+			1.0F);
+		resolution.lensScale = std::clamp(
+			scopeLensScale.load(std::memory_order_acquire),
+			0.25F,
+			2.0F);
 		resolution.imageDenoise = std::clamp(
 			scopeImageDenoise.load(std::memory_order_acquire),
 			0.0F,
@@ -6681,6 +6696,9 @@ namespace Hook
 	std::atomic<float> D3D::scopeRecenterSpeed{ 1.0F };
 	std::atomic<float> D3D::scopeApertureScaleRatio{ 1.0F };
 	std::atomic<float> D3D::scopeTubeDepth{ 0.0F };
+	std::atomic<float> D3D::scopeLensOffsetX{ 0.0F };
+	std::atomic<float> D3D::scopeLensOffsetY{ 0.0F };
+	std::atomic<float> D3D::scopeLensScale{ 1.0F };
 	bool D3D::bLegacyMode;
 
 	std::once_flag D3D::flagOnce;

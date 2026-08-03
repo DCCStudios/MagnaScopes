@@ -69,6 +69,34 @@ float2 ScopeShadowSoftLimitVector(float2 value, float limit)
     return value * (ScopeShadowSoftLimit(magnitude, limit) / magnitude);
 }
 
+// Maps a display-space pixel vector into optic-local lens units through the
+// game thread's published aperture basis.
+//
+// Every quantity handed to EvaluateScopeShadow must live in the same frame.
+// The lens coordinate is basis-inverted, so it rotates and foreshortens with
+// the optic; a display-space offset added to it does not, and the mismatch
+// makes the pupil and recessed image appear to spin around the lens as the
+// camera pans. Both shaders route every offset through this one function so
+// that class of bug cannot reappear in only one of them.
+//
+// The basis already carries the aperture's pixel scale, so the result is
+// normalized to aperture radii without a separate radius division.
+float2 ScopeShadowInvertLensBasis(
+    float2 displayPixels,
+    float2 basisX,
+    float2 basisZ,
+    float basisDeterminant)
+{
+    if (abs(basisDeterminant) <= 0.0001f) {
+        return float2(0.0f, 0.0f);
+    }
+    return float2(
+        (displayPixels.x * basisZ.y - displayPixels.y * basisZ.x) /
+            basisDeterminant,
+        (-displayPixels.x * basisX.y + displayPixels.y * basisX.x) /
+            basisDeterminant);
+}
+
 // Normalized [0, 1] forms of the authored 0..20 editor ranges.
 float ScopeShadowVignetteReach(float authoredReach)
 {

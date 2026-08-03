@@ -909,7 +909,11 @@ def main() -> int:
         in prepare_scope_source
         and "projection.aimCenterY - projection.centerY"
         in prepare_scope_source
-        and "sizeof(ConstBufferData) == 160" in hooking_h
+        # MagnaScope owns this buffer's creation, so the Lens Center/Lens Size
+        # row was appended rather than stolen from an existing field. The size
+        # is still pinned: the shader-side layout and both WARP harness mirrors
+        # have to move with it or the wrong floats reach the optics.
+        and "sizeof(ConstBufferData) == 176" in hooking_h
         and "SCOPE_AIM_OFFSET_VALID" in triangle_shader
         and "SCOPE_IMAGE_DENOISE" in triangle_shader
         and "SCOPE_IMAGE_SHARPEN" in triangle_shader

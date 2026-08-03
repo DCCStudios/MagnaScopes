@@ -2143,6 +2143,15 @@ void HookedUpdate()
 				Hook::D3D::scopeTubeDepth.store(
 					editorPreview.tubeDepth,
 					std::memory_order_release);
+				Hook::D3D::scopeLensOffsetX.store(
+					editorPreview.lensOffsetX,
+					std::memory_order_release);
+				Hook::D3D::scopeLensOffsetY.store(
+					editorPreview.lensOffsetY,
+					std::memory_order_release);
+				Hook::D3D::scopeLensScale.store(
+					editorPreview.lensScale,
+					std::memory_order_release);
 				editorPreviewApplied = true;
 			} else {
 				if (editorPreviewApplied) {
@@ -2307,6 +2316,24 @@ void HookedUpdate()
 						currentData->shaderData.parallax.tubeDepth,
 						0.0F,
 						1.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeLensOffsetX.store(
+					std::clamp(
+						currentData->shaderData.lensOffset[0],
+						-1.0F,
+						1.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeLensOffsetY.store(
+					std::clamp(
+						currentData->shaderData.lensOffset[1],
+						-1.0F,
+						1.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeLensScale.store(
+					std::clamp(
+						currentData->shaderData.lensScale,
+						0.25F,
+						2.0F),
 					std::memory_order_release);
 			}
 

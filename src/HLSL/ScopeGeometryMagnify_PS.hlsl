@@ -187,6 +187,15 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // scene-parallax control could never actually hold the image still.
     const float imageStillness = saturate(ScopeImageStillness);
     float2 aperturePivotPixels = currentAimPixels;
+    // Lens Center moves the whole optical assembly, not just its mask. The
+    // pivot is the fixed point of the magnification, so placing it at the
+    // authored lens centre is what actually re-centres the sight picture --
+    // moving the mask alone would only crop an image still zoomed about the
+    // old point. The optic-local offset returns to pixels through the published
+    // basis, the same rotation the mask coordinate is expressed in.
+    aperturePivotPixels +=
+        publishedLensBasisX * SCOPE_LENS_OFFSET_X +
+        publishedLensBasisZ * SCOPE_LENS_OFFSET_Y;
     if (physicalEyeTravelValid && imageStillness > 0.0f) {
         const float2 apertureMotionPixels =
             float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y) *
@@ -489,18 +498,23 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
         1.0f);
     const float2 shadowCenterPixels =
         float2(SCOPE_LENS_CENTER_X, SCOPE_LENS_CENTER_Y);
+    // Where the sight picture sits inside the housing. STS publishes where its
+    // ScopeFade mesh is, which is not always where a given scope model wants
+    // the optical image, so this is authored per scope. It is in aperture radii
+    // along the optic's own axes, which is why it is subtracted from the
+    // optic-local coordinate rather than from screen pixels: it then rolls and
+    // foreshortens with the lens instead of sliding across it.
+    const float2 lensUserOffset =
+        float2(SCOPE_LENS_OFFSET_X, SCOPE_LENS_OFFSET_Y);
     float2 stableShadowCoordinates = normalizedLensPosition;
     if (shadowFrameValid) {
-        const float2 shadowDisplacement =
-            input.position.xy - shadowCenterPixels;
-        stableShadowCoordinates = float2(
-            (shadowDisplacement.x * shadowBasisZ.y -
-             shadowDisplacement.y * shadowBasisZ.x) /
-                shadowBasisDeterminant,
-            (-shadowDisplacement.x * shadowBasisX.y +
-             shadowDisplacement.y * shadowBasisX.x) /
-                shadowBasisDeterminant);
+        stableShadowCoordinates = ScopeShadowInvertLensBasis(
+            input.position.xy - shadowCenterPixels,
+            shadowBasisX,
+            shadowBasisZ,
+            shadowBasisDeterminant);
     }
+    stableShadowCoordinates -= lensUserOffset;
     // Display-X/Y travel becomes optic-local travel through the published basis
     // inverse. This used to run through the derivative frame, which made the
     // mask's offset differ from wedge to wedge -- the same faceting the
@@ -509,17 +523,13 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // shift their pupil by the same amount by construction.
     float2 eyeTravelLens = float2(0.0f, 0.0f);
     if (physicalEyeTravelValid) {
-        const float2 eyeTravelPixels =
-            physicalEyeTravel * publishedRadius;
         eyeTravelLens =
             shadowFrameValid ?
-                float2(
-                    (eyeTravelPixels.x * shadowBasisZ.y -
-                     eyeTravelPixels.y * shadowBasisZ.x) /
-                        shadowBasisDeterminant,
-                    (-eyeTravelPixels.x * shadowBasisX.y +
-                     eyeTravelPixels.y * shadowBasisX.x) /
-                        shadowBasisDeterminant) :
+                ScopeShadowInvertLensBasis(
+                    physicalEyeTravel * publishedRadius,
+                    shadowBasisX,
+                    shadowBasisZ,
+                    shadowBasisDeterminant) :
                 physicalEyeTravel;
     }
     // Positive relief moved the eyepiece farther away, so the lit disc
@@ -536,8 +546,15 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // fabricated centre fan, where it picked up the fan's coordinate seam and
     // came out visibly faceted. The floor is 0.6 rather than 0.45 so a fully
     // recessed image still reads as a sight picture and not a porthole.
+    //
+    // Lens Size then scales the result, which is the direct control over how
+    // much of the scope's glass the sight picture fills. Above 1 the disc
+    // exceeds the aperture and the drawn geometry crops it, so no tube ring is
+    // visible at all -- that is the intended way to disable the ring.
     const float imageDiscRadius =
-        axialPupilScale * lerp(1.0f, 0.6f, saturate(ScopeTubeDepth));
+        axialPupilScale *
+        lerp(1.0f, 0.6f, saturate(ScopeTubeDepth)) *
+        clamp(SCOPE_LENS_SCALE, 0.25f, 2.0f);
     // Optical-tube parallax.
     //
     // Two circles at different depths separate when the eye leaves the optical
@@ -557,9 +574,18 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // Measured in the published frame for the same reason as everything else
     // here: the solved centre and radius are triangle-local, so driving the
     // disc's offset from them gave each wedge its own recessed circle.
+    //
+    // It also has to go through the basis inverse rather than a plain division
+    // by the radius. Dividing gives a display-space vector, and adding that to
+    // optic-local eye travel mixes two frames: as the weapon rolls, the local
+    // frame turns under a term that does not, so the recessed image appeared to
+    // rotate around the lens whenever the camera panned.
     const float2 opticalAxisPixels = 0.5f * ScreenSize;
-    const float2 axisOffsetLens =
-        (shadowCenterPixels - opticalAxisPixels) / publishedRadius;
+    const float2 axisOffsetLens = ScopeShadowInvertLensBasis(
+        shadowCenterPixels - opticalAxisPixels,
+        shadowBasisX,
+        shadowBasisZ,
+        shadowBasisDeterminant);
     const float2 tubeParallaxLens =
         -(axisOffsetLens + eyeTravelLens) * saturate(ScopeTubeDepth);
 

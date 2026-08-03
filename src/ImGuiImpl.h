@@ -219,6 +219,9 @@ namespace ImGuiImpl
 		float axialBreathing = 0.0F;
 		float recenterSpeed = 1.0F;
 		float tubeDepth = 0.0F;
+		float lensOffsetX = 0.0F;
+		float lensOffsetY = 0.0F;
+		float lensScale = 1.0F;
 		bool active = false;
 	};
 
@@ -280,7 +283,10 @@ namespace ImGuiImpl
 		float imageStillness,
 		float axialBreathing,
 		float recenterSpeed,
-		float tubeDepth);
+		float tubeDepth,
+		float lensOffsetX,
+		float lensOffsetY,
+		float lensScale);
 	[[nodiscard]] EditorPreviewSnapshot GetEditorPreviewSnapshot();
 	void ClearEditorPreview();
 	void RequestProfileAction(ProfileRequest request);
@@ -338,6 +344,8 @@ namespace ImGuiImpl
 		float axialBreathing_UI = 0.0F;
 		float recenterSpeed_UI = 1.0F;
 		float tubeDepth_UI = 0.0F;
+		float lensOffset_UI[2] = { 0.0F, 0.0F };
+		float lensScale_UI = 1.0F;
 		std::uint64_t selectionRevision_UI = 0;
 
 		bool bEnableFG;
