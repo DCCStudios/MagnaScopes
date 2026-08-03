@@ -61,12 +61,20 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
             0.0f;
     const float sceneDepth = clamp(ScopeSceneDepth, 0.0f, 4.0f);
     const float shadowDepth = clamp(ScopeShadowDepth, 0.0f, 4.0f);
+    // Fore/aft breathing is its own control. It used to be driven by
+    // ScopeSceneDepth, which also scales lateral parallax, so raising lateral
+    // parallax unavoidably made the image appear to move closer and farther.
+    // Worse, the underlying eye-relief signal was measured along the aperture's
+    // own local normal, and that frame rotates with the weapon, so lateral
+    // weapon swing during a yaw leaked into the axial term: panning left and
+    // right read as depth. Default zero keeps apparent size fixed.
+    const float axialBreathing = clamp(ScopeAxialBreathing, 0.0f, 4.0f);
     // Positive relief means the eyepiece moved farther from the camera. Its
     // apparent optical image and exit pupil therefore contract; moving closer
     // expands them. Clamp both responses so a malformed pose cannot flash a
     // full-screen sample or close the pupil into a black disk.
     const float axialSceneScale = clamp(
-        1.0f - axialEyeRelief * sceneDepth,
+        1.0f - axialEyeRelief * axialBreathing,
         0.92f,
         1.08f);
     const float opticalMagnification = max(
@@ -164,9 +172,48 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
              length(unitZPixel - centerPixels)),
         1.0f);
     const float2 currentCenterUv = centerPixels * PixelSize;
-    const float2 samplePivotUv = currentAimPixels * PixelSize;
+
+    // Optical tube depth. The authored aperture is the near end of a tube and
+    // the magnified image sits far behind it, so when the housing sways the
+    // image should not travel with it one-for-one. The game thread publishes
+    // how far the aperture has moved from its settled screen position, in
+    // aperture radii; declining to follow that fraction of the motion is what
+    // reads as depth.
+    //
+    // This has to scale the sample pivot, not the sample delta. A pivot shift
+    // of d changes the sampled point by d * (1 - 1/M), while a delta shift
+    // changes it by d / M. Only the pivot form cancels the aperture's own
+    // motion identically at every magnification, which is why the existing
+    // scene-parallax control could never actually hold the image still.
+    const float imageStillness = saturate(ScopeImageStillness);
+    float2 aperturePivotPixels = currentAimPixels;
+    if (physicalEyeTravelValid && imageStillness > 0.0f) {
+        const float2 apertureMotionPixels =
+            float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y) *
+            saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
+            currentProjectedRadius;
+        // Published travel is the eye's displacement, which is the negation of
+        // the optic's screen motion. Adding it therefore removes the aperture's
+        // excursion from the pivot and leaves the image where it settled.
+        aperturePivotPixels += apertureMotionPixels * imageStillness;
+    }
+    const float2 samplePivotUv = aperturePivotPixels * PixelSize;
+
+    // Apparent-size stillness. Fore/aft motion barely moves the aperture's
+    // centre but swings its projected radius by well over ten percent, so the
+    // housing visibly looms while the image behind it stayed locked. If the
+    // aperture grew by ratio r, dividing the sampled extent by r holds the
+    // image world-static: extent = R / (M * r) = R_settled / M, independent of
+    // how large the housing has become.
+    const float apertureScaleRatio =
+        ScopeApertureScaleRatio > 0.01f ?
+            clamp(ScopeApertureScaleRatio, 0.25f, 4.0f) :
+            1.0f;
+    const float sampleMagnification =
+        opticalMagnification *
+        lerp(1.0f, apertureScaleRatio, imageStillness);
     float2 sampleDelta =
-        (screenUv - samplePivotUv) / opticalMagnification;
+        (screenUv - samplePivotUv) / max(sampleMagnification, 0.0001f);
     const float radialPosition =
         saturate(length(normalizedLensPosition));
     const float fishEyeAmount =
@@ -430,16 +477,41 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // contracts slightly. The bound keeps ordinary breathing subtle and stops
     // a malformed pose from closing the pupil into a black spot.
     const float axialPupilScale = clamp(
-        1.0f - axialEyeRelief * shadowDepth,
+        1.0f - axialEyeRelief * axialBreathing,
         0.96f,
         1.04f);
+    // The magnified image sits toward the front of the tube rather than at the
+    // rear glass, so it subtends a smaller angle than the aperture and a ring
+    // of tube wall shows around it. That empty space is the optical depth cue,
+    // and it is what the exit pupil slides across as the eye leaves the axis.
+    // Zero keeps the historical behaviour of an image that fills the aperture.
+    const float imageDiscRadius =
+        axialPupilScale *
+        lerp(1.0f, 0.45f, saturate(ScopeTubeDepth));
+    // Optical-tube parallax.
+    //
+    // Recessing the image disc alone only makes it smaller; it stays centred on
+    // the aperture and therefore still tracks the housing exactly. Two circles
+    // at different depths separate only when the eye leaves the optical axis --
+    // and here the eye is the camera, so the axis is screen centre. However far
+    // the aperture sits from screen centre is how far off-axis the shooter is
+    // looking, and the recessed disc shifts the opposite way in proportion to
+    // how deep in the tube it sits. That is what stops the magnified image from
+    // moving one-for-one with the rear glass, and it needs no temporal filter:
+    // it is a property of where the optic currently is, not of how it got there.
+    const float2 opticalAxisPixels = 0.5f * ScreenSize;
+    const float2 axisOffsetLens =
+        (centerPixels - opticalAxisPixels) / currentProjectedRadius;
+    const float2 tubeParallaxLens =
+        -axisOffsetLens * saturate(ScopeTubeDepth);
+
     const ScopeShadowLayers shadow = EvaluateScopeShadow(
         stableShadowCoordinates,
-        eyeTravelLens,
-        physicalEyeTravelValid,
+        eyeTravelLens + tubeParallaxLens,
+        physicalEyeTravelValid || saturate(ScopeTubeDepth) > 0.0f,
         SCOPE_EYEBOX_RADIUS,
         shadowDepth,
-        axialPupilScale,
+        imageDiscRadius,
         SCOPE_VIGNETTE_REACH,
         SCOPE_VIGNETTE_SHARPNESS);
 

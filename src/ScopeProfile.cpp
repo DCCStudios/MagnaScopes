@@ -88,6 +88,10 @@ namespace ScopeData
 		p.maxTravel = j.value("maxTravel", 0.0F);
 		p.sceneDepth = j.value("sceneDepth", 1.0F);
 		p.shadowDepth = j.value("shadowDepth", 1.0F);
+		p.imageStillness = j.value("imageStillness", 0.0F);
+		p.axialBreathing = j.value("axialBreathing", 0.0F);
+		p.recenterSpeed = j.value("recenterSpeed", 1.0F);
+		p.tubeDepth = j.value("tubeDepth", 0.0F);
 	}
 
 	void from_json(const json& j, ZoomDataOverwrite& z)
@@ -187,7 +191,11 @@ namespace ScopeData
 			{ "scopeSwayAmount", p.scopeSwayAmount },
 			{ "maxTravel", p.maxTravel },
 			{ "sceneDepth", p.sceneDepth },
-			{ "shadowDepth", p.shadowDepth }
+			{ "shadowDepth", p.shadowDepth },
+			{ "imageStillness", p.imageStillness },
+			{ "axialBreathing", p.axialBreathing },
+			{ "recenterSpeed", p.recenterSpeed },
+			{ "tubeDepth", p.tubeDepth }
 		};
 	}
 
@@ -791,6 +799,12 @@ namespace ScopeData
 		profile->shaderData.parallax.maxTravel = 4.0F;
 		profile->shaderData.parallax.sceneDepth = 1.0F;
 		profile->shaderData.parallax.shadowDepth = 1.0F;
+		// A new optic reads as a tube by default: the image holds most of its
+		// position while the housing sways, and apparent size stays fixed.
+		profile->shaderData.parallax.imageStillness = 0.65F;
+		profile->shaderData.parallax.axialBreathing = 0.0F;
+		profile->shaderData.parallax.recenterSpeed = 1.0F;
+		profile->shaderData.parallax.tubeDepth = 0.35F;
 
 		// New automatic profiles begin from the weapon's authored sighted zoom
 		// and camera offsets. Lens magnification remains neutral at 1x until the

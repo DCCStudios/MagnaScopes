@@ -2334,9 +2334,22 @@ namespace Hook
 		ID3D11SamplerState* sampler = mScopeFadeSampler.Get();
 		ID3D11Buffer* resolutionBuffer =
 			mScopeFadeResolutionBuffer.Get();
+		// b5 carries every depth and separation control the magnify shader
+		// reads: ScopeSceneDepth, ScopeShadowDepth, ScopeImageStillness,
+		// ScopeAxialBreathing, and ScopeApertureScaleRatio. Only b4 was bound
+		// here, so the shader sampled whatever the game happened to leave in
+		// slot 5. Shadow depth reading as zero collapsed the exit-pupil
+		// displacement to nothing, which is why no eye-box setting could ever
+		// produce a crescent, and the same omission silently disabled scene
+		// parallax and image stillness. The WARP harnesses bind b5 explicitly,
+		// so they could not catch it.
+		ID3D11Buffer* scopeEffectBuffer = m_pScopeEffectBuffer.Get();
 		g_Context->PSSetShaderResources(4, 1, &source);
 		g_Context->PSSetSamplers(0, 1, &sampler);
 		g_Context->PSSetConstantBuffers(4, 1, &resolutionBuffer);
+		if (scopeEffectBuffer) {
+			g_Context->PSSetConstantBuffers(5, 1, &scopeEffectBuffer);
+		}
 
 		bSelfDraw = true;
 		g_Context->DrawIndexed(
@@ -3132,9 +3145,17 @@ namespace Hook
 		ID3D11SamplerState* sampler = mScopeFadeSampler.Get();
 		ID3D11Buffer* resolutionBuffer =
 			mScopeFadeResolutionBuffer.Get();
+		// The reticle layer reads ScopeSceneDepth and ScopeShadowDepth from b5
+		// to follow the optical image and match the scene's exit pupil. Without
+		// this binding it tracked a zero depth and could never share the scene
+		// shader's shadow.
+		ID3D11Buffer* scopeEffectBuffer = m_pScopeEffectBuffer.Get();
 		g_Context->PSSetShaderResources(4U, 2U, layerSources);
 		g_Context->PSSetSamplers(0U, 1U, &sampler);
 		g_Context->PSSetConstantBuffers(4U, 1U, &resolutionBuffer);
+		if (scopeEffectBuffer) {
+			g_Context->PSSetConstantBuffers(5U, 1U, &scopeEffectBuffer);
+		}
 		bSelfDraw = true;
 		g_Context->DrawIndexed(3U, 0U, 0);
 		bSelfDraw = false;
@@ -3563,6 +3584,24 @@ namespace Hook
 				scopeShadowDepth.load(std::memory_order_acquire),
 				0.0F,
 				4.0F)
+		};
+		scopeData.scopeDepthSeparation = {
+			std::clamp(
+				scopeImageStillness.load(std::memory_order_acquire),
+				0.0F,
+				1.0F),
+			std::clamp(
+				scopeAxialBreathing.load(std::memory_order_acquire),
+				0.0F,
+				4.0F),
+			std::clamp(
+				scopeApertureScaleRatio.load(std::memory_order_acquire),
+				0.25F,
+				4.0F),
+			std::clamp(
+				scopeTubeDepth.load(std::memory_order_acquire),
+				0.0F,
+				1.0F)
 		};
 #pragma endregion
 
@@ -6635,6 +6674,11 @@ namespace Hook
 	std::atomic<float> D3D::scopeOpticalLagStrength{ 1.0F };
 	std::atomic<float> D3D::scopeSceneDepth{ 1.0F };
 	std::atomic<float> D3D::scopeShadowDepth{ 1.0F };
+	std::atomic<float> D3D::scopeImageStillness{ 0.0F };
+	std::atomic<float> D3D::scopeAxialBreathing{ 0.0F };
+	std::atomic<float> D3D::scopeRecenterSpeed{ 1.0F };
+	std::atomic<float> D3D::scopeApertureScaleRatio{ 1.0F };
+	std::atomic<float> D3D::scopeTubeDepth{ 0.0F };
 	bool D3D::bLegacyMode;
 
 	std::once_flag D3D::flagOnce;

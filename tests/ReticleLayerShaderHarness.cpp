@@ -339,7 +339,7 @@ Output main(uint vertexId : SV_VertexID)
 			// The production reticle layer reads the lens and shadow depth
 			// separation from ScopeEffectData at b5. Bind a valid fixture buffer
 			// rather than relying on undefined state from an unbound slot.
-			std::array<float, 88> scopeEffectConstants{};
+			std::array<float, 92> scopeEffectConstants{};
 			scopeEffectConstants[86] = 1.0F;
 			scopeEffectConstants[87] = 1.0F;
 			D3D11_BUFFER_DESC scopeEffectDescription{};

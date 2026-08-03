@@ -200,13 +200,21 @@ ReticleCompositeOutput main(VertexPosHTex input)
                 clamp(ScopeShadowDepth, 0.0f, 4.0f),
         0.96f,
         1.04f);
+    // Same optical-tube parallax the scene replay applies, so the reticle is
+    // occluded by the identical recessed disc rather than a concentric one.
+    const float2 opticalAxisPixels =
+        0.5f * float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+    const float2 tubeParallaxLocal =
+        -((lensCenterPixel - opticalAxisPixels) / projectedRadius) *
+        saturate(ScopeTubeDepth);
+
     const ScopeShadowLayers shadow = EvaluateScopeShadow(
         shadowLensCoordinates,
-        eyeTravelLocal,
-        physicalEyeTravelValid,
+        eyeTravelLocal + tubeParallaxLocal,
+        physicalEyeTravelValid || saturate(ScopeTubeDepth) > 0.0f,
         SCOPE_EYEBOX_RADIUS,
         clamp(ScopeShadowDepth, 0.0f, 4.0f),
-        axialPupilScale,
+        axialPupilScale * lerp(1.0f, 0.45f, saturate(ScopeTubeDepth)),
         SCOPE_VIGNETTE_REACH,
         SCOPE_VIGNETTE_SHARPNESS);
     const float pupilShadow = 1.0f - shadow.visibility;

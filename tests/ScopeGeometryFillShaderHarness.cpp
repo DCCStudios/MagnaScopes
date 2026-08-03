@@ -818,7 +818,7 @@ Output main(Input input)
 	// shader for the configurable lens and shadow depth separation.  Keep the
 	// harness bound exactly like the live compositor so the shader never reads
 	// an unbound cbuffer during WARP validation.
-	std::array<float, 88> scopeEffectConstants{};
+	std::array<float, 92> scopeEffectConstants{};
 	scopeEffectConstants[86] = 1.0F;
 	scopeEffectConstants[87] = 1.0F;
 	D3D11_BUFFER_DESC scopeEffectDescription{};

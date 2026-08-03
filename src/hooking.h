@@ -188,9 +188,16 @@ namespace Hook
 			float FishEyeStrength = 0;
 			float FishEyePower = 2;
 			XMFLOAT2 scopeDepth = { 1.0F, 1.0F };
+
+			// X is how much of the aperture's screen motion the magnified image
+			// declines to follow (0 locked, 1 world-static). Y is fore/aft
+			// apparent-size breathing, deliberately independent of scopeDepth.x
+			// so lateral parallax can be tuned without camera yaw reading as
+			// depth. Z and W pad the block to the 16-byte cbuffer granularity.
+			XMFLOAT4 scopeDepthSeparation = { 0.0F, 0.0F, 0.0F, 0.0F };
 		};
 		static_assert(
-			sizeof(ScopeEffectShaderData) == 352,
+			sizeof(ScopeEffectShaderData) == 368,
 			"ScopeEffectData must match Triangle.hlsli");
 
 		struct GameConstBuffer
@@ -264,6 +271,14 @@ namespace Hook
 			float lensBasisZX = 0.0F;
 			float lensBasisZY = 0.0F;
 			float blend = 0.0F;
+			// Diagnostic only: magnitude of this frame's aperture screen
+			// excursion, so a log line shows how much of the published travel
+			// came from the optic actually moving.
+			float apertureExcursion = 0.0F;
+			// Current projected aperture radius over its settled radius.
+			float apertureScaleRatio = 1.0F;
+			// Diagnostic only: foreshortening-robust projected radius.
+			float apertureProjectedRadius = 0.0F;
 			bool valid = false;
 		};
 
@@ -525,6 +540,14 @@ namespace Hook
 		static std::atomic<float> scopeOpticalLagStrength;
 		static std::atomic<float> scopeSceneDepth;
 		static std::atomic<float> scopeShadowDepth;
+		// Fraction of the aperture's screen motion the magnified image
+		// declines to follow, fore/aft apparent-size breathing, and how
+		// quickly the optic settles back to centre.
+		static std::atomic<float> scopeImageStillness;
+		static std::atomic<float> scopeAxialBreathing;
+		static std::atomic<float> scopeRecenterSpeed;
+		static std::atomic<float> scopeApertureScaleRatio;
+		static std::atomic<float> scopeTubeDepth;
 		static std::atomic_bool isEnableRender;
 		static bool frameworkRenderAnchor;
 		static std::atomic<float> projectedLensX;

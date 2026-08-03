@@ -215,6 +215,10 @@ namespace ImGuiImpl
 		float opticalLagStrength = 1.0F;
 		float sceneDepth = 1.0F;
 		float shadowDepth = 1.0F;
+		float imageStillness = 0.0F;
+		float axialBreathing = 0.0F;
+		float recenterSpeed = 1.0F;
+		float tubeDepth = 0.0F;
 		bool active = false;
 	};
 
@@ -272,7 +276,11 @@ namespace ImGuiImpl
 		float reticleShadowStrength,
 		float reticleParallaxStrength,
 		float sceneDepth,
-		float shadowDepth);
+		float shadowDepth,
+		float imageStillness,
+		float axialBreathing,
+		float recenterSpeed,
+		float tubeDepth);
 	[[nodiscard]] EditorPreviewSnapshot GetEditorPreviewSnapshot();
 	void ClearEditorPreview();
 	void RequestProfileAction(ProfileRequest request);
@@ -326,6 +334,10 @@ namespace ImGuiImpl
 		float opticalLagStrength_UI = 1.0F;
 		float sceneDepth_UI = 1.0F;
 		float shadowDepth_UI = 1.0F;
+		float imageStillness_UI = 0.0F;
+		float axialBreathing_UI = 0.0F;
+		float recenterSpeed_UI = 1.0F;
+		float tubeDepth_UI = 0.0F;
 		std::uint64_t selectionRevision_UI = 0;
 
 		bool bEnableFG;

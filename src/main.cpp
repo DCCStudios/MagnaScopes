@@ -321,6 +321,15 @@ struct AutomaticSTSEyeBoxTrackingState
 	RE::NiMatrix3 previousCameraRotation{};
 	float angularLagX{ 0.0F };
 	float angularLagY{ 0.0F };
+	// Settled screen position of the aperture itself. The camera-versus-optic
+	// residual above is near zero in Fallout because the weapon is rigidly
+	// parented to the camera in ADS, so it cannot drive the optics on its own.
+	// What the player actually sees move is the aperture, and its excursion
+	// from this settled position is the usable optical-motion signal.
+	float smoothedApertureRadius{ 0.0F };
+	float smoothedApertureScreenX{ 0.0F };
+	float smoothedApertureScreenY{ 0.0F };
+	bool apertureScreenReady{ false };
 	bool baselineReady{ false };
 	bool hasLastValidSample{ false };
 	bool hasSmoothedOffset{ false };
@@ -430,6 +439,43 @@ bool IsFinitePoint(const RE::NiPoint3& point)
 	       std::isfinite(point.z);
 }
 
+// Names which guard rejected the physical eye-box sample. Zero means the
+// sample was produced normally. Every consumer of eye travel -- the
+// exit-pupil crescent, image stillness, and axial breathing -- reads the
+// same published value, so one rejected sample disables all three at once.
+std::atomic<int> g_eyeBoxBailReason{ -1 };
+
+// Optical smoothing needs a real elapsed time. UI::uiTimer is the menu timer
+// and does not advance during ordinary gameplay, so every response alpha
+// derived from it evaluated to exactly zero:
+//
+//   smoothed += (target - smoothed) * CalculateResponseAlpha(0, tau)   // * 0
+//
+// The smoothed eye-box output could therefore never leave its initial centred
+// value. Published travel was permanently (0, 0) while the sample still
+// reported valid, which silently disabled the exit-pupil crescent, image
+// stillness, and axial response at once without tripping any guard.
+//
+// Measure the frame interval directly. The bound is the same one the tracker
+// already applied, so a long stall, a load screen, or a paused game cannot
+// deliver a single huge step to the filters.
+[[nodiscard]] float AcquireOpticalFrameDelta() noexcept
+{
+	using clock = std::chrono::steady_clock;
+	static clock::time_point previous{};
+	static bool hasPrevious = false;
+	const auto now = clock::now();
+	if (!hasPrevious) {
+		previous = now;
+		hasPrevious = true;
+		return 0.0F;
+	}
+	const float seconds =
+		std::chrono::duration<float>(now - previous).count();
+	previous = now;
+	return std::isfinite(seconds) ? std::clamp(seconds, 0.0F, 0.05F) : 0.0F;
+}
+
 Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 	const void* profileIdentity,
 	RE::NiAVObject* aperture,
@@ -443,7 +489,8 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 {
 	Hook::D3D::PhysicalEyeBoxSample result{};
 	auto& state = automaticSTSEyeBoxTracking;
-	const auto lastValidOrCentered = [&]() {
+	const auto lastValidOrCentered = [&](int reason) {
+		g_eyeBoxBailReason.store(reason, std::memory_order_relaxed);
 		if (state.apertureIdentity == aperture &&
 			state.profileIdentity == profileIdentity &&
 			state.hasLastValidSample) {
@@ -456,7 +503,7 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		!std::isfinite(apertureWorldRadius) ||
 		apertureWorldRadius <= 0.001F ||
 		!std::isfinite(aperture->world.scale)) {
-		return lastValidOrCentered();
+		return lastValidOrCentered(1);
 	}
 
 	if (state.apertureIdentity != aperture ||
@@ -499,13 +546,13 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 	if (!std::isfinite(worldScale) ||
 		worldScale <= 0.0001F ||
 		worldScale >= 10000.0F) {
-		return lastValidOrCentered();
+		return lastValidOrCentered(2);
 	}
 	const float localRadius = apertureWorldRadius / worldScale;
 	if (!std::isfinite(localRadius) ||
 		localRadius <= 0.001F ||
 		localRadius >= 100000.0F) {
-		return lastValidOrCentered();
+		return lastValidOrCentered(3);
 	}
 
 	// STS ScopeFade's standardized 48-vertex annulus lies in local X/Z. Build
@@ -518,7 +565,7 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		inverseAperture * apertureWorldCenter;
 	if (!IsFinitePoint(apertureLocalCenter) ||
 		!IsFinitePoint(apertureScreenCenter)) {
-		return lastValidOrCentered();
+		return lastValidOrCentered(4);
 	}
 	const RE::NiPoint3 xAxisWorld =
 		aperture->world *
@@ -532,7 +579,7 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		hookIns->WorldPointToScreen(camera, zAxisWorld, firstPersonFov);
 	if (!IsFinitePoint(xAxisScreen) || !IsFinitePoint(zAxisScreen) ||
 		xAxisScreen.z <= 0.001F || zAxisScreen.z <= 0.001F) {
-		return lastValidOrCentered();
+		return lastValidOrCentered(5);
 	}
 
 	const float basisXX = xAxisScreen.x - apertureScreenCenter.x;
@@ -544,15 +591,33 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 	const float zBasisLength =
 		std::sqrt(basisZX * basisZX + basisZY * basisZY);
 	const float averageBasisLength = 0.5F * (xBasisLength + zBasisLength);
+	// A circular aperture projects to an ellipse, so its true projected radius
+	// is the major semi-axis; the minor one is pure foreshortening. Runtime
+	// telemetry showed |basisX| collapsing from 452 to 141 pixels and even
+	// changing sign while |basisZ| held at 460 on an optic whose apparent size
+	// was barely moving. Averaging the two turned that into a 35% swing in the
+	// normalizing denominator, which drowned the fore/aft apparent-size signal
+	// and injected spurious lateral travel. The maximum is stable under the
+	// same foreshortening.
+	const float apertureProjectedRadius =
+		std::max(xBasisLength, zBasisLength);
 	if (!std::isfinite(xBasisLength) || !std::isfinite(zBasisLength) ||
 		!std::isfinite(averageBasisLength) ||
 		xBasisLength <= 0.01F || zBasisLength <= 0.01F ||
 		xBasisLength > 100000.0F || zBasisLength > 100000.0F) {
-		return lastValidOrCentered();
+		return lastValidOrCentered(6);
 	}
 
 	const float boundedDeltaSeconds =
 		std::clamp(deltaSeconds, 0.0F, 0.05F);
+	// How quickly the optic returns to its settled state. Higher is faster.
+	// Every response below divides its time constant by this, so one control
+	// governs pupil recentering, image recentering, and angular-lag decay
+	// together rather than leaving them as three fixed constants.
+	const float recenterSpeed = std::clamp(
+		Hook::D3D::scopeRecenterSpeed.load(std::memory_order_acquire),
+		0.1F,
+		10.0F);
 	// ScopeFade lies in local X/Z, making local Y its authored optical normal.
 	// Measure the camera against that plane in ScopeFade-local coordinates.
 	// Unlike camera-view Z, this distance cannot change merely because the
@@ -566,7 +631,7 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 	if (!IsFinitePoint(cameraApertureLocal) ||
 		!std::isfinite(currentEyeReliefDistance) ||
 		currentEyeReliefDistance <= 0.001F) {
-		return lastValidOrCentered();
+		return lastValidOrCentered(7);
 	}
 	if (!state.baselineReady || activationProgress <= 0.001F) {
 		// Start exactly centered. A stationary optic must never inherit a
@@ -585,7 +650,7 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		const float followerBlend =
 			MagnaScope::EyeBoxRecentering::CalculateResponseAlpha(
 				boundedDeltaSeconds,
-				kOpticalFollowerTimeConstant);
+				kOpticalFollowerTimeConstant / recenterSpeed);
 		state.baselineEyeLocalX +=
 			(cameraApertureLocal.x - state.baselineEyeLocalX) * followerBlend;
 		state.baselineEyeLocalZ +=
@@ -614,7 +679,7 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 			basisZY,
 			averageBasisLength);
 	if (!screenEyeOffset.valid) {
-		return lastValidOrCentered();
+		return lastValidOrCentered(8);
 	}
 	const float maximumTravel = std::clamp(
 		Hook::D3D::scopeEyeBoxMaxTravel.load(std::memory_order_acquire),
@@ -631,6 +696,21 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 	// or pitch. prev-current makes the pupil lag opposite the camera movement.
 	const RE::NiPoint3 currentCameraTranslation = camera->world.translate;
 	const RE::NiMatrix3 currentCameraRotation = camera->world.rotate;
+	// Capture fore/aft camera travel before the block below overwrites the
+	// previous pose. This is the only axial signal used; see the eye-relief
+	// note further down for why the aperture-local measurement cannot be.
+	float axialTravelAlongView = 0.0F;
+	if (state.previousCameraPoseReady && activationProgress > 0.001F) {
+		const RE::NiPoint3 viewForward =
+			currentCameraRotation.Transpose() *
+			RE::NiPoint3{ 0.0F, 0.0F, -1.0F };
+		const RE::NiPoint3 cameraStep =
+			currentCameraTranslation - state.previousCameraTranslation;
+		axialTravelAlongView =
+			cameraStep.x * viewForward.x +
+			cameraStep.y * viewForward.y +
+			cameraStep.z * viewForward.z;
+	}
 	if (!state.previousCameraPoseReady || activationProgress <= 0.001F) {
 		state.previousCameraTranslation = currentCameraTranslation;
 		state.previousCameraRotation = currentCameraRotation;
@@ -657,7 +737,8 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 
 		constexpr float kAngularLagDecaySeconds = 0.055F;
 		const float decay = std::exp(
-			-boundedDeltaSeconds / kAngularLagDecaySeconds);
+			-boundedDeltaSeconds *
+			recenterSpeed / kAngularLagDecaySeconds);
 		state.angularLagX *= decay;
 		state.angularLagY *= decay;
 		if (IsFinitePoint(previousForwardScreen) &&
@@ -693,12 +774,92 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		state.previousCameraRotation = currentCameraRotation;
 	}
 
-	float normalizedX = screenEyeOffset.x + state.angularLagX;
-	float normalizedY = screenEyeOffset.y + state.angularLagY;
-	const auto axialEyeRelief =
+	// Follow the aperture's own projected screen position and keep the
+	// excursion from it. Recoil, sway, and weapon lag during a fast pan all
+	// move the optic by hundreds of pixels, which is the motion the optics are
+	// meant to respond to; the camera-relative residual alone measured only a
+	// few percent of an aperture radius and was far too small to see.
+	float apertureExcursionX = 0.0F;
+	float apertureExcursionY = 0.0F;
+	float apertureScaleRatio = 1.0F;
+	if (!state.apertureScreenReady || activationProgress <= 0.001F) {
+		state.smoothedApertureScreenX = apertureScreenCenter.x;
+		state.smoothedApertureScreenY = apertureScreenCenter.y;
+		state.smoothedApertureRadius = apertureProjectedRadius;
+		state.apertureScreenReady = true;
+	} else {
+		constexpr float kApertureFollowerTimeConstant = 0.090F;
+		const float apertureBlend =
+			MagnaScope::EyeBoxRecentering::CalculateResponseAlpha(
+				boundedDeltaSeconds,
+				kApertureFollowerTimeConstant / recenterSpeed);
+		state.smoothedApertureScreenX +=
+			(apertureScreenCenter.x - state.smoothedApertureScreenX) *
+			apertureBlend;
+		state.smoothedApertureScreenY +=
+			(apertureScreenCenter.y - state.smoothedApertureScreenY) *
+			apertureBlend;
+		// Negated to match CalculateScreenEyeOffset's convention: the eye moves
+		// opposite the optic, so an aperture that swings right is an eye that
+		// has moved left of the optical axis.
+		apertureExcursionX =
+			-(apertureScreenCenter.x - state.smoothedApertureScreenX) /
+			apertureProjectedRadius;
+		apertureExcursionY =
+			-(apertureScreenCenter.y - state.smoothedApertureScreenY) /
+			apertureProjectedRadius;
+		if (!std::isfinite(apertureExcursionX) ||
+			!std::isfinite(apertureExcursionY)) {
+			apertureExcursionX = 0.0F;
+			apertureExcursionY = 0.0F;
+		}
+
+		// Apparent-size change dominates fore/aft motion: walking toward a
+		// target swings the projected radius by well over ten percent while the
+		// centre barely moves. Holding the image still against that needs the
+		// ratio, not the excursion.
+		state.smoothedApertureRadius +=
+			(apertureProjectedRadius - state.smoothedApertureRadius) *
+			apertureBlend;
+		if (state.smoothedApertureRadius > 0.01F) {
+			apertureScaleRatio =
+				apertureProjectedRadius / state.smoothedApertureRadius;
+		}
+		if (!std::isfinite(apertureScaleRatio)) {
+			apertureScaleRatio = 1.0F;
+		}
+		apertureScaleRatio = std::clamp(apertureScaleRatio, 0.25F, 4.0F);
+	}
+
+	float normalizedX =
+		screenEyeOffset.x + state.angularLagX + apertureExcursionX;
+	float normalizedY =
+		screenEyeOffset.y + state.angularLagY + apertureExcursionY;
+	// Fore/aft eye motion is measured against the settled eye-to-aperture
+	// distance, but that distance is taken along the aperture's own local
+	// normal, and the aperture's frame rotates with the weapon. During a yaw
+	// the weapon lags the camera slightly, so part of that lateral swing
+	// projects onto the local normal and a pure left/right pan reported real
+	// fore/aft motion -- panning read as the image moving closer and farther.
+	//
+	// Reject that by keeping only the component the camera actually
+	// translated along its own view axis. A rotation moves the camera's
+	// position very little, so yaw and pitch contribute almost nothing, while
+	// walking forward or backward is captured in full.
+	auto axialEyeRelief =
 		MagnaScope::EyeBoxRecentering::CalculateAxialEyeRelief(
 			currentEyeReliefDistance,
 			state.baselineEyeReliefDistance);
+	if (axialEyeRelief.valid &&
+		std::isfinite(axialTravelAlongView) &&
+		currentEyeReliefDistance > 0.001F) {
+		// Moving forward closes the eye-to-optic gap, so a positive travel
+		// along the view axis is a negative relief delta.
+		axialEyeRelief.normalizedDelta = std::clamp(
+			-axialTravelAlongView / currentEyeReliefDistance,
+			-0.10F,
+			0.10F);
+	}
 	// Axial relief is optional. A malformed or temporarily unavailable depth
 	// sample must not discard valid lateral X/Y travel, because that invalidates
 	// the complete physical-eye-box sample and disables the stationary rim.
@@ -707,7 +868,7 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 	if (!std::isfinite(normalizedX) ||
 		!std::isfinite(normalizedY) ||
 		!std::isfinite(normalizedRelief)) {
-		return lastValidOrCentered();
+		return lastValidOrCentered(9);
 	}
 	// A sharp but finite drag remains a valid optical sample. Clamp the
 	// published pupil travel instead of invalidating it, which formerly made
@@ -728,7 +889,7 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 	const float responseAlpha =
 		MagnaScope::EyeBoxRecentering::CalculateResponseAlpha(
 			boundedDeltaSeconds,
-			0.010F);
+			0.010F / recenterSpeed);
 	if (!state.hasSmoothedOffset) {
 		state.smoothedNormalizedX = 0.0F;
 		state.smoothedNormalizedY = 0.0F;
@@ -754,6 +915,11 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		-maximumTravel,
 		maximumTravel);
 
+	result.apertureScaleRatio = apertureScaleRatio;
+	result.apertureProjectedRadius = apertureProjectedRadius;
+	result.apertureExcursion = std::sqrt(
+		apertureExcursionX * apertureExcursionX +
+		apertureExcursionY * apertureExcursionY);
 	result.eyeOffsetX = state.smoothedNormalizedX;
 	result.eyeOffsetY = state.smoothedNormalizedY;
 	result.eyeReliefDelta = state.smoothedNormalizedRelief;
@@ -763,6 +929,7 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 	result.lensBasisZY = basisZY;
 	result.blend = std::clamp(activationProgress, 0.0F, 1.0F);
 	result.valid = true;
+	g_eyeBoxBailReason.store(0, std::memory_order_relaxed);
 	state.lastValidSample = result;
 	state.hasLastValidSample = true;
 	return result;
@@ -1964,6 +2131,18 @@ void HookedUpdate()
 				Hook::D3D::scopeShadowDepth.store(
 					editorPreview.shadowDepth,
 					std::memory_order_release);
+				Hook::D3D::scopeImageStillness.store(
+					editorPreview.imageStillness,
+					std::memory_order_release);
+				Hook::D3D::scopeAxialBreathing.store(
+					editorPreview.axialBreathing,
+					std::memory_order_release);
+				Hook::D3D::scopeRecenterSpeed.store(
+					editorPreview.recenterSpeed,
+					std::memory_order_release);
+				Hook::D3D::scopeTubeDepth.store(
+					editorPreview.tubeDepth,
+					std::memory_order_release);
 				editorPreviewApplied = true;
 			} else {
 				if (editorPreviewApplied) {
@@ -2104,6 +2283,30 @@ void HookedUpdate()
 						currentData->shaderData.parallax.shadowDepth,
 						0.0F,
 						4.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeImageStillness.store(
+					std::clamp(
+						currentData->shaderData.parallax.imageStillness,
+						0.0F,
+						1.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeAxialBreathing.store(
+					std::clamp(
+						currentData->shaderData.parallax.axialBreathing,
+						0.0F,
+						4.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeRecenterSpeed.store(
+					std::clamp(
+						currentData->shaderData.parallax.recenterSpeed,
+						0.1F,
+						10.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeTubeDepth.store(
+					std::clamp(
+						currentData->shaderData.parallax.tubeDepth,
+						0.0F,
+						1.0F),
 					std::memory_order_release);
 			}
 
@@ -2263,6 +2466,10 @@ void HookedUpdate()
 									aimProjectionPoint,
 									firstPersonFov) :
 								tempOut;
+						// One measured interval per frame, shared by the aim
+						// transition and the eye-box filters.
+						const float opticalFrameDelta =
+							AcquireOpticalFrameDelta();
 						const float activationProgress =
 							UpdateAutomaticSTSTracking(
 								scopeNode,
@@ -2270,7 +2477,7 @@ void HookedUpdate()
 								Hook::D3D::
 									automaticSTSScopeFadeVisibleLastFrame.load(
 										std::memory_order_acquire),
-								uiTimer ? uiTimer->delta : 0.0F);
+								opticalFrameDelta);
 						const Hook::D3D::PhysicalEyeBoxSample physicalEyeBox =
 							UpdateAutomaticSTSEyeBoxTracking(
 								currentData,
@@ -2280,13 +2487,18 @@ void HookedUpdate()
 								scopeWorldRadius,
 								firstPersonFov,
 								activationProgress,
-								uiTimer ? uiTimer->delta : 0.0F,
+								opticalFrameDelta,
 								tempOut);
 						// Physical aperture and authored reticle centers must use the
 						// same current-frame projection as the ScopeFade geometry and
 						// lens basis. Smoothing either point against current geometry
 						// changes the clipping frame at extreme pitch. Optical inertia
 						// is already filtered independently by the eye-box tracker.
+						Hook::D3D::scopeApertureScaleRatio.store(
+							physicalEyeBox.valid ?
+								physicalEyeBox.apertureScaleRatio :
+								1.0F,
+							std::memory_order_release);
 						hookIns->PublishLensProjection(
 							tempOut.x,
 							tempOut.y,

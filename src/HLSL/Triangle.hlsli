@@ -120,6 +120,30 @@ cbuffer ScopeEffectData : register(b5)
 	float FishEyePower;
 	float ScopeSceneDepth;
 	float ScopeShadowDepth;
+
+	// How much of the aperture's own screen motion the magnified image
+	// declines to follow. 0 locks the image to the housing exactly as before;
+	// 1 leaves it world-static so the housing slides over a still image, which
+	// is what conveys a long optical tube. This scales the sample pivot rather
+	// than the sample delta, so the perceived stillness is identical at every
+	// magnification -- a delta-space shift cannot do that, because the pivot's
+	// own contribution carries a (1 - 1/M) factor the delta term does not.
+	float ScopeImageStillness;
+	// Fore/aft apparent-size breathing. Kept separate from ScopeSceneDepth so
+	// lateral parallax can be tuned without making the image appear to move
+	// closer and farther. Zero by default: camera yaw must never read as depth.
+	float ScopeAxialBreathing;
+	// Current projected aperture radius over its settled radius. Moving
+	// toward or away from a target changes the housing's apparent size far
+	// more than it changes its screen position, so this -- not the centre
+	// excursion -- is what image stillness has to compensate.
+	float ScopeApertureScaleRatio;
+	// How far the magnified image sits toward the front of the tube. 0 puts
+	// it at the rear aperture so it fills the glass. Higher values recess it,
+	// leaving a ring of tube wall between the aperture edge and the image
+	// disc -- the empty space that reads as optical depth and that the exit
+	// pupil then slides across as the eye moves off axis.
+	float ScopeTubeDepth;
 };
 
 

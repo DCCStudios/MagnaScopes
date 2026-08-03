@@ -194,6 +194,25 @@ def main() -> int:
         ),
         "exact ScopeFade draw is not captured and color-suppressed like MagnaScope",
     )
+    # Both optical passes must bind b5. Every depth and separation control the
+    # magnify shader reads lives there -- ScopeSceneDepth, ScopeShadowDepth,
+    # ScopeImageStillness, ScopeAxialBreathing, ScopeApertureScaleRatio -- and
+    # the reticle layer reads the first two to follow the image and share the
+    # exit pupil. Binding only b4 made the shaders sample whatever the game left
+    # in slot 5; shadow depth reading zero collapsed the pupil displacement, so
+    # no eye-box setting could produce a crescent. The WARP harnesses bind b5
+    # themselves and therefore cannot catch this, which is why it survived every
+    # green test run.
+    reticle_composite = function_body(
+        hooking,
+        "bool D3D::CompositeAutomaticSTSReticleLayer(",
+    )
+    require(
+        "PSSetConstantBuffers(5, 1, &scopeEffectBuffer)" in replay
+        and "PSSetConstantBuffers(5U, 1U, &scopeEffectBuffer)"
+        in reticle_composite,
+        "optical passes do not bind the b5 depth/separation constants",
+    )
     require(
         "PrepareScopeFadeSceneSource(" not in capture
         and "PSSetShader(" not in capture
@@ -364,7 +383,21 @@ def main() -> int:
         and "const float2 pixelsToUnitX" in shader
         and "const float2 pixelsToUnitZ" in shader
         and "const float2 currentAimPixels" in shader
-        and "const float2 samplePivotUv = currentAimPixels * PixelSize" in shader
+        # The sample pivot now declines a configurable fraction of the
+        # aperture's own screen motion, which is what makes the image read
+        # as sitting far behind the housing. Scaling the pivot rather than
+        # the delta is required: only the pivot form cancels that motion
+        # identically at every magnification.
+        and "const float imageStillness = saturate(ScopeImageStillness);"
+        in shader
+        and "aperturePivotPixels += apertureMotionPixels * imageStillness;"
+        in shader
+        and "const float2 samplePivotUv = aperturePivotPixels * PixelSize"
+        in shader
+        # Fore/aft breathing must stay independent of lateral parallax so
+        # camera yaw can never read as depth.
+        and "axialEyeRelief * axialBreathing" in shader
+        and "1.0f - axialEyeRelief * sceneDepth" not in shader
         and "const bool exactDrawFrameValid" in shader
         and "if (!exactDrawFrameValid)" in shader
         and "tBACKBUFFER.SampleLevel(gSamLinear, screenUv, 0.0f)" in shader
@@ -391,7 +424,11 @@ def main() -> int:
         and "A malformed or temporarily unavailable depth" in main_raw
         and "SCOPE_EYE_RELIEF_DELTA" in shader
         and "const float axialPupilScale" in shader
-        and "axialPupilScale," in shader
+        # The disc handed to the shadow contract is the recessed image
+        # plane, not the aperture itself: it sits toward the front of the
+        # tube so a ring of wall separates it from the rear glass.
+        and "const float imageDiscRadius =" in shader
+        and "imageDiscRadius," in shader
         # The resting rim is computed unconditionally inside the shared
         # contract, so losing physical eye telemetry can only remove the
         # moving crescent -- never the authored tube rim.
@@ -545,7 +582,15 @@ def main() -> int:
         # coordinates rather than through a CPU projection from another frame.
         and "float2 eyeTravelLens =" in shader
         and "numeratorAtEye / reciprocalWAtEye" in shader
-        and "eyeTravelLens," in shader,
+        # Eye travel now carries the optical-tube parallax term. A
+        # recessed image disc that stays concentric with the aperture
+        # only looks smaller; it still tracks the housing one-for-one.
+        # Two circles at different depths separate only when the eye is
+        # off the optical axis, and the eye is the camera, so the axis is
+        # screen centre.
+        and "eyeTravelLens + tubeParallaxLens," in shader
+        and "const float2 opticalAxisPixels = 0.5f * ScreenSize;" in shader
+        and "const float2 tubeParallaxLens =" in shader,
         "heading-independent camera-space eye-box inertia or pupil travel regressed",
     )
     # The reticle is a true second layer. The exact authored draw is redirected

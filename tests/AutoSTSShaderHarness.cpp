@@ -134,6 +134,9 @@ namespace
 		float fishEyeStrength{ 0.35F };
 		float fishEyePower{ 2.0F };
 		Float2 padding6{};
+		// Image stillness, axial breathing, and two reserved slots. Mirrors the
+		// depth-separation block appended to ScopeEffectData in Triangle.hlsli.
+		Float4 depthSeparation{};
 	};
 	static_assert(sizeof(ScopeEffectData) % 16 == 0);
 

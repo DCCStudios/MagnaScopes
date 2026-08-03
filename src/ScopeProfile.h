@@ -30,6 +30,18 @@ namespace ScopeData
 		// the exit-pupil shadow. Values above one exaggerate tube depth.
 		float sceneDepth = 1.0F;
 		float shadowDepth = 1.0F;
+		// Fraction of the aperture's own screen motion the magnified image
+		// declines to follow. 1 leaves the image world-static while the
+		// housing slides over it, which is what conveys tube depth.
+		float imageStillness = 0.0F;
+		// Fore/aft apparent-size breathing, independent of sceneDepth so
+		// lateral parallax cannot make the image read as moving closer.
+		float axialBreathing = 0.0F;
+		// Settling rate multiplier for pupil and image recentering.
+		float recenterSpeed = 1.0F;
+		// How far the magnified image is recessed toward the front of the
+		// tube, leaving a ring of shadow between it and the rear aperture.
+		float tubeDepth = 0.0F;
 	};
 
 	struct ZoomDataOverwrite

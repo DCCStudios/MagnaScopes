@@ -145,7 +145,11 @@ namespace ImGuiImpl
 		float reticleShadowStrength,
 		float reticleParallaxStrength,
 		float sceneDepth,
-		float shadowDepth)
+		float shadowDepth,
+		float imageStillness,
+		float axialBreathing,
+		float recenterSpeed,
+		float tubeDepth)
 	{
 		std::scoped_lock lock(editorPreviewMutex);
 		editorPreview.zoomOverride = zoomOverride;
@@ -197,6 +201,14 @@ namespace ImGuiImpl
 			std::clamp(sceneDepth, 0.0F, 4.0F);
 		editorPreview.shadowDepth =
 			std::clamp(shadowDepth, 0.0F, 4.0F);
+		editorPreview.imageStillness =
+			std::clamp(imageStillness, 0.0F, 1.0F);
+		editorPreview.axialBreathing =
+			std::clamp(axialBreathing, 0.0F, 4.0F);
+		editorPreview.recenterSpeed =
+			std::clamp(recenterSpeed, 0.1F, 10.0F);
+		editorPreview.tubeDepth =
+			std::clamp(tubeDepth, 0.0F, 1.0F);
 		editorPreview.active = true;
 	}
 
@@ -425,6 +437,22 @@ namespace ImGuiImpl
 				std::isfinite(data->shaderData.parallax.sceneDepth) ?
 					std::clamp(data->shaderData.parallax.sceneDepth, 0.0F, 4.0F) :
 					1.0F;
+			ins->imageStillness_UI =
+				std::isfinite(data->shaderData.parallax.imageStillness) ?
+					std::clamp(data->shaderData.parallax.imageStillness, 0.0F, 1.0F) :
+					0.0F;
+			ins->axialBreathing_UI =
+				std::isfinite(data->shaderData.parallax.axialBreathing) ?
+					std::clamp(data->shaderData.parallax.axialBreathing, 0.0F, 4.0F) :
+					0.0F;
+			ins->tubeDepth_UI =
+				std::isfinite(data->shaderData.parallax.tubeDepth) ?
+					std::clamp(data->shaderData.parallax.tubeDepth, 0.0F, 1.0F) :
+					0.0F;
+			ins->recenterSpeed_UI =
+				std::isfinite(data->shaderData.parallax.recenterSpeed) ?
+					std::clamp(data->shaderData.parallax.recenterSpeed, 0.1F, 10.0F) :
+					1.0F;
 			ins->shadowDepth_UI =
 				std::isfinite(data->shaderData.parallax.shadowDepth) ?
 					std::clamp(data->shaderData.parallax.shadowDepth, 0.0F, 4.0F) :
@@ -534,6 +562,14 @@ namespace ImGuiImpl
 				std::clamp(sceneDepth_UI, 0.0F, 4.0F);
 			editedProfile.shaderData.parallax.shadowDepth =
 				std::clamp(shadowDepth_UI, 0.0F, 4.0F);
+			editedProfile.shaderData.parallax.imageStillness =
+				std::clamp(imageStillness_UI, 0.0F, 1.0F);
+			editedProfile.shaderData.parallax.axialBreathing =
+				std::clamp(axialBreathing_UI, 0.0F, 4.0F);
+			editedProfile.shaderData.parallax.recenterSpeed =
+				std::clamp(recenterSpeed_UI, 0.1F, 10.0F);
+			editedProfile.shaderData.parallax.tubeDepth =
+				std::clamp(tubeDepth_UI, 0.0F, 1.0F);
 			editedProfile.shaderData.bBoltDisable = bDisableWhileBolt;
 			editedProfile.shaderData.nvIntensity = nvIntensity_UI;
 			editedProfile.shaderData.fovAdjust = fovBase_UI;
@@ -573,6 +609,12 @@ namespace ImGuiImpl
 		scopeData.parallax_scopeSwayAmount = scopeSwayAmount_UI;
 		scopeData.parallax_maxTravel = maxTravel_UI;
 		scopeData.scopeDepth = { sceneDepth_UI, shadowDepth_UI };
+		scopeData.scopeDepthSeparation = {
+			imageStillness_UI,
+			axialBreathing_UI,
+			1.0F,
+			tubeDepth_UI
+		};
 
 		scopeData.BaseWeaponPos = baseWeaponPos_UI;
 		scopeData.MovePercentage = MovePercentage_UI;
@@ -1009,6 +1051,53 @@ namespace ImGuiImpl
 			Tip("Scales transient weapon-motion response for both the exit-pupil\n"
 				"shadow and scene counter-shift. 0 disables motion lag, 1 uses\n"
 				"the measured movement, and higher values exaggerate it.");
+			ImGui::DragFloat(
+				"Image Stillness",
+				&imageStillness_UI,
+				0.01F,
+				0.0F,
+				1.0F,
+				"%.2f");
+			Tip("How much of the housing's own screen movement the magnified\n"
+				"image refuses to follow. 0 locks the image to the optic. 1 holds\n"
+				"it still while the housing slides over it, which is what makes\n"
+				"the scope read as a long tube with the image far behind it.\n"
+				"Unlike Scene Parallax Strength this behaves identically at every\n"
+				"magnification.");
+			ImGui::DragFloat(
+				"Axial Breathing",
+				&axialBreathing_UI,
+				0.01F,
+				0.0F,
+				4.0F,
+				"%.2f");
+			Tip("Apparent size change as you move toward or away from the target.\n"
+				"0 keeps apparent size fixed, which is usually what you want:\n"
+				"any value here makes walking forward and backward subtly zoom\n"
+				"the image. This is independent of Scene Depth Separation so\n"
+				"lateral parallax can be raised without adding depth wobble.");
+			ImGui::DragFloat(
+				"Tube Depth",
+				&tubeDepth_UI,
+				0.01F,
+				0.0F,
+				1.0F,
+				"%.2f");
+			Tip("Recesses the magnified image toward the front of the tube so a\n"
+				"ring of shadow separates it from the rear aperture. 0 fills the\n"
+				"glass; higher values open that gap and give the optic real\n"
+				"depth for the exit pupil to slide across.");
+			ImGui::DragFloat(
+				"Recenter Speed",
+				&recenterSpeed_UI,
+				0.01F,
+				0.1F,
+				10.0F,
+				"%.2f");
+			Tip("How quickly the shadow and image settle back to centre after\n"
+				"motion stops. 1 is the tuned default, lower is slower and more\n"
+				"floaty, higher snaps back sooner. Governs pupil recentering,\n"
+				"image recentering, and camera-rotation lag decay together.");
 		}
 	}
 
@@ -1122,7 +1211,11 @@ namespace ImGuiImpl
 			instance->reticleShadowStrength_UI,
 			instance->reticleParallaxStrength_UI,
 			instance->sceneDepth_UI,
-			instance->shadowDepth_UI);
+			instance->shadowDepth_UI,
+			instance->imageStillness_UI,
+			instance->axialBreathing_UI,
+			instance->recenterSpeed_UI,
+			instance->tubeDepth_UI);
 
 		ImGui::PopItemWidth();
 	}
