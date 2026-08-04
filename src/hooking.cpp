@@ -772,6 +772,44 @@ bool bResetZoomDelta = false;
 // this guard thread-local prevents an unrelated deferred/context thread from
 // accidentally bypassing capture while the immediate context is replaying.
 thread_local bool bSelfDraw = false;
+// Retained so Present can compare what we hooked against what is in the vtable
+// now. An upscaler proxy or another integration replacing the entry after us
+// silently removes our detour from the chain, and the only visible symptom is
+// a draw count far below the frame's real one.
+DWORD_PTR* g_deviceContextVTable = nullptr;
+void* g_hookedDrawIndexedTarget = nullptr;
+void* g_hookedDrawIndexedInstancedTarget = nullptr;
+
+// "module.dll+0xOFFSET" for a code address. Which module owns a hook target is
+// the difference between having hooked d3d11's own function and having hooked
+// somebody else's detour or a proxy context's vtable thunk.
+std::string DescribeCodeAddress(const void* address)
+{
+	if (!address) {
+		return "<null>";
+	}
+	HMODULE module = nullptr;
+	if (!GetModuleHandleExA(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCSTR>(address),
+			&module) ||
+		!module) {
+		return "<unowned>";
+	}
+	char path[MAX_PATH]{};
+	if (GetModuleFileNameA(module, path, static_cast<DWORD>(std::size(path))) ==
+		0U) {
+		return "<unnamed>";
+	}
+	const char* name = std::strrchr(path, '\\');
+	name = name ? name + 1 : path;
+	const auto offset =
+		reinterpret_cast<std::uintptr_t>(address) -
+		reinterpret_cast<std::uintptr_t>(module);
+	return std::format("{}+0x{:X}", name, offset);
+}
+
 bool isActive_TAA = false;
 bool isActive_DOF = false;
 bool renderedAtTAAThisFrame = false;
@@ -6225,6 +6263,39 @@ namespace Hook
 				automaticSTSObservedInstancedDrawsThisFrame.exchange(
 					0U,
 					std::memory_order_acq_rel);
+
+			// A frame with the weapon drawn issues thousands of indexed draws.
+			// Seeing a couple of dozen means our detour is no longer in the
+			// chain -- not that the gate closed, which the gated/observed pair
+			// already rules out. Report what we hooked against what the vtable
+			// holds now, so a slot replaced after us is visible rather than
+			// inferred, and name the owning module: hooking a wrapped context's
+			// forwarding thunk looks identical from inside except for this.
+			static std::atomic_uint32_t loggedBypassFrames{ 0U };
+			if (observedDraws + observedInstancedDraws < 64U &&
+				g_deviceContextVTable &&
+				loggedBypassFrames.fetch_add(1U, std::memory_order_relaxed) <
+					4U) {
+				const auto currentDrawIndexed =
+					reinterpret_cast<void*>(g_deviceContextVTable[12]);
+				const auto currentDrawIndexedInstanced =
+					reinterpret_cast<void*>(g_deviceContextVTable[20]);
+				logger::warn(
+					"Draw hook appears bypassed: observed DI:{} DII:{} this "
+					"frame. DrawIndexed hooked {:p} ({}), vtable now {:p} ({}); "
+					"DrawIndexedInstanced hooked {:p} ({}), vtable now {:p} "
+					"({})",
+					observedDraws,
+					observedInstancedDraws,
+					g_hookedDrawIndexedTarget,
+					DescribeCodeAddress(g_hookedDrawIndexedTarget),
+					currentDrawIndexed,
+					DescribeCodeAddress(currentDrawIndexed),
+					g_hookedDrawIndexedInstancedTarget,
+					DescribeCodeAddress(g_hookedDrawIndexedInstancedTarget),
+					currentDrawIndexedInstanced,
+					DescribeCodeAddress(currentDrawIndexedInstanced));
+			}
 			const auto reticleDraws =
 				automaticSTSReticleDrawsThisFrame.exchange(
 					0U,
@@ -6488,7 +6559,11 @@ namespace Hook
 			logger::error("Failed to enable {} hook", hookName);
 			return false;
 		}
-		logger::info("Installed {} at {:p}", hookName, target);
+		logger::info(
+			"Installed {} at {:p} ({})",
+			hookName,
+			target,
+			DescribeCodeAddress(target));
 		return true;
 	}
 
@@ -6707,9 +6782,24 @@ namespace Hook
 			{ pDeviceContextVTable, HookInfo{ 20, reinterpret_cast<void*>(DrawIndexedInstancedHook), reinterpret_cast<void**>(&oldFuncs.phookD3D11DrawIndexedInstanced), "DrawIndexedInstancedHook" } },
 		};
 
+		// Which vtable we read matters as much as which slot. A wrapped device
+		// context has its own vtable of forwarding thunks, and hooking those
+		// only sees the draws that particular wrapper forwards.
+		g_deviceContextVTable = pDeviceContextVTable;
+		logger::info(
+			"Device context vtable at {:p} ({}); slot 12 -> {:p}, slot 20 -> {:p}",
+			static_cast<void*>(pDeviceContextVTable),
+			DescribeCodeAddress(pDeviceContextVTable),
+			reinterpret_cast<void*>(pDeviceContextVTable[12]),
+			reinterpret_cast<void*>(pDeviceContextVTable[20]));
+
 		for (const auto& [vtable, info] : hooks) {
 			CreateAndEnableHook(reinterpret_cast<void*>(vtable[info.index]), info.hook, info.original, info.name);
 		}
+		g_hookedDrawIndexedTarget =
+			reinterpret_cast<void*>(pDeviceContextVTable[12]);
+		g_hookedDrawIndexedInstancedTarget =
+			reinterpret_cast<void*>(pDeviceContextVTable[20]);
 
 		if (MagnaScope::GetSettings().AllowsTAACapture() &&
 			!InstallGuardedTAAHook()) {
