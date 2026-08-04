@@ -1169,6 +1169,15 @@ struct STSApertureCandidate
 	// primitive order on that specific mesh. Anything else still supplies the
 	// aperture's projection, eye box and mask.
 	bool annulus{ false };
+	// Named like an optical surface rather than structure. Third-party optics
+	// that ship no ScopeFade still name their glass: specter_lens_rear,
+	// hamr_lens_rear, LenseRearSTS. Without this the automatic choice takes
+	// whichever shape came first, which on those meshes is the scope body.
+	bool lensNamed{ false };
+	// The eye-side element among them. That is the one the player looks
+	// through, and it is where the aperture belongs.
+	bool rearNamed{ false };
+	float radius{ 0.0F };
 };
 
 // The first object under a root whose name begins with the given prefix.
@@ -1301,14 +1310,25 @@ std::vector<STSApertureCandidate> FindSTSApertureCandidates(
 			NameHasPrefixNoCase(name, "ScopeFade") ? 0U :
 			insideViewParts                       ? 1U :
 													2U;
+		const bool lensNamed =
+			NameContainsTokenNoCase(name, "lens") ||
+			NameContainsTokenNoCase(name, "glass");
 		candidates.push_back({
 			object,
 			std::string{ name },
 			rank,
-			shape->numTriangles == 48U && shape->numVertices == 48U
+			shape->numTriangles == 48U && shape->numVertices == 48U,
+			lensNamed,
+			lensNamed && NameContainsTokenNoCase(name, "rear"),
+			bound.fRadius
 		});
 	}
 
+	// Structural rank first, as asked: ScopeFade, then ScopeViewParts, then
+	// the rest of ScopeAiming. Within a rank, pick the shape most likely to be
+	// the glass rather than whichever the tree happened to yield first -- on an
+	// optic with no ScopeFade that was the scope body, which is why those
+	// scopes magnified nothing usable.
 	std::stable_sort(
 		candidates.begin(),
 		candidates.end(),
@@ -1317,9 +1337,19 @@ std::vector<STSApertureCandidate> FindSTSApertureCandidates(
 			if (left.rank != right.rank) {
 				return left.rank < right.rank;
 			}
-			// Within a rank a real annulus always beats a plain shape: it is
-			// the only topology that can drive the exact geometry replay.
-			return left.annulus && !right.annulus;
+			// A real annulus is the only topology that can drive the exact
+			// geometry replay, so it wins outright.
+			if (left.annulus != right.annulus) {
+				return left.annulus;
+			}
+			if (left.lensNamed != right.lensNamed) {
+				return left.lensNamed;
+			}
+			if (left.rearNamed != right.rearNamed) {
+				return left.rearNamed;
+			}
+			// Last resort: a lens is small next to the body it sits in.
+			return left.radius < right.radius;
 		});
 	return candidates;
 }
