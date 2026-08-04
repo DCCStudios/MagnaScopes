@@ -405,6 +405,41 @@ def main() -> int:
         "Lens Center or Lens Size is not wired through to the optics",
     )
 
+    # Breathing must not be routed through the eye-box travel that carries
+    # recoil and inertia. That path runs through a recentering follower whose
+    # job is to pull transient motion back to zero, so a continuous oscillation
+    # fed into it would be progressively cancelled: the baseline would learn the
+    # sine and the effect would fade while the slider still read a large value.
+    # It is its own term, integrated on the game thread so a rate change bends
+    # the curve forward instead of teleporting the image.
+    require(
+        "struct Breathing" in data_h
+        and "Breathing breathing;" in data_h
+        and '"Breathing"' in data_cpp
+        and "scopeBreathPhase" in hooking_h
+        and "resolution.breathPhase" in hooking
+        and "kTwoPi * breathRate * opticalFrameDelta" in main_cpp
+        and "std::fmod(breathPhase, kTwoPi)" in main_cpp
+        and "Hook::D3D::scopeBreathSway.store(" in main_cpp
+        and "editorPreview.breathing.sway" in main_cpp
+        and "float2 ScopeBreathingOffset()" in triangle_shader
+        # The scene translates, so the sampled region moves and the pivot does
+        # not. Moving the pivot would drag the zoom's fixed point and take the
+        # reticle's alignment with it.
+        and "const float2 breathingLens = ScopeBreathingOffset();" in shader
+        and "sampleDelta -=\n        breathingLens *" in shader
+        and "aperturePivotPixels += breathingLens" not in shader
+        # The reticle is fixed to the weapon: its shadow follows, it does not.
+        and "breathingPupilLocal" in reticle_shader
+        and "opticalTranslation += ScopeBreathingOffset()" not in reticle_shader
+        and "SCOPE_BREATH_PUPIL_FOLLOW" in shader
+        and "SCOPE_BREATH_PUPIL_FOLLOW" in reticle_shader
+        # Eye-box travel and breathing stay separate all the way through.
+        and "physicalEyeTravel += " not in shader
+        and "ScopeBreathingOffset" not in eyebox_header,
+        "breathing sway is not an independent, phase-integrated term",
+    )
+
     # The WARP harnesses resolve Compile/Shaders from the working directory.
     # Starting them in build/tests let a stale shader tree shadow the freshly
     # built one and report failures that do not exist in the real output.
@@ -668,7 +703,7 @@ def main() -> int:
         # image disc that stays concentric with the aperture only looks
         # smaller; it still tracks the housing one-for-one, and it is eye
         # travel that carries the eye off the optical axis while aiming.
-        and "eyeTravelLens + tubeParallaxLens," in shader
+        and "eyeTravelLens + tubeParallaxLens + breathingPupilLens," in shader
         and "const float2 tubeParallaxLens =\n        -eyeTravelLens * saturate(ScopeTubeDepth);"
         in shader,
         "heading-independent camera-space eye-box inertia or pupil travel regressed",

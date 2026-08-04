@@ -94,6 +94,16 @@ namespace ScopeData
 		p.tubeDepth = j.value("tubeDepth", 0.0F);
 	}
 
+	void from_json(const json& j, Breathing& b)
+	{
+		b.rate = j.value("rate", 0.25F);
+		b.sway = j.value("sway", 0.0F);
+		b.drift = j.value("drift", 0.0F);
+		b.figure = j.value("figure", 0.25F);
+		b.hold = j.value("hold", 0.0F);
+		b.pupilFollow = j.value("pupilFollow", 1.0F);
+	}
+
 	void from_json(const json& j, ZoomDataOverwrite& z)
 	{
 		z.x = j.value("x", 0.0F);
@@ -148,6 +158,7 @@ namespace ScopeData
 		s.lensScale = j.value("LensScale", 1.0F);
 		s.fovAdjust = j.value("fovAdjust", 0.0F);
 		s.parallax = j.value("Parallax", Parallax());
+		s.breathing = j.value("Breathing", Breathing());
 	}
 
 	void from_json(const json& j, ScopeProfile& f)
@@ -201,6 +212,18 @@ namespace ScopeData
 		};
 	}
 
+	void to_json(json& j, const Breathing& b)
+	{
+		j = json{
+			{ "rate", b.rate },
+			{ "sway", b.sway },
+			{ "drift", b.drift },
+			{ "figure", b.figure },
+			{ "hold", b.hold },
+			{ "pupilFollow", b.pupilFollow }
+		};
+	}
+
 	void to_json(json& j, const ZoomDataOverwrite& z)
 	{
 		j = json{
@@ -249,7 +272,8 @@ namespace ScopeData
 			{ "LensScale", s.lensScale },
 			{ "fovAdjust", s.fovAdjust },
 			//
-			{ "Parallax", s.parallax }
+			{ "Parallax", s.parallax },
+			{ "Breathing", s.breathing }
 		};
 	}
 
@@ -795,6 +819,15 @@ namespace ScopeData
 		profile->shaderData.lensOffset[0] = 0.0F;
 		profile->shaderData.lensOffset[1] = 0.0F;
 		profile->shaderData.lensScale = 1.0F;
+		// Breathing is off by default. The rate and shape are pre-set to a
+		// plausible hold so raising Breathing Sway alone gives something that
+		// already looks right, rather than a fast horizontal wobble.
+		profile->shaderData.breathing.rate = 0.25F;
+		profile->shaderData.breathing.sway = 0.0F;
+		profile->shaderData.breathing.drift = 0.0F;
+		profile->shaderData.breathing.figure = 0.25F;
+		profile->shaderData.breathing.hold = 0.35F;
+		profile->shaderData.breathing.pupilFollow = 1.0F;
 		const float diameter = std::clamp(defaultDiameter, 64.0F, 2160.0F);
 		profile->shaderData.Size[0] = diameter;
 		profile->shaderData.Size[1] = diameter;

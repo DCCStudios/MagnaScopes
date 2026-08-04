@@ -152,7 +152,8 @@ namespace ImGuiImpl
 		float tubeDepth,
 		float lensOffsetX,
 		float lensOffsetY,
-		float lensScale)
+		float lensScale,
+		const ScopeData::Breathing& breathing)
 	{
 		std::scoped_lock lock(editorPreviewMutex);
 		editorPreview.zoomOverride = zoomOverride;
@@ -218,6 +219,18 @@ namespace ImGuiImpl
 			std::clamp(lensOffsetY, -1.0F, 1.0F);
 		editorPreview.lensScale =
 			std::clamp(lensScale, 0.25F, 2.0F);
+		editorPreview.breathing.rate =
+			std::clamp(breathing.rate, 0.0F, 4.0F);
+		editorPreview.breathing.sway =
+			std::clamp(breathing.sway, 0.0F, 1.0F);
+		editorPreview.breathing.drift =
+			std::clamp(breathing.drift, 0.0F, 1.0F);
+		editorPreview.breathing.figure =
+			std::clamp(breathing.figure, 0.0F, 1.0F);
+		editorPreview.breathing.hold =
+			std::clamp(breathing.hold, 0.0F, 1.0F);
+		editorPreview.breathing.pupilFollow =
+			std::clamp(breathing.pupilFollow, 0.0F, 2.0F);
 		editorPreview.active = true;
 	}
 
@@ -474,6 +487,31 @@ namespace ImGuiImpl
 				std::isfinite(data->shaderData.lensScale) ?
 					std::clamp(data->shaderData.lensScale, 0.25F, 2.0F) :
 					1.0F;
+			const auto& profileBreathing = data->shaderData.breathing;
+			ins->breathRate_UI =
+				std::isfinite(profileBreathing.rate) ?
+					std::clamp(profileBreathing.rate, 0.0F, 4.0F) :
+					0.25F;
+			ins->breathSway_UI =
+				std::isfinite(profileBreathing.sway) ?
+					std::clamp(profileBreathing.sway, 0.0F, 1.0F) :
+					0.0F;
+			ins->breathDrift_UI =
+				std::isfinite(profileBreathing.drift) ?
+					std::clamp(profileBreathing.drift, 0.0F, 1.0F) :
+					0.0F;
+			ins->breathFigure_UI =
+				std::isfinite(profileBreathing.figure) ?
+					std::clamp(profileBreathing.figure, 0.0F, 1.0F) :
+					0.25F;
+			ins->breathHold_UI =
+				std::isfinite(profileBreathing.hold) ?
+					std::clamp(profileBreathing.hold, 0.0F, 1.0F) :
+					0.0F;
+			ins->breathPupilFollow_UI =
+				std::isfinite(profileBreathing.pupilFollow) ?
+					std::clamp(profileBreathing.pupilFollow, 0.0F, 2.0F) :
+					1.0F;
 			ins->shadowDepth_UI =
 				std::isfinite(data->shaderData.parallax.shadowDepth) ?
 					std::clamp(data->shaderData.parallax.shadowDepth, 0.0F, 4.0F) :
@@ -597,6 +635,18 @@ namespace ImGuiImpl
 				std::clamp(lensOffset_UI[1], -1.0F, 1.0F);
 			editedProfile.shaderData.lensScale =
 				std::clamp(lensScale_UI, 0.25F, 2.0F);
+			editedProfile.shaderData.breathing.rate =
+				std::clamp(breathRate_UI, 0.0F, 4.0F);
+			editedProfile.shaderData.breathing.sway =
+				std::clamp(breathSway_UI, 0.0F, 1.0F);
+			editedProfile.shaderData.breathing.drift =
+				std::clamp(breathDrift_UI, 0.0F, 1.0F);
+			editedProfile.shaderData.breathing.figure =
+				std::clamp(breathFigure_UI, 0.0F, 1.0F);
+			editedProfile.shaderData.breathing.hold =
+				std::clamp(breathHold_UI, 0.0F, 1.0F);
+			editedProfile.shaderData.breathing.pupilFollow =
+				std::clamp(breathPupilFollow_UI, 0.0F, 2.0F);
 			editedProfile.shaderData.bBoltDisable = bDisableWhileBolt;
 			editedProfile.shaderData.nvIntensity = nvIntensity_UI;
 			editedProfile.shaderData.fovAdjust = fovBase_UI;
@@ -1157,6 +1207,83 @@ namespace ImGuiImpl
 				"floaty, higher snaps back sooner. Governs pupil recentering,\n"
 				"image recentering, and camera-rotation lag decay together.");
 		}
+
+		if (ImGui::CollapsingHeader("Breathing")) {
+			ImGui::TextWrapped(
+				"Slow cyclic sway of the sight picture. Independent of the "
+				"recoil and inertia above: those are transient and settle back "
+				"to centre, this never stops while you are aiming.");
+			ImGui::Spacing();
+
+			ImGui::DragFloat(
+				"Breathing Sway",
+				&breathSway_UI,
+				0.001F,
+				0.0F,
+				1.0F,
+				"%.3f");
+			Tip("Vertical amplitude, in scope radii. This is the main control:\n"
+				"0 disables breathing entirely. Around 0.05 is a calm hold and\n"
+				"0.2 is winded. The amount is apparent motion, so it looks the\n"
+				"same through a 4x and a 12x rather than becoming unusable at\n"
+				"high magnification.");
+			ImGui::DragFloat(
+				"Breathing Drift",
+				&breathDrift_UI,
+				0.001F,
+				0.0F,
+				1.0F,
+				"%.3f");
+			Tip("Horizontal amplitude, in scope radii. Real breathing is mostly\n"
+				"vertical, so keeping this well below Sway reads best. Equal\n"
+				"values give a circular wander.");
+			ImGui::DragFloat(
+				"Breathing Rate",
+				&breathRate_UI,
+				0.005F,
+				0.0F,
+				4.0F,
+				"%.3f Hz");
+			Tip("Breaths per second. 0.25 is about fifteen a minute, a resting\n"
+				"rate. Raise it toward 0.5 for exertion. Changing this bends\n"
+				"the curve forward from where it is rather than jumping the\n"
+				"image, so it is safe to drag while aiming.");
+			ImGui::DragFloat(
+				"Breathing Figure",
+				&breathFigure_UI,
+				0.005F,
+				0.0F,
+				1.0F,
+				"%.3f");
+			Tip("Phase lead of the horizontal axis over the vertical, in turns.\n"
+				"0 traces a straight diagonal, 0.25 an ellipse, and values in\n"
+				"between the leaning figure-eight a real hold wanders through.\n"
+				"Has no visible effect unless Drift is above 0.");
+			ImGui::DragFloat(
+				"Breathing Hold",
+				&breathHold_UI,
+				0.005F,
+				0.0F,
+				1.0F,
+				"%.3f");
+			Tip("Flattens the turning points so the drift dwells at the top and\n"
+				"bottom of each breath instead of sweeping through at constant\n"
+				"speed. 0 is a pure sine; higher values give the pause at the\n"
+				"end of a breath that makes the timing readable.");
+			ImGui::DragFloat(
+				"Breathing Pupil Follow",
+				&breathPupilFollow_UI,
+				0.01F,
+				0.0F,
+				2.0F,
+				"%.2f");
+			Tip("How much of the sway the exit-pupil shadow takes. The image\n"
+				"and the pupil sit at different depths in a real optic, so they\n"
+				"need not move together: 0 holds the shadow perfectly still\n"
+				"while the scene swims, 1 moves them as one, and above 1 the\n"
+				"shadow leads. The reticle never translates with breathing --\n"
+				"only its shadow does.");
+		}
 	}
 
 	ImGuiImplClass::ImGuiImplClass()
@@ -1276,7 +1403,14 @@ namespace ImGuiImpl
 			instance->tubeDepth_UI,
 			instance->lensOffset_UI[0],
 			instance->lensOffset_UI[1],
-			instance->lensScale_UI);
+			instance->lensScale_UI,
+			ScopeData::Breathing{
+				instance->breathRate_UI,
+				instance->breathSway_UI,
+				instance->breathDrift_UI,
+				instance->breathFigure_UI,
+				instance->breathHold_UI,
+				instance->breathPupilFollow_UI });
 
 		ImGui::PopItemWidth();
 	}

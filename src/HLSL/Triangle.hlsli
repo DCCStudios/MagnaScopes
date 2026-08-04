@@ -69,8 +69,51 @@ cbuffer ResolutionConstantData : register(b4){
 	float SCOPE_LENS_OFFSET_X;
 	float SCOPE_LENS_OFFSET_Y;
 	float SCOPE_LENS_SCALE;
-	float SCOPE_LENS_UNUSED;
+
+	// Breathing sway. The phase is accumulated on the game thread rather than
+	// derived from a clock here, so changing the rate bends the curve forward
+	// from where it already was instead of jumping the image to wherever a
+	// freshly scaled absolute time happens to land.
+	float SCOPE_BREATH_PHASE;
+
+	float SCOPE_BREATH_SWAY;
+	float SCOPE_BREATH_DRIFT;
+	float SCOPE_BREATH_FIGURE;
+	float SCOPE_BREATH_HOLD;
+
+	float SCOPE_BREATH_PUPIL_FOLLOW;
+	float SCOPE_RESERVED_0;
+	float SCOPE_RESERVED_1;
+	float SCOPE_RESERVED_2;
 };
+
+// Breathing displacement in aperture radii, shared so the magnified scene and
+// the reticle's exit-pupil shadow cannot drift out of step.
+//
+// The shaping exponent flattens the turning points as Hold rises, which is what
+// makes the drift dwell at the extremes the way a real breath pauses, rather
+// than sweeping through them at constant speed like a plain sine.
+float2 ScopeBreathingOffset()
+{
+    const float sway = SCOPE_BREATH_SWAY;
+    const float drift = SCOPE_BREATH_DRIFT;
+    if (abs(sway) + abs(drift) < 0.00001f) {
+        return float2(0.0f, 0.0f);
+    }
+    const float twoPi = 6.28318530717958647692f;
+    const float verticalPhase = SCOPE_BREATH_PHASE;
+    const float horizontalPhase =
+        verticalPhase + clamp(SCOPE_BREATH_FIGURE, 0.0f, 1.0f) * twoPi;
+    const float shaping =
+        1.0f / (1.0f + 1.5f * saturate(SCOPE_BREATH_HOLD));
+    const float verticalRaw = sin(verticalPhase);
+    const float horizontalRaw = sin(horizontalPhase);
+    const float vertical =
+        sign(verticalRaw) * pow(abs(verticalRaw), shaping);
+    const float horizontal =
+        sign(horizontalRaw) * pow(abs(horizontalRaw), shaping);
+    return float2(horizontal * drift, vertical * sway);
+}
 
 cbuffer ScopeEffectData : register(b5)
 {

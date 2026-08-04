@@ -44,6 +44,38 @@ namespace ScopeData
 		float tubeDepth = 0.0F;
 	};
 
+	// Breathing sway applied to the magnified image and the exit pupil.
+	//
+	// This is deliberately NOT routed through the eye-box travel that carries
+	// recoil and weapon inertia. That path is filtered by a recentering
+	// follower whose whole job is to pull transient motion back to zero, so a
+	// continuous oscillation fed into it would be progressively cancelled: the
+	// baseline would learn the sine and the effect would fade out while the
+	// slider still read a large value. Breathing is its own term.
+	struct Breathing
+	{
+		// Cycles per second. 0.25 is roughly fifteen breaths a minute.
+		float rate = 0.25F;
+		// Vertical and horizontal amplitude, in aperture radii of apparent
+		// motion. Apparent rather than angular: the shift is divided by
+		// magnification so a scope's sway reads the same at 4x and 12x
+		// instead of becoming unusable at the top of the range.
+		float sway = 0.0F;
+		float drift = 0.0F;
+		// Phase lead of the horizontal axis over the vertical, in turns.
+		// 0 traces a diagonal line, 0.25 an ellipse, and values between them
+		// the leaning figure-eight a real hold wanders through.
+		float figure = 0.25F;
+		// Waveform shape. 0 is a pure sine. Higher values flatten the turning
+		// points so the drift dwells at the extremes, which is what the pause
+		// at the end of a breath actually looks like through glass.
+		float hold = 0.0F;
+		// How much of the sway the exit pupil takes. The image and the pupil
+		// are at different depths in a real optic, so they need not move
+		// together; 0 keeps the shadow perfectly still while the image swims.
+		float pupilFollow = 1.0F;
+	};
+
 	struct ZoomDataOverwrite
 	{
 		float x = 0;
@@ -122,6 +154,8 @@ namespace ScopeData
 		// weapon.
 		float lensOffset[2] = { 0.0F, 0.0F };
 		float lensScale = 1.0F;
+
+		Breathing breathing;
 
 		float fovAdjust = 0;
 		Parallax parallax;

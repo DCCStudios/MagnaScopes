@@ -204,10 +204,19 @@ ReticleCompositeOutput main(VertexPosHTex input)
     const float2 tubeParallaxLocal =
         -eyeTravelLocal * saturate(ScopeTubeDepth);
 
+    // The reticle is fixed to the weapon, so breathing must not translate it --
+    // the scene swims underneath while the crosshair holds. Its exit pupil does
+    // follow, by exactly the amount the scene replay applies, or the reticle
+    // would stay lit inside a crescent the scene had already darkened.
+    const float2 breathingPupilLocal =
+        ScopeBreathingOffset() *
+        clamp(SCOPE_BREATH_PUPIL_FOLLOW, 0.0f, 2.0f);
+
     const ScopeShadowLayers shadow = EvaluateScopeShadow(
         shadowLensCoordinates,
-        eyeTravelLocal + tubeParallaxLocal,
-        physicalEyeTravelValid || saturate(ScopeTubeDepth) > 0.0f,
+        eyeTravelLocal + tubeParallaxLocal + breathingPupilLocal,
+        physicalEyeTravelValid || saturate(ScopeTubeDepth) > 0.0f ||
+            dot(breathingPupilLocal, breathingPupilLocal) > 0.0f,
         SCOPE_EYEBOX_RADIUS,
         clamp(ScopeShadowDepth, 0.0f, 4.0f),
         axialPupilScale *

@@ -2152,6 +2152,24 @@ void HookedUpdate()
 				Hook::D3D::scopeLensScale.store(
 					editorPreview.lensScale,
 					std::memory_order_release);
+				Hook::D3D::scopeBreathRate.store(
+					editorPreview.breathing.rate,
+					std::memory_order_release);
+				Hook::D3D::scopeBreathSway.store(
+					editorPreview.breathing.sway,
+					std::memory_order_release);
+				Hook::D3D::scopeBreathDrift.store(
+					editorPreview.breathing.drift,
+					std::memory_order_release);
+				Hook::D3D::scopeBreathFigure.store(
+					editorPreview.breathing.figure,
+					std::memory_order_release);
+				Hook::D3D::scopeBreathHold.store(
+					editorPreview.breathing.hold,
+					std::memory_order_release);
+				Hook::D3D::scopeBreathPupilFollow.store(
+					editorPreview.breathing.pupilFollow,
+					std::memory_order_release);
 				editorPreviewApplied = true;
 			} else {
 				if (editorPreviewApplied) {
@@ -2334,6 +2352,26 @@ void HookedUpdate()
 						currentData->shaderData.lensScale,
 						0.25F,
 						2.0F),
+					std::memory_order_release);
+				const auto& breathing =
+					currentData->shaderData.breathing;
+				Hook::D3D::scopeBreathRate.store(
+					std::clamp(breathing.rate, 0.0F, 4.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeBreathSway.store(
+					std::clamp(breathing.sway, 0.0F, 1.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeBreathDrift.store(
+					std::clamp(breathing.drift, 0.0F, 1.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeBreathFigure.store(
+					std::clamp(breathing.figure, 0.0F, 1.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeBreathHold.store(
+					std::clamp(breathing.hold, 0.0F, 1.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeBreathPupilFollow.store(
+					std::clamp(breathing.pupilFollow, 0.0F, 2.0F),
 					std::memory_order_release);
 			}
 
@@ -2526,6 +2564,42 @@ void HookedUpdate()
 								physicalEyeBox.apertureScaleRatio :
 								1.0F,
 							std::memory_order_release);
+						// Breathing phase is integrated here rather than read
+						// from a clock in the shader. Multiplying an absolute
+						// time by the rate makes every rate change teleport the
+						// image to a new point on the curve, which is very
+						// visible while dragging the slider; integrating means
+						// the curve simply bends forward from where it was.
+						//
+						// It advances only while the optic is live, so a breath
+						// does not silently continue through a loading screen
+						// and resume at an arbitrary point.
+						{
+							constexpr float kTwoPi = 6.28318530717958647692F;
+							const float breathRate = std::clamp(
+								Hook::D3D::scopeBreathRate.load(
+									std::memory_order_acquire),
+								0.0F,
+								4.0F);
+							float breathPhase =
+								Hook::D3D::scopeBreathPhase.load(
+									std::memory_order_acquire) +
+								kTwoPi * breathRate * opticalFrameDelta;
+							if (!std::isfinite(breathPhase)) {
+								breathPhase = 0.0F;
+							}
+							// Wrapping keeps the argument small enough that
+							// sin() does not lose precision after an hour of
+							// aiming, which would show up as the sway slowly
+							// going ragged.
+							breathPhase = std::fmod(breathPhase, kTwoPi);
+							if (breathPhase < 0.0F) {
+								breathPhase += kTwoPi;
+							}
+							Hook::D3D::scopeBreathPhase.store(
+								breathPhase,
+								std::memory_order_release);
+						}
 						hookIns->PublishLensProjection(
 							tempOut.x,
 							tempOut.y,

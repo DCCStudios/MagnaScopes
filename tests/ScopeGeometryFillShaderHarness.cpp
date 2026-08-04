@@ -87,9 +87,19 @@ namespace
 		float lensOffsetX = 0.0F;
 		float lensOffsetY = 0.0F;
 		float lensScale = 1.0F;
-		float lensUnused = 0.0F;
+		float breathPhase = 0.0F;
+
+		float breathSway = 0.0F;
+		float breathDrift = 0.0F;
+		float breathFigure = 0.25F;
+		float breathHold = 0.0F;
+
+		float breathPupilFollow = 1.0F;
+		float reserved0 = 0.0F;
+		float reserved1 = 0.0F;
+		float reserved2 = 0.0F;
 	};
-	static_assert(sizeof(ResolutionConstants) == 176);
+	static_assert(sizeof(ResolutionConstants) == 208);
 
 	void Check(HRESULT result, std::string_view operation)
 	{
@@ -1936,6 +1946,12 @@ Output main(Input input)
 		resolution.aimCenterY = 0.5F * static_cast<float>(kHeight);
 		resolution.lensCenterX = 0.5F * static_cast<float>(kWidth);
 		resolution.lensCenterY = 0.5F * static_cast<float>(kHeight);
+		resolution.breathPhase = 0.0F;
+		resolution.breathSway = 0.0F;
+		resolution.breathDrift = 0.0F;
+		resolution.breathFigure = 0.0F;
+		resolution.breathHold = 0.0F;
+		resolution.breathPupilFollow = 1.0F;
 	};
 
 	// The source is the uniform 192-grey fixture installed above, so any
@@ -2097,13 +2113,108 @@ Output main(Input input)
 		return 1;
 	}
 
+	// ------------------------------------------------------------------
+	// Breathing sway.
+	//
+	// Asserted against rendered output because this project has repeatedly
+	// shipped controls that were wired everywhere except the one place that
+	// mattered and silently did nothing. The uniform grey fixture cannot show
+	// an image translation, but it shows the exit pupil, so these checks drive
+	// the pupil and prove the term is live, phase-driven, and independently
+	// controllable:
+	//   1. sin(0) is zero, so phase 0 must be vertically symmetric;
+	//   2. phase pi/2 must push the pupil off-centre into a crescent;
+	//   3. phase pi must be symmetric again -- a ramp or an absolute-time
+	//      multiply would still be displaced here, a sine is not;
+	//   4. Pupil Follow at 0 must remove the response entirely while Sway
+	//      stays high, so the two are genuinely separate controls.
+	// ------------------------------------------------------------------
+	const auto renderVerticalPair = [&]() {
+		updateResolution(resolution);
+		submitLensPose(-kCenterNdcX, -kCenterNdcY);
+		context->ClearRenderTargetView(renderTargetView.Get(), clear);
+		context->DrawIndexed(static_cast<UINT>(indices.size()), 0, 0);
+		context->CopyResource(staging.Get(), renderTarget.Get());
+		D3D11_MAPPED_SUBRESOURCE mapped{};
+		Check(
+			context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped),
+			"Map(staging breathing contract)");
+		const auto sample = [&](std::uint32_t x, std::uint32_t y) {
+			const auto pixel = Pixel(mapped, x, y);
+			return static_cast<unsigned>(pixel[0]) +
+			       static_cast<unsigned>(pixel[1]) +
+			       static_cast<unsigned>(pixel[2]);
+		};
+		// Mirrored about the exact aperture centre at 64.0, matching the
+		// half-pixel straddle the horizontal shadow samples use.
+		const std::pair<unsigned, unsigned> pair{
+			sample(64, 39),
+			sample(64, 88)
+		};
+		context->Unmap(staging.Get(), 0);
+		return pair;
+	};
+
+	constexpr float kPi = 3.14159265358979323846F;
+	restoreCenteredShadowFixture();
+	updateScopeEffect(1.0F, 1.0F);
+	resolution.vignetteReach = 9.0F;
+	resolution.vignetteSharpness = 3.0F;
+	resolution.eyeBoxRadius = 1.0F;
+	resolution.breathSway = 0.6F;
+	resolution.breathPupilFollow = 1.0F;
+
+	resolution.breathPhase = 0.0F;
+	const auto breathingAtZero = renderVerticalPair();
+	resolution.breathPhase = 0.5F * kPi;
+	const auto breathingAtQuarter = renderVerticalPair();
+	resolution.breathPhase = kPi;
+	const auto breathingAtHalf = renderVerticalPair();
+	resolution.breathPhase = 0.5F * kPi;
+	resolution.breathPupilFollow = 0.0F;
+	const auto breathingWithoutPupil = renderVerticalPair();
+
+	const auto asymmetry = [](const std::pair<unsigned, unsigned>& pair) {
+		return pair.first > pair.second ?
+			pair.first - pair.second :
+			pair.second - pair.first;
+	};
+	const bool zeroPhaseIsSymmetric = asymmetry(breathingAtZero) < 8U;
+	const bool quarterPhaseIsDisplaced =
+		asymmetry(breathingAtQuarter) > 60U;
+	const bool halfPhaseReturnsToSymmetric =
+		asymmetry(breathingAtHalf) < 8U;
+	const bool pupilFollowIsLive =
+		asymmetry(breathingWithoutPupil) < 8U;
+	if (!zeroPhaseIsSymmetric ||
+		!quarterPhaseIsDisplaced ||
+		!halfPhaseReturnsToSymmetric ||
+		!pupilFollowIsLive) {
+		std::cerr << std::format(
+			"Breathing contract failed: "
+			"phase0[top={}, bottom={}], "
+			"phaseQuarter[top={}, bottom={}], "
+			"phaseHalf[top={}, bottom={}], "
+			"pupilFollow0[top={}, bottom={}]\n",
+			breathingAtZero.first,
+			breathingAtZero.second,
+			breathingAtQuarter.first,
+			breathingAtQuarter.second,
+			breathingAtHalf.first,
+			breathingAtHalf.second,
+			breathingWithoutPupil.first,
+			breathingWithoutPupil.second);
+		return 1;
+	}
+
 	std::cout << std::format(
 		"ScopeFade geometry fill PASSED: center=({}, {}, {}), "
 		"annulus=({}, {}, {}), outside=({}, {}, {}); "
 		"2x magnification PASSED: right=({}, {}, {}), "
 		"top=({}, {}, {}); reticle pivot, 1x identity, projective "
 		"lens frame, heading-invariant optical lag, stationary recentering, "
-		"authored pupil radius, bounded axial breathing, local-motion "
+		"authored pupil radius, bounded axial breathing, phase-driven "
+		"breathing sway with an independent pupil follow, local-motion "
 		"eye-box direction, bounded exit-pupil shadow (aligned centre "
 		"survives maximum travel, rim spares mid-lens, live Eye Box Radius "
 		"and Shadow Depth), and packed ScopeFade "

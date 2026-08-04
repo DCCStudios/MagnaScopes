@@ -1984,6 +1984,28 @@ namespace Hook
 			scopeLensScale.load(std::memory_order_acquire),
 			0.25F,
 			2.0F);
+		resolution.breathPhase =
+			scopeBreathPhase.load(std::memory_order_acquire);
+		resolution.breathSway = std::clamp(
+			scopeBreathSway.load(std::memory_order_acquire),
+			0.0F,
+			1.0F);
+		resolution.breathDrift = std::clamp(
+			scopeBreathDrift.load(std::memory_order_acquire),
+			0.0F,
+			1.0F);
+		resolution.breathFigure = std::clamp(
+			scopeBreathFigure.load(std::memory_order_acquire),
+			0.0F,
+			1.0F);
+		resolution.breathHold = std::clamp(
+			scopeBreathHold.load(std::memory_order_acquire),
+			0.0F,
+			1.0F);
+		resolution.breathPupilFollow = std::clamp(
+			scopeBreathPupilFollow.load(std::memory_order_acquire),
+			0.0F,
+			2.0F);
 		resolution.imageDenoise = std::clamp(
 			scopeImageDenoise.load(std::memory_order_acquire),
 			0.0F,
@@ -6862,6 +6884,13 @@ namespace Hook
 	std::atomic<float> D3D::scopeLensOffsetX{ 0.0F };
 	std::atomic<float> D3D::scopeLensOffsetY{ 0.0F };
 	std::atomic<float> D3D::scopeLensScale{ 1.0F };
+	std::atomic<float> D3D::scopeBreathPhase{ 0.0F };
+	std::atomic<float> D3D::scopeBreathRate{ 0.25F };
+	std::atomic<float> D3D::scopeBreathSway{ 0.0F };
+	std::atomic<float> D3D::scopeBreathDrift{ 0.0F };
+	std::atomic<float> D3D::scopeBreathFigure{ 0.25F };
+	std::atomic<float> D3D::scopeBreathHold{ 0.0F };
+	std::atomic<float> D3D::scopeBreathPupilFollow{ 1.0F };
 	bool D3D::bLegacyMode;
 
 	std::once_flag D3D::flagOnce;

@@ -319,6 +319,23 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
              opticalMagnification);
     }
 
+    // Breathing sway. The shooter's whole hold drifts, so the scene swims
+    // beneath a housing and reticle that stay put -- which means translating
+    // the sampled region, not the magnification pivot. Moving the pivot would
+    // drag the zoom's fixed point around and take the reticle's alignment with
+    // it.
+    //
+    // Dividing by magnification makes the amplitude apparent rather than
+    // angular, so one authored value reads the same through a 4x and a 12x.
+    // Physically the sway would grow with magnification, but that makes the
+    // control unusable at the top of the range for no gain in feel.
+    const float2 breathingLens = ScopeBreathingOffset();
+    sampleDelta -=
+        breathingLens *
+        currentProjectedRadius *
+        PixelSize /
+        opticalMagnification;
+
     const float2 sampleUv = saturate(samplePivotUv + sampleDelta);
     const float2 sourcePixel = PixelSize;
     const float2 radialPixels = radialUv / max(sourcePixel, 0.000001f);
@@ -566,10 +583,17 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     const float2 tubeParallaxLens =
         -eyeTravelLens * saturate(ScopeTubeDepth);
 
+    // The image and the exit pupil sit at different depths, so breathing need
+    // not move them together. Pupil Follow at 0 keeps the shadow perfectly
+    // still while the scene swims; at 1 the pupil rides the same sway.
+    const float2 breathingPupilLens =
+        breathingLens * clamp(SCOPE_BREATH_PUPIL_FOLLOW, 0.0f, 2.0f);
+
     const ScopeShadowLayers shadow = EvaluateScopeShadow(
         stableShadowCoordinates,
-        eyeTravelLens + tubeParallaxLens,
-        physicalEyeTravelValid || saturate(ScopeTubeDepth) > 0.0f,
+        eyeTravelLens + tubeParallaxLens + breathingPupilLens,
+        physicalEyeTravelValid || saturate(ScopeTubeDepth) > 0.0f ||
+            dot(breathingPupilLens, breathingPupilLens) > 0.0f,
         SCOPE_EYEBOX_RADIUS,
         shadowDepth,
         imageDiscRadius,

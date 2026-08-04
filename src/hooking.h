@@ -139,10 +139,25 @@ namespace Hook
 			float lensOffsetX = 0.0F;
 			float lensOffsetY = 0.0F;
 			float lensScale = 1.0F;
-			float lensUnused = 0.0F;
+
+			// Breathing sway. The phase is integrated on the game thread so a
+			// rate change bends the curve forward from where it already was,
+			// instead of jumping the image to wherever a rescaled absolute
+			// time happens to land.
+			float breathPhase = 0.0F;
+
+			float breathSway = 0.0F;
+			float breathDrift = 0.0F;
+			float breathFigure = 0.25F;
+			float breathHold = 0.0F;
+
+			float breathPupilFollow = 1.0F;
+			float reserved0 = 0.0F;
+			float reserved1 = 0.0F;
+			float reserved2 = 0.0F;
 		};
 		static_assert(
-			sizeof(ConstBufferData) == 176,
+			sizeof(ConstBufferData) == 208,
 			"ScopeFade constant buffer must match Triangle.hlsli");
 
 	public:
@@ -565,6 +580,15 @@ namespace Hook
 		static std::atomic<float> scopeLensOffsetX;
 		static std::atomic<float> scopeLensOffsetY;
 		static std::atomic<float> scopeLensScale;
+		// Breathing sway. The phase is integrated by the game thread; the rest
+		// are authored per scope.
+		static std::atomic<float> scopeBreathPhase;
+		static std::atomic<float> scopeBreathRate;
+		static std::atomic<float> scopeBreathSway;
+		static std::atomic<float> scopeBreathDrift;
+		static std::atomic<float> scopeBreathFigure;
+		static std::atomic<float> scopeBreathHold;
+		static std::atomic<float> scopeBreathPupilFollow;
 		static std::atomic_bool isEnableRender;
 		static bool frameworkRenderAnchor;
 		static std::atomic<float> projectedLensX;

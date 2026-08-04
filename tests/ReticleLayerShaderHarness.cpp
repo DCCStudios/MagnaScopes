@@ -80,9 +80,19 @@ namespace
 		float lensOffsetX = 0.0F;
 		float lensOffsetY = 0.0F;
 		float lensScale = 1.0F;
-		float lensUnused = 0.0F;
+		float breathPhase = 0.0F;
+
+		float breathSway = 0.0F;
+		float breathDrift = 0.0F;
+		float breathFigure = 0.25F;
+		float breathHold = 0.0F;
+
+		float breathPupilFollow = 1.0F;
+		float reserved0 = 0.0F;
+		float reserved1 = 0.0F;
+		float reserved2 = 0.0F;
 	};
-	static_assert(sizeof(ResolutionConstants) == 176U);
+	static_assert(sizeof(ResolutionConstants) == 208U);
 
 	struct PixelMetrics
 	{

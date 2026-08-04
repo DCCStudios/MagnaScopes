@@ -222,6 +222,9 @@ namespace ImGuiImpl
 		float lensOffsetX = 0.0F;
 		float lensOffsetY = 0.0F;
 		float lensScale = 1.0F;
+		// Six related values, carried as a struct rather than six more
+		// positional parameters on an already long publish call.
+		ScopeData::Breathing breathing;
 		bool active = false;
 	};
 
@@ -286,7 +289,8 @@ namespace ImGuiImpl
 		float tubeDepth,
 		float lensOffsetX,
 		float lensOffsetY,
-		float lensScale);
+		float lensScale,
+		const ScopeData::Breathing& breathing);
 	[[nodiscard]] EditorPreviewSnapshot GetEditorPreviewSnapshot();
 	void ClearEditorPreview();
 	void RequestProfileAction(ProfileRequest request);
@@ -346,6 +350,12 @@ namespace ImGuiImpl
 		float tubeDepth_UI = 0.0F;
 		float lensOffset_UI[2] = { 0.0F, 0.0F };
 		float lensScale_UI = 1.0F;
+		float breathRate_UI = 0.25F;
+		float breathSway_UI = 0.0F;
+		float breathDrift_UI = 0.0F;
+		float breathFigure_UI = 0.25F;
+		float breathHold_UI = 0.0F;
+		float breathPupilFollow_UI = 1.0F;
 		std::uint64_t selectionRevision_UI = 0;
 
 		bool bEnableFG;
