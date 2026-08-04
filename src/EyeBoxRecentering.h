@@ -214,13 +214,25 @@ namespace MagnaScope::EyeBoxRecentering
 	// position and the rotation term reads zero. Only weapon animation inertia
 	// leaks through, which is far too little to register as lens lag.
 	//
-	// This gain is much smaller than the angular one because its input is much
-	// larger. A walk is roughly a hundred game units per second against an
-	// aperture radius near three, so an unscaled ratio would contribute half a
-	// radius every frame and saturate instantly. At this value a walk is a
-	// suggestion, a sprint is clearly visible, and Lens Lag still scales the
-	// result the same way it scales a pan.
-	inline constexpr float kTranslationLagGain = 0.05F;
+	// Derived rather than guessed, because guessing produced a value five times
+	// too small and a control that did almost nothing at maximum.
+	//
+	// The accumulator decays over 55ms, so at 60fps a constant impulse settles
+	// at roughly 3.8 times its per-frame value. A fast pan sweeps the reference
+	// point about 400 pixels against an aperture radius near 440, which through
+	// kAngularLagGain accumulates to about 1.2 radii -- that is the scale a
+	// strong lag effect actually operates at.
+	//
+	// Aimed movement covers roughly one game unit per frame against an aperture
+	// radius near three. Landing Strafe Lag 1 at a visible-but-modest 0.3 radii
+	// therefore wants 0.3 * 3.3 / 3.8, and the maximum of 4 then reaches about
+	// 1.03 radii, comparable to a hard pan.
+	//
+	// It stays well under the angular gain despite the larger multiplier
+	// because its input is in game units rather than screen widths. Sprinting
+	// is several times faster than walking and rides the same curve; the
+	// accumulator's soft limit at Maximum Eye Travel is what keeps that bounded.
+	inline constexpr float kTranslationLagGain = 0.25F;
 
 	// Returns the frame-rate independent fraction used by a stateful optical
 	// output to approach a new target. Unlike assigning the target directly,
