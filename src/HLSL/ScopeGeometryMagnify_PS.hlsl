@@ -190,7 +190,11 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
         1.0f);
     const float2 currentCenterUv = centerPixels * PixelSize;
 
-    const float imageLag = saturate(ScopeImageStillness);
+    // Ranges past 1 because this is now the only gain on the image. The old
+    // path multiplied Optical Lag Strength, which reaches 4, on top of the
+    // published travel; folding everything into one control and leaving it
+    // capped at 1 quietly removed most of the available throw.
+    const float imageLag = clamp(ScopeImageStillness, 0.0f, 4.0f);
     float2 aperturePivotPixels = currentAimPixels;
     // Lens Center moves the whole optical assembly, not just its mask. The
     // pivot is the fixed point of the magnification, so placing it at the
@@ -231,13 +235,20 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // where it was a moment ago. The eye-box follower decays this to zero at
     // Recenter Speed, which is the catch-up.
     if (physicalEyeTravelValid && imageLag > 0.0f) {
-        const float2 apertureMotionPixels =
+        // Bounded in aperture radii before it becomes pixels. One radius is as
+        // far as the scene can slide and still be a sight picture rather than
+        // a smear against the sampler's clamp, and the shared soft limiter
+        // reaches that asymptotically: ordinary motion stays essentially
+        // linear, so raising the control keeps doing something, while a
+        // violent recoil spike cannot throw the image out of the glass.
+        const float2 lagRadii = ScopeShadowSoftLimitVector(
             float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y) *
-            saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
-            currentProjectedRadius;
+                saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
+                imageLag,
+            1.0f);
         sampleDelta -=
-            apertureMotionPixels *
-            imageLag *
+            lagRadii *
+            currentProjectedRadius *
             PixelSize /
             opticalMagnification;
     }

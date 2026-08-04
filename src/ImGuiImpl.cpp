@@ -206,7 +206,7 @@ namespace ImGuiImpl
 		editorPreview.shadowDepth =
 			std::clamp(shadowDepth, 0.0F, 4.0F);
 		editorPreview.imageStillness =
-			std::clamp(imageStillness, 0.0F, 1.0F);
+			std::clamp(imageStillness, 0.0F, 4.0F);
 		editorPreview.axialBreathing =
 			std::clamp(axialBreathing, 0.0F, 4.0F);
 		editorPreview.recenterSpeed =
@@ -461,7 +461,7 @@ namespace ImGuiImpl
 					1.0F;
 			ins->imageStillness_UI =
 				std::isfinite(data->shaderData.parallax.imageStillness) ?
-					std::clamp(data->shaderData.parallax.imageStillness, 0.0F, 1.0F) :
+					std::clamp(data->shaderData.parallax.imageStillness, 0.0F, 4.0F) :
 					0.0F;
 			ins->axialBreathing_UI =
 				std::isfinite(data->shaderData.parallax.axialBreathing) ?
@@ -622,7 +622,7 @@ namespace ImGuiImpl
 			editedProfile.shaderData.parallax.shadowDepth =
 				std::clamp(shadowDepth_UI, 0.0F, 4.0F);
 			editedProfile.shaderData.parallax.imageStillness =
-				std::clamp(imageStillness_UI, 0.0F, 1.0F);
+				std::clamp(imageStillness_UI, 0.0F, 4.0F);
 			editedProfile.shaderData.parallax.axialBreathing =
 				std::clamp(axialBreathing_UI, 0.0F, 4.0F);
 			editedProfile.shaderData.parallax.recenterSpeed =
@@ -1136,12 +1136,18 @@ namespace ImGuiImpl
 				&imageStillness_UI,
 				0.01F,
 				0.0F,
-				1.0F,
+				4.0F,
 				"%.2f");
 			Tip("How far the magnified image trails when you swing the camera.\n"
 				"0 locks the image to the optic so nothing lags; higher values\n"
-				"let the scene slide further behind before catching up.\n"
-				"Recenter Speed below controls how fast it catches back up.\n"
+				"let the scene slide further behind before catching up. It\n"
+				"saturates smoothly toward one scope radius of travel, so large\n"
+				"values keep adding throw to ordinary movement without letting\n"
+				"a recoil spike throw the picture out of the glass.\n"
+				"\n"
+				"If it still settles too fast to see, lower Recenter Speed:\n"
+				"this sets how far the image falls behind, that sets how long\n"
+				"it stays there.\n"
 				"\n"
 				"Only the picture moves. The reticle stays exactly where the\n"
 				"optic authored it and the point of aim is never displaced, so\n"

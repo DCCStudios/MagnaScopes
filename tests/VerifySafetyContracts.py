@@ -502,11 +502,16 @@ def main() -> int:
         # it is the player's point of aim, and displacing it makes swinging the
         # camera move where the shot lands and then settle it back. Only the
         # authored Lens Center may place that pivot.
-        and "const float imageLag = saturate(ScopeImageStillness);" in shader
+        and "const float imageLag = clamp(ScopeImageStillness, 0.0f, 4.0f);"
+        in shader
         and "aperturePivotPixels += apertureMotionPixels" not in shader
         and "aperturePivotPixels += pixelsToLensOffset - pixelsToCenter;"
         in shader
-        and "sampleDelta -=\n            apertureMotionPixels *" in shader
+        and "sampleDelta -=\n            lagRadii *" in shader
+        # Bounded in aperture radii before it becomes pixels, so raising the
+        # control keeps adding throw to ordinary movement while a recoil spike
+        # cannot slide the picture out of the glass into the sampler's clamp.
+        and "const float2 lagRadii = ScopeShadowSoftLimitVector(" in shader
         and "const float2 samplePivotUv = aperturePivotPixels * PixelSize"
         in shader
         # Fore/aft breathing must stay independent of lateral parallax so

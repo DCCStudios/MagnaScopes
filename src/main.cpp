@@ -2315,7 +2315,7 @@ void HookedUpdate()
 					std::clamp(
 						currentData->shaderData.parallax.imageStillness,
 						0.0F,
-						1.0F),
+						4.0F),
 					std::memory_order_release);
 				Hook::D3D::scopeAxialBreathing.store(
 					std::clamp(
