@@ -530,7 +530,7 @@ def main() -> int:
         # it is the player's point of aim, and displacing it makes swinging the
         # camera move where the shot lands and then settle it back. Only the
         # authored Lens Center may place that pivot.
-        and "const float imageLag = clamp(ScopeImageStillness, 0.0f, 4.0f);"
+        and "const float imageLag = clamp(ScopeImageStillness, 0.0f, 8.0f);"
         in shader
         and "aperturePivotPixels += apertureMotionPixels" not in shader
         and "aperturePivotPixels += pixelsToLensOffset - pixelsToCenter;"

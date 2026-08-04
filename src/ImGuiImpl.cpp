@@ -206,7 +206,7 @@ namespace ImGuiImpl
 		editorPreview.shadowDepth =
 			std::clamp(shadowDepth, 0.0F, 4.0F);
 		editorPreview.imageStillness =
-			std::clamp(imageStillness, 0.0F, 4.0F);
+			std::clamp(imageStillness, 0.0F, 8.0F);
 		editorPreview.axialBreathing =
 			std::clamp(axialBreathing, 0.0F, 4.0F);
 		editorPreview.recenterSpeed =
@@ -461,7 +461,7 @@ namespace ImGuiImpl
 					1.0F;
 			ins->imageStillness_UI =
 				std::isfinite(data->shaderData.parallax.imageStillness) ?
-					std::clamp(data->shaderData.parallax.imageStillness, 0.0F, 4.0F) :
+					std::clamp(data->shaderData.parallax.imageStillness, 0.0F, 8.0F) :
 					0.0F;
 			ins->axialBreathing_UI =
 				std::isfinite(data->shaderData.parallax.axialBreathing) ?
@@ -622,7 +622,7 @@ namespace ImGuiImpl
 			editedProfile.shaderData.parallax.shadowDepth =
 				std::clamp(shadowDepth_UI, 0.0F, 4.0F);
 			editedProfile.shaderData.parallax.imageStillness =
-				std::clamp(imageStillness_UI, 0.0F, 4.0F);
+				std::clamp(imageStillness_UI, 0.0F, 8.0F);
 			editedProfile.shaderData.parallax.axialBreathing =
 				std::clamp(axialBreathing_UI, 0.0F, 4.0F);
 			editedProfile.shaderData.parallax.recenterSpeed =
@@ -1134,20 +1134,23 @@ namespace ImGuiImpl
 			ImGui::DragFloat(
 				"Image Lag",
 				&imageStillness_UI,
-				0.01F,
+				0.02F,
 				0.0F,
-				4.0F,
+				8.0F,
 				"%.2f");
 			Tip("How far the magnified image trails when you swing the camera.\n"
-				"0 locks the image to the optic so nothing lags; higher values\n"
-				"let the scene slide further behind before catching up. It\n"
-				"saturates smoothly toward one scope radius of travel, so large\n"
-				"values keep adding throw to ordinary movement without letting\n"
-				"a recoil spike throw the picture out of the glass.\n"
+				"0 locks the image to the optic so nothing lags.\n"
+				"\n"
+				"The range is wide because the signal underneath it is small:\n"
+				"the weapon lags the camera by a few degrees, so a fast swing\n"
+				"moves the optic about a tenth of a lens radius. Values of 4 to\n"
+				"8 are ordinary here, not extreme. Past roughly one radius of\n"
+				"shift the lens is mostly tube wall, which is a look you may or\n"
+				"may not want.\n"
 				"\n"
 				"If it still settles too fast to see, lower Recenter Speed:\n"
 				"this sets how far the image falls behind, that sets how long\n"
-				"it stays there.\n"
+				"it stays there. A fast settle hides a large amplitude.\n"
 				"\n"
 				"Only the picture moves. The reticle stays exactly where the\n"
 				"optic authored it and the point of aim is never displaced, so\n"

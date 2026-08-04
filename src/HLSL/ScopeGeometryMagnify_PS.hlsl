@@ -190,11 +190,12 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
         1.0f);
     const float2 currentCenterUv = centerPixels * PixelSize;
 
-    // Ranges past 1 because this is now the only gain on the image. The old
-    // path multiplied Optical Lag Strength, which reaches 4, on top of the
-    // published travel; folding everything into one control and leaving it
-    // capped at 1 quietly removed most of the available throw.
-    const float imageLag = clamp(ScopeImageStillness, 0.0f, 4.0f);
+    // Ranges well past 1 because this is the only gain on the image and the
+    // signal it multiplies is small. Published eye travel during a fast swing
+    // is on the order of a tenth of an aperture radius -- the weapon lags the
+    // camera by a few degrees, not by half a lens -- so a gain of 1 produces a
+    // shift barely worth the name.
+    const float imageLag = clamp(ScopeImageStillness, 0.0f, 8.0f);
     float2 aperturePivotPixels = currentAimPixels;
     // Lens Center moves the whole optical assembly, not just its mask. The
     // pivot is the fixed point of the magnification, so placing it at the
@@ -235,17 +236,24 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // where it was a moment ago. The eye-box follower decays this to zero at
     // Recenter Speed, which is the catch-up.
     if (physicalEyeTravelValid && imageLag > 0.0f) {
-        // Bounded in aperture radii before it becomes pixels. One radius is as
-        // far as the scene can slide and still be a sight picture rather than
-        // a smear against the sampler's clamp, and the shared soft limiter
-        // reaches that asymptotically: ordinary motion stays essentially
-        // linear, so raising the control keeps doing something, while a
-        // violent recoil spike cannot throw the image out of the glass.
+        // Bounded in aperture radii before it becomes pixels.
+        //
+        // The bound is two radii, not one. A soft limiter compresses hard as
+        // its input approaches the limit, so a bound of one radius spent most
+        // of the control's upper range fighting itself: doubling the gain near
+        // the knee bought only a few percent more shift, and the slider felt
+        // dead well before its maximum. Two radii keeps the knee outside the
+        // usable range, so the control stays close to linear all the way up
+        // and the limiter does what it is actually for -- stopping a recoil
+        // spike from throwing the picture clean out of the glass.
+        //
+        // Past about one radius the lens is mostly tube wall, which is the
+        // player's decision to make, not something to clamp away.
         const float2 lagRadii = ScopeShadowSoftLimitVector(
             float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y) *
                 saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
                 imageLag,
-            1.0f);
+            2.0f);
         sampleDelta -=
             lagRadii *
             currentProjectedRadius *
