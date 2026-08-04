@@ -1239,7 +1239,12 @@ std::vector<STSApertureCandidate> FindSTSApertureCandidates(
 		return candidates;
 	}
 
-	constexpr std::size_t kMaximumVisitedObjects = 512U;
+	// Searched from the first-person root, not from the ScopeAiming node.
+	// Anchoring to that node missed scopes whose aperture shape sits outside
+	// it -- the node exists, nothing beneath it matches, and the scope showed
+	// nothing. The three names are STS-specific enough to search wider, and
+	// the visit bound rises to suit the larger tree.
+	constexpr std::size_t kMaximumVisitedObjects = 4096U;
 	constexpr std::size_t kMaximumCandidates = 16U;
 	std::vector<RE::NiAVObject*> pending{ searchRoot };
 	for (std::size_t cursor = 0;
@@ -1419,16 +1424,16 @@ STSApertureSelection FindSTSAperture(RE::NiAVObject* firstPersonRoot)
 	// Do not substitute optional Glass, Lens, ScreenWarp or EdgeBlur here:
 	// Stage 4c proved those differ between scope NIFs. The candidates are
 	// limited to the three structural names STS itself defines.
-	auto apertureCandidates = FindSTSApertureCandidates(scopeAiming);
+	auto apertureCandidates = FindSTSApertureCandidates(firstPersonRoot);
 	if (apertureCandidates.empty()) {
 		// A scope with no usable aperture shape produces nothing at all, which
 		// is indistinguishable from the plugin being off. Name it once.
 		static std::once_flag loggedNoCandidates;
-		std::call_once(loggedNoCandidates, [scopeAiming] {
+		std::call_once(loggedNoCandidates, [] {
 			logger::warn(
-				"No aperture shape found under '{}': needs a BSTriShape named "
-				"ScopeFade, ScopeViewParts or ScopeAiming",
-				scopeAiming->name.c_str());
+				"No aperture shape found on this weapon: needs a BSTriShape "
+				"whose name starts with ScopeFade, ScopeViewParts or "
+				"ScopeAiming");
 		});
 		return {};
 	}
