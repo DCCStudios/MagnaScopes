@@ -215,8 +215,10 @@ ReticleCompositeOutput main(VertexPosHTex input)
     // put and its image stays current; only the opening they are seen through
     // swings, and both layers must agree on where that opening is or the
     // reticle stays lit inside a crescent the scene has already darkened.
+    // Negated to match the scene replay exactly: the opening trails the swing
+    // rather than leading it.
     const float2 lensLagWindowLocal = ScopeShadowSoftLimitVector(
-        eyeTravelLocal * clamp(ScopeImageStillness, 0.0f, 8.0f),
+        -eyeTravelLocal * clamp(ScopeImageStillness, 0.0f, 8.0f),
         3.0f);
 
     const ScopeShadowLayers shadow = EvaluateScopeShadow(

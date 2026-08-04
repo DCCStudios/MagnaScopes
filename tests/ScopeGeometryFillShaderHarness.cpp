@@ -1560,6 +1560,11 @@ Output main(Input input)
 			positiveOpticalSample[1], neutralOpticalSample[1]) <= 3 &&
 		channelDifference(
 			negativeOpticalSample[1], neutralOpticalSample[1]) <= 3;
+	// Back to neutral before anything else runs. Lens Lag opposes the base
+	// exit-pupil travel and outweighs it eight to one at maximum, so leaving it
+	// set silently inverts the pupil direction every later check measures.
+	setImageLag(0.0F);
+
 	if (!zeroLagIsNeutral ||
 		!positiveTravelLeavesContentPut ||
 		!negativeTravelLeavesContentPut ||
@@ -2191,7 +2196,11 @@ Output main(Input input)
 	updateScopeEffect(1.0F, 1.0F);
 	resolution.vignetteReach = 9.0F;
 	resolution.vignetteSharpness = 3.0F;
-	resolution.eyeBoxRadius = 2.0F;
+	// A forgiving eye box keeps the lit disc wide enough that both mid-lens
+	// samples stay lit however far the opening slides, which would make this
+	// check pass on a few units of noise. Tighten it so the opening genuinely
+	// crosses them.
+	resolution.eyeBoxRadius = 0.5F;
 	resolution.eyeBoxMaxTravel = 4.0F;
 	resolution.eyeOffsetX = 0.15F;
 

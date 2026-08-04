@@ -568,6 +568,12 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // Lens Lag: the visible opening swings off centre while the image behind
     // it stays exactly where the reticle says it is.
     //
+    // Negated. Swinging right must leave the opening behind, to the left --
+    // that is what "lag" names. Published travel carries the sign that walks
+    // it the other way, which reads as the lens leading the mouse. The rendered
+    // result is the authority on this sign; it has been derived both ways in
+    // this file and the derivation is not trustworthy.
+    //
     // Additive rather than a multiplier on eye travel, so zero leaves the
     // ordinary exit-pupil response untouched instead of switching it off.
     // Bounded well past the aperture: the pupil disc leaving the glass
@@ -575,7 +581,7 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // the sight picture behind the tube wall is -- but an unbounded value
     // could park it there permanently after one recoil spike.
     const float2 lensLagWindow = ScopeShadowSoftLimitVector(
-        eyeTravelLens * imageLag,
+        -eyeTravelLens * imageLag,
         3.0f);
 
     const ScopeShadowLayers shadow = EvaluateScopeShadow(

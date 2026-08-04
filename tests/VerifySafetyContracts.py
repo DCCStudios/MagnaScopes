@@ -573,7 +573,11 @@ def main() -> int:
         # identically in both layers or the reticle sits lit inside a crescent
         # the scene has already darkened.
         and "const float2 lensLagWindow = ScopeShadowSoftLimitVector(" in shader
-        and "eyeTravelLens * imageLag," in shader
+        # Negated: swinging right must leave the opening behind, to the left.
+        # Published travel carries the sign that walks it the other way, which
+        # reads as the lens leading the mouse.
+        and "-eyeTravelLens * imageLag," in shader
+        and "-eyeTravelLocal * clamp(ScopeImageStillness" in reticle_shader
         and "+ lensLagWindow," in shader
         and "lensLagWindowLocal" in reticle_shader
         and "const float2 samplePivotUv = aperturePivotPixels * PixelSize"
