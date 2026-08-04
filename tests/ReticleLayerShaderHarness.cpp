@@ -354,14 +354,21 @@ Output main(uint vertexId : SV_VertexID)
 			// The production reticle layer reads the lens and shadow depth
 			// separation from ScopeEffectData at b5. Bind a valid fixture buffer
 			// rather than relying on undefined state from an unbound slot.
+			// Image Lag lives at slot 88 and has to be settable per test. It
+			// governs both the reticle's translation and, through the tests
+			// that assume a centred reticle, whether the shadow checks are
+			// sampling where they think they are -- pinning it high for the
+			// whole fixture walks the reticle out from under them.
 			std::array<float, 92> scopeEffectConstants{};
 			scopeEffectConstants[86] = 1.0F;
 			scopeEffectConstants[87] = 1.0F;
+			scopeEffectConstants[88] = 0.0F;
 			D3D11_BUFFER_DESC scopeEffectDescription{};
 			scopeEffectDescription.ByteWidth =
 				static_cast<UINT>(scopeEffectConstants.size() * sizeof(float));
-			scopeEffectDescription.Usage = D3D11_USAGE_IMMUTABLE;
+			scopeEffectDescription.Usage = D3D11_USAGE_DYNAMIC;
 			scopeEffectDescription.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+			scopeEffectDescription.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 			const D3D11_SUBRESOURCE_DATA scopeEffectData{
 				scopeEffectConstants.data(),
 				0U,
@@ -406,6 +413,30 @@ Output main(uint vertexId : SV_VertexID)
 					&blendDescription,
 					dualSourceBlend.GetAddressOf()),
 				"CreateBlendState(dual-source reticle)");
+		}
+
+		// Image Lag (ScopeImageStillness, b5 slot 88). Drives both the scene
+		// replay's sample pivot and, through it, how far the reticle follows.
+		void SetImageLag(float lag)
+		{
+			std::array<float, 92> scopeEffectConstants{};
+			scopeEffectConstants[86] = 1.0F;
+			scopeEffectConstants[87] = 1.0F;
+			scopeEffectConstants[88] = lag;
+			D3D11_MAPPED_SUBRESOURCE mapping{};
+			Check(
+				context->Map(
+					scopeEffectBuffer.Get(),
+					0U,
+					D3D11_MAP_WRITE_DISCARD,
+					0U,
+					&mapping),
+				"Map(scope effect)");
+			std::memcpy(
+				mapping.pData,
+				scopeEffectConstants.data(),
+				scopeEffectConstants.size() * sizeof(float));
+			context->Unmap(scopeEffectBuffer.Get(), 0U);
 		}
 
 		std::vector<std::uint8_t> Render(
@@ -811,26 +842,24 @@ try {
 			"reticle local offset was scaled or changed reticle coverage");
 	}
 
-	// The isolated reticle follows the same bounded scene-parallax display
-	// translation while remaining independent of scene magnification.
+	// The isolated reticle follows the lagging image while remaining
+	// independent of scene magnification.
 	ResolutionConstants movingConstants{};
-	movingConstants.sceneParallaxStrength = 1.0F;
 	movingConstants.eyeOffsetX = 0.5F;
 	movingConstants.opticalLagStrength = 1.0F;
 	movingConstants.eyeBoxRadius = 4.0F;
+	fixture.SetImageLag(1.0F);
 	const auto movingOneX = fixture.Render(movingConstants, centeredLayer);
 	const auto movingOneMetrics = AnalyzeDifference(movingOneX);
 	movingConstants.sceneMagnification = 4.0F;
 	const auto movingFourX = fixture.Render(movingConstants, centeredLayer);
-	// Scene parallax saturates through ScopeShadowSoftLimitVector at one
-	// aperture radius, the same limiter the magnified replay applies, so the
-	// two layers stay locked together. Deriving the expectation from that
-	// formula keeps this test honest if the limit is ever retuned; the
-	// retired 1/(1 + 2m) form produced 14.0 pixels here, discarding nearly
-	// half of an ordinary half-radius shift.
+	// Raw aperture motion times Image Lag times Reticle Parallax Strength,
+	// which is exactly the pivot displacement the scene replay applies. It is
+	// deliberately not passed through the soft limiter or scaled by Optical Lag
+	// Strength: reproducing the retired delta path's chain of gains here is
+	// what previously let the reticle track a curve the image was not on.
 	constexpr double kTravel = 0.5;
-	const double expectedTravelPixels =
-		kTravel / std::sqrt(1.0 + kTravel * kTravel) * 56.0;
+	const double expectedTravelPixels = kTravel * 56.0;
 	if (movingOneX != movingFourX ||
 		std::abs(
 			movingOneMetrics.centerX -
@@ -879,8 +908,11 @@ try {
 	// because the magnified scene beneath it is also still lit. The retired
 	// unbounded formulation blacked out the whole lens here, which is the
 	// defect in-game testers reported.
+	// Image Lag back to zero: this check is about the shadow, and a following
+	// reticle would walk out from under the sample point rather than testing
+	// whether the pupil dimmed it.
+	fixture.SetImageLag(0.0F);
 	ResolutionConstants alignedMaximumTravel{};
-	alignedMaximumTravel.sceneParallaxStrength = 0.0F;
 	alignedMaximumTravel.eyeOffsetX = 4.0F;
 	alignedMaximumTravel.eyeBoxMaxTravel = 4.0F;
 	alignedMaximumTravel.eyeBoxRadius = 0.1F;

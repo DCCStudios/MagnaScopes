@@ -1462,15 +1462,26 @@ Output main(Input input)
 		return 1;
 	}
 
-	// Prove the optical-lag sign with a directional source rather than a
-	// uniform lens. Positive ScopeFade-local eye travel must counter-shift the
-	// sampled scene toward lower source X, while negative travel must shift it
-	// toward higher source X. Setting OpticalLagStrength to zero must restore
+	// Prove the image-lag sign with a directional source rather than a uniform
+	// lens. Image Lag shifts the sample pivot, so eye travel must move the
+	// sampled point along source X, and setting Image Lag to zero must restore
 	// the neutral sample even when eye-motion telemetry is non-zero.
+	//
+	// Magnification must be above 1 here. A pivot shift of d moves the sampled
+	// point by d * (1 - 1/M), which is identically zero at 1x -- correctly, as
+	// an unmagnified view has no parallax to show -- so testing this at 1x
+	// would assert nothing. That is exactly what happened when this test still
+	// drove the retired delta path, whose d/M term stayed alive at 1x.
 	submitLensPose(-kCenterNdcX, -kCenterNdcY);
-	resolution.magnification = 1.0F;
+	resolution.magnification = 2.0F;
 	resolution.aimOffsetValid = 0.0F;
-	resolution.sceneParallaxStrength = 1.0F;
+	// ScopeImageStillness is b5 slot 88, two past the scene/shadow depth pair
+	// updateScopeEffect writes.
+	const auto setImageLag = [&](float lag) {
+		scopeEffectConstants[88] = lag;
+		updateScopeEffect(1.0F, 1.0F);
+	};
+	setImageLag(1.0F);
 	resolution.physicalEyeBoxValid = 1.0F;
 	resolution.lensRadiusX = 40.0F;
 	resolution.lensRadiusY = 40.0F;
@@ -1505,14 +1516,17 @@ Output main(Input input)
 
 	resolution.eyeOffsetX = 0.0F;
 	resolution.eyeOffsetY = 0.0F;
-	resolution.opticalLagStrength = 1.0F;
 	const auto neutralOpticalSample = renderOpticalLagSample();
 
+	// Image Lag at zero must pin the image to the optic even with live
+	// telemetry. Optical Lag Strength is deliberately left at 1 here: it drives
+	// the exit pupil, and the image must not respond to it at all.
 	resolution.eyeOffsetX = 0.30F;
-	resolution.opticalLagStrength = 0.0F;
+	setImageLag(0.0F);
+	resolution.opticalLagStrength = 1.0F;
 	const auto disabledOpticalSample = renderOpticalLagSample();
 
-	resolution.opticalLagStrength = 1.0F;
+	setImageLag(1.0F);
 	const auto positiveOpticalSample = renderOpticalLagSample();
 
 	resolution.eyeOffsetX = -0.30F;
@@ -1521,25 +1535,28 @@ Output main(Input input)
 	const auto channelDifference = [](std::uint8_t left, std::uint8_t right) {
 		return std::abs(static_cast<int>(left) - static_cast<int>(right));
 	};
-	const bool zeroStrengthIsNeutral =
+	const bool zeroLagIsNeutral =
 		channelDifference(
 			disabledOpticalSample[0], neutralOpticalSample[0]) <= 3 &&
 		channelDifference(
 			disabledOpticalSample[1], neutralOpticalSample[1]) <= 3;
-	const bool positiveTravelLagsLeft =
-		static_cast<int>(positiveOpticalSample[0]) + 10 <
-		static_cast<int>(neutralOpticalSample[0]);
-	const bool negativeTravelLagsRight =
-		static_cast<int>(negativeOpticalSample[0]) >
+	// Published travel is the eye's displacement, the negation of the optic's
+	// screen motion, so adding it to the pivot samples further along source X
+	// and the image slides the other way beneath a housing that keeps moving.
+	const bool positiveTravelSamplesHigherX =
+		static_cast<int>(positiveOpticalSample[0]) >
 		static_cast<int>(neutralOpticalSample[0]) + 10;
+	const bool negativeTravelSamplesLowerX =
+		static_cast<int>(negativeOpticalSample[0]) + 10 <
+		static_cast<int>(neutralOpticalSample[0]);
 	const bool verticalChannelRemainsStable =
 		channelDifference(
 			positiveOpticalSample[1], neutralOpticalSample[1]) <= 3 &&
 		channelDifference(
 			negativeOpticalSample[1], neutralOpticalSample[1]) <= 3;
-	if (!zeroStrengthIsNeutral ||
-		!positiveTravelLagsLeft ||
-		!negativeTravelLagsRight ||
+	if (!zeroLagIsNeutral ||
+		!positiveTravelSamplesHigherX ||
+		!negativeTravelSamplesLowerX ||
 		!verticalChannelRemainsStable) {
 		std::cerr << std::format(
 			"Optical lag direction failed: neutral=({}, {}, {}), "

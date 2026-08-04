@@ -473,15 +473,14 @@ def main() -> int:
         and "const float2 pixelsToUnitX" in shader
         and "const float2 pixelsToUnitZ" in shader
         and "const float2 currentAimPixels" in shader
-        # The sample pivot now declines a configurable fraction of the
-        # aperture's own screen motion, which is what makes the image read
-        # as sitting far behind the housing. Scaling the pivot rather than
-        # the delta is required: only the pivot form cancels that motion
-        # identically at every magnification.
-        and "const float imageStillness = saturate(ScopeImageStillness);"
-        in shader
-        and "aperturePivotPixels += apertureMotionPixels * imageStillness;"
-        in shader
+        # Image Lag is the single control for the image trailing the reticle,
+        # and it declines a fraction of the aperture's own screen motion at the
+        # sample pivot. Scaling the pivot rather than the delta is required:
+        # only the pivot form cancels that motion identically at every
+        # magnification, which is why the delta path it replaced could not hold
+        # the image still however many gains were stacked on it.
+        and "const float imageLag = saturate(ScopeImageStillness);" in shader
+        and "aperturePivotPixels += apertureMotionPixels * imageLag;" in shader
         and "const float2 samplePivotUv = aperturePivotPixels * PixelSize"
         in shader
         # Fore/aft breathing must stay independent of lateral parallax so
@@ -633,19 +632,23 @@ def main() -> int:
         and "const float2 axisOffsetLens" not in shader
         and "opticalAxisPixels" not in shader
         and "opticalAxisPixels" not in reticle_shader
-        and "SCOPE_SCENE_PARALLAX_STRENGTH" in shader
-        and (
-            "physicalEyeTravel /" in shader
-            or "const float2 depthTravel = physicalEyeTravel * sceneDepth" in shader
-        )
-        # Scene parallax saturates through the same shared soft limiter the
-        # exit pupil uses, bounded to one aperture radius. The retired
-        # 1/(1 + 2m) form removed roughly 29% of an ordinary 0.2-radius shift
-        # and flattened exactly the motion that conveys optical depth.
-        and "ScopeShadowSoftLimitVector(depthTravel, 1.0f)" in shader
-        and "1.0f + 2.0f * sceneTravelLength" not in shader
-        and "sampleDelta -=\n            eyeParallaxPixels" in shader,
-        "aperture-derived shadow fit or bounded scene parallax is missing",
+        # The delta-space image-lag path is retired. It multiplied Lens Depth
+        # Separation and Scene Parallax Strength on top of the Optical Lag
+        # Strength already folded into the travel -- three gains for one
+        # effect -- and none of them could hold the image still, because a
+        # delta shift moves the sampled point by d/M while the pivot term it
+        # was fighting carries a (1 - 1/M) factor. Image Lag drives the pivot
+        # alone. Neither shader may read those gains again.
+        and "SCOPE_SCENE_PARALLAX_STRENGTH" not in shader
+        and "SCOPE_SCENE_PARALLAX_STRENGTH" not in reticle_shader
+        and "ScopeSceneDepth" not in shader
+        and "ScopeSceneDepth" not in reticle_shader
+        and "eyeParallaxPixels" not in shader
+        and "const float2 depthTravel" not in shader
+        # Eye travel survives for the exit pupil, still bounded by Maximum Eye
+        # Travel before it reaches the pupil.
+        and "physicalEyeTravel *= maximumTravel / travelLength;" in shader,
+        "aperture-derived shadow fit or retired delta-space image lag",
     )
     require(
         "float maxTravel = 4;" in data_h
@@ -1075,7 +1078,13 @@ def main() -> int:
         and "SCOPE_RETICLE_SIZE" in reticle_shader
         and "SCOPE_RETICLE_OFFSET_X" in reticle_shader
         and "SCOPE_RETICLE_OFFSET_Y" in reticle_shader
-        and "SCOPE_SCENE_PARALLAX_STRENGTH" in reticle_shader
+        # The reticle follows the lagging image through the same raw aperture
+        # motion and the same Image Lag the scene replay pivots by. Rebuilding
+        # the retired delta path's chain of gains here is what made the two
+        # disagree during fast inertia.
+        and "saturate(ScopeImageStillness) *" in reticle_shader
+        and "clamp(SCOPE_RETICLE_PARALLAX_STRENGTH, 0.0f, 4.0f);"
+        in reticle_shader
         and "SCOPE_EYE_OFFSET_X" in reticle_shader
         and "reticle.sourceContribution *= reticleVisibility"
         in reticle_shader

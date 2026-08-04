@@ -59,15 +59,14 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
             clamp(SCOPE_EYE_RELIEF_DELTA, -0.25f, 0.25f) *
                 physicalEyeBoxBlend * activation :
             0.0f;
-    const float sceneDepth = clamp(ScopeSceneDepth, 0.0f, 4.0f);
     const float shadowDepth = clamp(ScopeShadowDepth, 0.0f, 4.0f);
-    // Fore/aft breathing is its own control. It used to be driven by
-    // ScopeSceneDepth, which also scales lateral parallax, so raising lateral
-    // parallax unavoidably made the image appear to move closer and farther.
-    // Worse, the underlying eye-relief signal was measured along the aperture's
-    // own local normal, and that frame rotates with the weapon, so lateral
-    // weapon swing during a yaw leaked into the axial term: panning left and
-    // right read as depth. Default zero keeps apparent size fixed.
+    // Fore/aft breathing is its own control. It used to share a gain with the
+    // lateral lag, so raising the lag unavoidably made the image appear to
+    // move closer and farther. Worse, the underlying eye-relief signal was
+    // measured along the aperture's own local normal, and that frame rotates
+    // with the weapon, so lateral weapon swing during a yaw leaked into the
+    // axial term: panning left and right read as depth. Default zero keeps
+    // apparent size fixed.
     const float axialBreathing = clamp(ScopeAxialBreathing, 0.0f, 4.0f);
     // Positive relief means the eyepiece moved farther from the camera. Its
     // apparent optical image and exit pupil therefore contract; moving closer
@@ -191,19 +190,22 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
         1.0f);
     const float2 currentCenterUv = centerPixels * PixelSize;
 
-    // Optical tube depth. The authored aperture is the near end of a tube and
-    // the magnified image sits far behind it, so when the housing sways the
-    // image should not travel with it one-for-one. The game thread publishes
-    // how far the aperture has moved from its settled screen position, in
-    // aperture radii; declining to follow that fraction of the motion is what
-    // reads as depth.
+    // Image Lag. The authored aperture is the near end of a tube and the
+    // magnified image sits far behind it, so when the housing swings the image
+    // should not travel with it one-for-one. The game thread publishes how far
+    // the aperture has moved from its settled screen position, in aperture
+    // radii; declining to follow that fraction of the motion is what reads as
+    // the image trailing the reticle. The eye-box follower supplies the
+    // catch-up, at the rate Recenter Speed sets.
     //
-    // This has to scale the sample pivot, not the sample delta. A pivot shift
-    // of d changes the sampled point by d * (1 - 1/M), while a delta shift
-    // changes it by d / M. Only the pivot form cancels the aperture's own
-    // motion identically at every magnification, which is why the existing
-    // scene-parallax control could never actually hold the image still.
-    const float imageStillness = saturate(ScopeImageStillness);
+    // This is now the only path by which the image lags, and it scales the
+    // sample pivot rather than the sample delta. A pivot shift of d changes
+    // the sampled point by d * (1 - 1/M) while a delta shift changes it by
+    // d / M, so only the pivot form cancels the aperture's own motion
+    // identically at every magnification. The retired delta path could not,
+    // which is why stacking Lens Depth Separation and Scene Parallax Strength
+    // on top of it still never held the image still.
+    const float imageLag = saturate(ScopeImageStillness);
     float2 aperturePivotPixels = currentAimPixels;
     // Lens Center moves the whole optical assembly, not just its mask. The
     // pivot is the fixed point of the magnification, so placing it at the
@@ -214,7 +216,7 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     if (lensOffsetSolveValid) {
         aperturePivotPixels += pixelsToLensOffset - pixelsToCenter;
     }
-    if (physicalEyeTravelValid && imageStillness > 0.0f) {
+    if (physicalEyeTravelValid && imageLag > 0.0f) {
         const float2 apertureMotionPixels =
             float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y) *
             saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
@@ -222,7 +224,7 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
         // Published travel is the eye's displacement, which is the negation of
         // the optic's screen motion. Adding it therefore removes the aperture's
         // excursion from the pivot and leaves the image where it settled.
-        aperturePivotPixels += apertureMotionPixels * imageStillness;
+        aperturePivotPixels += apertureMotionPixels * imageLag;
     }
     const float2 samplePivotUv = aperturePivotPixels * PixelSize;
 
@@ -238,7 +240,7 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
             1.0f;
     const float sampleMagnification =
         opticalMagnification *
-        lerp(1.0f, apertureScaleRatio, imageStillness);
+        lerp(1.0f, apertureScaleRatio, imageLag);
     float2 sampleDelta =
         (screenUv - samplePivotUv) / max(sampleMagnification, 0.0001f);
     const float radialPosition =
@@ -273,11 +275,20 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
         (refractionStrength * edgeWeight) /
         opticalMagnification;
 
-    // A real optic's scene shifts slightly beneath the fixed housing as the
-    // eye leaves the optical axis. The game thread publishes transient travel
-    // in render-target X/Y, normalized by the projected aperture radius. Do
-    // not rotate this value through ScopeFade's world-facing X/Z basis: doing
-    // so made identical camera motion reverse with heading and pitch.
+    // Transient eye motion, used from here on only by the exit pupil. The
+    // game thread publishes it in render-target X/Y, normalized by the
+    // projected aperture radius. Do not rotate this value through ScopeFade's
+    // world-facing X/Z basis: doing so made identical camera motion reverse
+    // with heading and pitch.
+    //
+    // The magnified image no longer reads this. It used to lag through a
+    // second, delta-space path scaled by Lens Depth Separation and Scene
+    // Parallax Strength on top of the Optical Lag Strength already folded in
+    // here -- three multiplied gains for one effect, none of which could
+    // actually hold the image still, because a delta shift of d moves the
+    // sampled point by d/M while the pivot shift the aperture itself
+    // contributes carries a (1 - 1/M) factor the delta term cannot cancel.
+    // Image Lag drives the pivot alone; see the sample-pivot block above.
     float2 physicalEyeTravel = float2(0.0f, 0.0f);
     if (physicalEyeTravelValid) {
         physicalEyeTravel =
@@ -286,37 +297,13 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
             clamp(SCOPE_OPTICAL_LAG_STRENGTH, 0.0f, 4.0f);
         // The game-thread EMA already removes pose noise. Do not introduce a
         // second hard dead zone here: zeroing a nearly centered value makes
-        // the optical image snap after it has smoothly approached center.
+        // the exit pupil snap after it has smoothly approached center.
         const float travelLength = length(physicalEyeTravel);
         const float maximumTravel =
             clamp(SCOPE_EYEBOX_MAX_TRAVEL, 0.0f, 4.0f);
         if (travelLength > maximumTravel && travelLength > 0.00001f) {
             physicalEyeTravel *= maximumTravel / travelLength;
         }
-        // The shadow may travel the full configured distance. Scene parallax
-        // uses a smooth asymptotic limiter rather than the previous hard
-        // one-radius clamp: small inertia remains responsive, while large
-        // recoil can never displace the sample by an unbounded amount or
-        // create a visible derivative discontinuity.
-        const float2 depthTravel = physicalEyeTravel * sceneDepth;
-        // One aperture radius is the largest scene shift that still keeps a
-        // recognizable image behind the aperture. The shared soft limiter
-        // reaches that bound asymptotically while leaving ordinary small
-        // inertia essentially linear, which the previous 1/(1+2m) form did
-        // not: it removed roughly 29% of a 0.2-radius shift and flattened the
-        // very motion that sells optical depth.
-        const float2 sceneTravel =
-            ScopeShadowSoftLimitVector(depthTravel, 1.0f);
-        const float2 eyeParallaxPixels =
-            sceneTravel * currentProjectedRadius;
-        // The scene counter-shifts beneath the fixed housing. Using the same
-        // sign as measured eye motion made the image lead and overshoot the
-        // weapon; subtracting it produces the expected optical lag.
-        sampleDelta -=
-            eyeParallaxPixels *
-            PixelSize *
-            (clamp(SCOPE_SCENE_PARALLAX_STRENGTH, 0.0f, 2.0f) /
-             opticalMagnification);
     }
 
     // Breathing sway. The shooter's whole hold drifts, so the scene swims

@@ -26,13 +26,23 @@ namespace ScopeData
 		float relativeFogRadius = 9;
 		float scopeSwayAmount = 3;
 		float maxTravel = 4;
-		// Distances between the authored aperture, the magnified scene, and
-		// the exit-pupil shadow. Values above one exaggerate tube depth.
+		// Retired. Scaled a second, delta-space image-lag path that no shader
+		// reads any more. Kept so existing profiles round-trip unchanged and
+		// the version migrations below still compile; not shown in the editor.
 		float sceneDepth = 1.0F;
+		// Virtual distance between the authored aperture and the exit-pupil
+		// shadow. Values above one exaggerate pupil travel.
 		float shadowDepth = 1.0F;
-		// Fraction of the aperture's own screen motion the magnified image
-		// declines to follow. 1 leaves the image world-static while the
-		// housing slides over it, which is what conveys tube depth.
+		// Image Lag: the fraction of the aperture's own screen motion the
+		// magnified image declines to follow. 1 leaves the image world-static
+		// while the housing swings over it, which is what makes it trail the
+		// reticle. The eye-box follower supplies the catch-up at recenterSpeed.
+		//
+		// This is the single control for that effect. It used to be one of
+		// four: sceneDepth and sceneParallaxStrength multiplied a second,
+		// delta-space path that could not hold the image still at any setting,
+		// and opticalLagStrength scaled its input again. Both are retired --
+		// old profiles simply carry unread keys.
 		float imageStillness = 0.0F;
 		// Fore/aft apparent-size breathing, independent of sceneDepth so
 		// lateral parallax cannot make the image read as moving closer.
@@ -122,14 +132,15 @@ namespace ScopeData
 		float edgeRefractionStrength = 0.0F;
 		float edgeRefractionWidth = 0.15F;
 		float edgeChromaticAberration = 0.0F;
-		// Moves the sampled scene beneath the fixed physical aperture as the
-		// eye leaves the optical axis. This is expressed in aperture radii and
-		// is separate from the exit-pupil shadow travel.
+		// Retired alongside parallax.sceneDepth: the delta-space image-lag
+		// path these two scaled is gone. Kept for profile round-tripping and
+		// the version migrations below; not shown in the editor.
 		float sceneParallaxStrength = 0.0F;
 		// Multiplies transient ScopeFade-local eye motion before it drives the
-		// exit pupil and scene counter-shift. It does not change the settled
-		// center, so ordinary camera pitch/yaw cannot permanently offset the
-		// optic.
+		// exit pupil. It does not change the settled center, so ordinary
+		// camera pitch/yaw cannot permanently offset the optic. The magnified
+		// image is deliberately not scaled by this: Image Lag alone governs
+		// how far the image trails.
 		float opticalLagStrength = 1.0F;
 
 		// Optional single-pass cleanup for the automatic STS scene sample.

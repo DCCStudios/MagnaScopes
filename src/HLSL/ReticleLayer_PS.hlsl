@@ -95,35 +95,43 @@ ReticleCompositeOutput main(VertexPosHTex input)
                 0.5f * (SCOPE_LENS_RADIUS_X + SCOPE_LENS_RADIUS_Y),
                 1.0f);
 
-    // Reproduce the scene shader's bounded transient eye motion exactly.
-    // The plus sign is the inverse display-space mapping of the scene
-    // shader's negative source-sample shift. Scene magnification is
-    // deliberately absent: the reticle translates with the optical image
-    // but keeps its independently configured scale.
+    // Transient eye motion, used from here on only by the exit pupil, exactly
+    // as in the scene replay.
     float2 physicalEyeTravel = float2(0.0f, 0.0f);
-    float2 opticalTranslation = float2(0.0f, 0.0f);
     if (physicalEyeTravelValid) {
         physicalEyeTravel =
             float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y) *
             saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
             clamp(SCOPE_OPTICAL_LAG_STRENGTH, 0.0f, 4.0f);
         // The CPU eye-box output is already filtered. Keep the final tiny
-        // motion continuous so the reticle cannot snap when the lens settles.
+        // motion continuous so the pupil cannot snap when the lens settles.
         const float travelLength = length(physicalEyeTravel);
         const float maximumTravel =
             clamp(SCOPE_EYEBOX_MAX_TRAVEL, 0.0f, 4.0f);
         if (travelLength > maximumTravel && travelLength > 0.00001f) {
             physicalEyeTravel *= maximumTravel / travelLength;
         }
-        const float reticleDepth = clamp(ScopeSceneDepth, 0.0f, 4.0f);
-        const float2 depthTravel = physicalEyeTravel * reticleDepth;
-        // Must stay bit-for-bit the same limiter the scene replay applies, or
-        // the reticle drifts off the magnified image during fast inertia.
-        const float2 sceneTravel =
-            ScopeShadowSoftLimitVector(depthTravel, 1.0f);
+    }
+
+    // How far the reticle follows the lagging image. It is fixed to the
+    // weapon, so the physical answer is "not at all" and Reticle Parallax
+    // Strength defaults low; this exists because an authored reticle that
+    // detaches completely from the sight picture can read as a HUD overlay.
+    //
+    // It must be derived from the same raw aperture motion and the same Image
+    // Lag the scene replay pivots by, unscaled by Optical Lag Strength and
+    // unlimited by the soft limiter, or the reticle tracks a curve the image
+    // is not on. Reproducing the retired delta path's chain of gains here is
+    // what previously made these two disagree during fast inertia.
+    float2 opticalTranslation = float2(0.0f, 0.0f);
+    if (physicalEyeTravelValid) {
+        const float2 apertureMotionPixels =
+            float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y) *
+            saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
+            projectedRadius;
         opticalTranslation =
-            sceneTravel * projectedRadius *
-            clamp(SCOPE_SCENE_PARALLAX_STRENGTH, 0.0f, 2.0f) *
+            apertureMotionPixels *
+            saturate(ScopeImageStillness) *
             clamp(SCOPE_RETICLE_PARALLAX_STRENGTH, 0.0f, 4.0f);
     }
 

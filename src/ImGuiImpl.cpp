@@ -1118,26 +1118,22 @@ namespace ImGuiImpl
 					"brightness; lower values tint the whole scope darker.");
 			}
 			ImGui::DragFloat(
-				"Scene Parallax Strength",
-				&sceneParallaxStrength_UI,
+				"Image Lag",
+				&imageStillness_UI,
 				0.01F,
 				0.0F,
-				2.0F,
+				1.0F,
 				"%.2f");
-			Tip("Moves the magnified scene beneath the fixed ScopeFade aperture as\n"
-				"the eye leaves the optical axis. The visible scene shift is capped\n"
-				"separately from Maximum Eye Travel to remain stable during recoil.");
-			ImGui::DragFloat(
-				"Lens Depth Separation",
-				&sceneDepth_UI,
-				0.01F,
-				0.0F,
-				4.0F,
-				"%.2f");
-			Tip(
-				"Sets the virtual distance between the fixed ScopeFade aperture and\n"
-				"the magnified scene. Higher values strengthen both lateral parallax\n"
-				"and subtle fore/aft image breathing.");
+			Tip("How far the magnified image trails the reticle when you swing\n"
+				"the camera. 0 locks the image to the optic so nothing lags. 1\n"
+				"holds it world-static while the housing swings over it, which\n"
+				"reads as a long tube with the image far behind the glass.\n"
+				"Recenter Speed below controls how fast it catches back up.\n"
+				"\n"
+				"This replaces Scene Parallax Strength and Lens Depth\n"
+				"Separation, which multiplied a second path that could not hold\n"
+				"the image still at any setting. It behaves identically at\n"
+				"every magnification.");
 			ImGui::DragFloat(
 				"Shadow Depth Separation",
 				&shadowDepth_UI,
@@ -1156,22 +1152,10 @@ namespace ImGuiImpl
 				0.0F,
 				4.0F,
 				"%.2f");
-			Tip("Scales transient weapon-motion response for both the exit-pupil\n"
-				"shadow and scene counter-shift. 0 disables motion lag, 1 uses\n"
-				"the measured movement, and higher values exaggerate it.");
-			ImGui::DragFloat(
-				"Image Stillness",
-				&imageStillness_UI,
-				0.01F,
-				0.0F,
-				1.0F,
-				"%.2f");
-			Tip("How much of the housing's own screen movement the magnified\n"
-				"image refuses to follow. 0 locks the image to the optic. 1 holds\n"
-				"it still while the housing slides over it, which is what makes\n"
-				"the scope read as a long tube with the image far behind it.\n"
-				"Unlike Scene Parallax Strength this behaves identically at every\n"
-				"magnification.");
+			Tip("Scales transient weapon-motion response for the exit-pupil\n"
+				"shadow and the reticle. 0 disables it, 1 uses the measured\n"
+				"movement, higher exaggerates it. It does not affect how far\n"
+				"the image lags -- Image Lag alone governs that.");
 			ImGui::DragFloat(
 				"Axial Breathing",
 				&axialBreathing_UI,
@@ -1182,8 +1166,8 @@ namespace ImGuiImpl
 			Tip("Apparent size change as you move toward or away from the target.\n"
 				"0 keeps apparent size fixed, which is usually what you want:\n"
 				"any value here makes walking forward and backward subtly zoom\n"
-				"the image. This is independent of Scene Depth Separation so\n"
-				"lateral parallax can be raised without adding depth wobble.");
+				"the image. Independent of Image Lag, so lateral lag can be\n"
+				"raised without adding depth wobble.");
 			ImGui::DragFloat(
 				"Tube Depth",
 				&tubeDepth_UI,
@@ -1202,10 +1186,11 @@ namespace ImGuiImpl
 				0.1F,
 				10.0F,
 				"%.2f");
-			Tip("How quickly the shadow and image settle back to centre after\n"
-				"motion stops. 1 is the tuned default, lower is slower and more\n"
-				"floaty, higher snaps back sooner. Governs pupil recentering,\n"
-				"image recentering, and camera-rotation lag decay together.");
+			Tip("How quickly the image catches back up to the reticle, and the\n"
+				"shadow to centre, once motion stops. 1 is the tuned default,\n"
+				"lower is slower and more floaty, higher snaps back sooner.\n"
+				"This is the companion to Image Lag: that sets how far behind\n"
+				"the image falls, this sets how long it stays there.");
 		}
 
 		if (ImGui::CollapsingHeader("Breathing")) {
