@@ -1537,26 +1537,26 @@ Output main(Input input)
 			disabledOpticalSample[0], neutralOpticalSample[0]) <= 3 &&
 		channelDifference(
 			disabledOpticalSample[1], neutralOpticalSample[1]) <= 3;
-	// Published travel is the eye's displacement, the negation of the optic's
-	// screen motion, so subtracting it samples further back along source X and
-	// shows the scene where it was a moment ago -- the picture trailing. The
-	// pivot form this replaced had the opposite sign, because it was cancelling
-	// the aperture's motion rather than delaying the image, and cancelling it
-	// dragged the point of aim along too.
-	const bool positiveTravelSamplesLowerX =
-		static_cast<int>(positiveOpticalSample[0]) + 10 <
-		static_cast<int>(neutralOpticalSample[0]);
-	const bool negativeTravelSamplesHigherX =
-		static_cast<int>(negativeOpticalSample[0]) >
+	// Published travel is the eye's displacement relative to the settled optic,
+	// which is already the negation of the optic's screen motion, so it is
+	// added. Subtracting negated it twice and the picture led the swing instead
+	// of trailing it -- visible immediately in game, and not caught here
+	// because this only ever asserted that the sample moved, never which way
+	// the resulting image went.
+	const bool positiveTravelSamplesHigherX =
+		static_cast<int>(positiveOpticalSample[0]) >
 		static_cast<int>(neutralOpticalSample[0]) + 10;
+	const bool negativeTravelSamplesLowerX =
+		static_cast<int>(negativeOpticalSample[0]) + 10 <
+		static_cast<int>(neutralOpticalSample[0]);
 	const bool verticalChannelRemainsStable =
 		channelDifference(
 			positiveOpticalSample[1], neutralOpticalSample[1]) <= 3 &&
 		channelDifference(
 			negativeOpticalSample[1], neutralOpticalSample[1]) <= 3;
 	if (!zeroLagIsNeutral ||
-		!positiveTravelSamplesLowerX ||
-		!negativeTravelSamplesHigherX ||
+		!positiveTravelSamplesHigherX ||
+		!negativeTravelSamplesLowerX ||
 		!verticalChannelRemainsStable) {
 		std::cerr << std::format(
 			"Optical lag direction failed: neutral=({}, {}, {}), "

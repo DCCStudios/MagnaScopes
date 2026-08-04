@@ -535,7 +535,11 @@ def main() -> int:
         and "aperturePivotPixels += apertureMotionPixels" not in shader
         and "aperturePivotPixels += pixelsToLensOffset - pixelsToCenter;"
         in shader
-        and "sampleDelta -=\n            lagRadii *" in shader
+        # Added, not subtracted. Published travel already negates the optic's
+        # screen motion, so subtracting negated it twice and the picture led
+        # the swing instead of trailing it.
+        and "sampleDelta +=\n            lagRadii *" in shader
+        and "sampleDelta -=\n            lagRadii *" not in shader
         # Bounded in aperture radii before it becomes pixels, so raising the
         # control keeps adding throw to ordinary movement while a recoil spike
         # cannot slide the picture out of the glass into the sampler's clamp.

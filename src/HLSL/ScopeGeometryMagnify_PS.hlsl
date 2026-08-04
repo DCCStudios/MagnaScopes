@@ -230,11 +230,15 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // motion decays; a pivot shift drags the aim along with it.
     //
     // Dividing by magnification makes the authored amount apparent screen
-    // motion, so it reads the same at 4x and 12x. Subtracting is what makes it
-    // trail: published travel is the eye's displacement, the negation of the
-    // optic's screen motion, so sampling further back along it shows the scene
-    // where it was a moment ago. The eye-box follower decays this to zero at
-    // Recenter Speed, which is the catch-up.
+    // motion, so it reads the same at 4x and 12x. The eye-box follower decays
+    // this to zero at Recenter Speed, which is the catch-up.
+    //
+    // The sign is added, not subtracted. Published travel is the eye's
+    // displacement relative to the settled optic, which is already the negation
+    // of the optic's screen motion, so subtracting negated it a second time and
+    // the picture led the swing instead of trailing it. Two comments in this
+    // file previously derived the opposite from the same sentence; the
+    // rendered result is what settled it.
     if (physicalEyeTravelValid && imageLag > 0.0f) {
         // Bounded in aperture radii before it becomes pixels.
         //
@@ -254,7 +258,7 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
                 saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
                 imageLag,
             2.0f);
-        sampleDelta -=
+        sampleDelta +=
             lagRadii *
             currentProjectedRadius *
             PixelSize /
