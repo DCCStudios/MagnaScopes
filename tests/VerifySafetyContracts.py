@@ -796,6 +796,14 @@ def main() -> int:
         and "kAngularLagDecaySeconds = 0.055F" in main_cpp
         and "state.angularLagX *= decay" in main_cpp
         and "state.angularLagY *= decay" in main_cpp
+        # Strafing produces no angular signal: camera and reference point
+        # translate together, so a rotation measured from a distant point's
+        # screen displacement reads zero however fast the player moves
+        # sideways. Translation is added to the same accumulator so it decays
+        # at Recenter Speed and is scaled by Lens Lag like any pan.
+        and "kTranslationLagGain" in eyebox_header
+        and "impulseX += lateralStep * translationScale;" in main_cpp
+        and "impulseY -= verticalStep * translationScale;" in main_cpp
         # Eye travel reaches the pupil through the same exact projective solve
         # the mask coordinate comes from, so the two share one frame by
         # construction with no basis or convention to be guessed at.

@@ -753,6 +753,41 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 				(previousForwardScreen.y - currentForwardScreen.y) /
 				averageBasisLength *
 				MagnaScope::EyeBoxRecentering::kAngularLagGain;
+			// Strafing and walking contribute nothing above: the camera and
+			// the reference point translate together, so a rotation measured
+			// from a distant point's screen displacement reads zero however
+			// fast the player moves sideways. Add the translation directly.
+			//
+			// Measured along the camera's own right and up axes and expressed
+			// in aperture radii, which is the unit the whole eye-box path
+			// already speaks. The signs match the rotation impulse: moving
+			// right sweeps the world left exactly as looking right does, and
+			// rising sweeps it down exactly as looking up does, so both must
+			// push the opening the same way a pan would.
+			if (apertureWorldRadius > 0.001F) {
+				const RE::NiPoint3 cameraRight =
+					currentCameraRotation.Transpose() *
+					RE::NiPoint3{ 1.0F, 0.0F, 0.0F };
+				const RE::NiPoint3 cameraUp =
+					currentCameraRotation.Transpose() *
+					RE::NiPoint3{ 0.0F, 1.0F, 0.0F };
+				const RE::NiPoint3 cameraStep =
+					currentCameraTranslation -
+					state.previousCameraTranslation;
+				const float lateralStep =
+					cameraStep.x * cameraRight.x +
+					cameraStep.y * cameraRight.y +
+					cameraStep.z * cameraRight.z;
+				const float verticalStep =
+					cameraStep.x * cameraUp.x +
+					cameraStep.y * cameraUp.y +
+					cameraStep.z * cameraUp.z;
+				const float translationScale =
+					MagnaScope::EyeBoxRecentering::kTranslationLagGain /
+					apertureWorldRadius;
+				impulseX += lateralStep * translationScale;
+				impulseY -= verticalStep * translationScale;
+			}
 			// Bound the accumulated lag, not the individual impulse. Clamping
 			// each impulse still let the decaying sum settle far past the
 			// configured travel, and it put a derivative discontinuity in the

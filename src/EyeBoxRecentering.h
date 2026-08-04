@@ -206,6 +206,22 @@ namespace MagnaScope::EyeBoxRecentering
 	// radii and used to be bounded by nothing.
 	inline constexpr float kAngularLagGain = 0.35F;
 
+	// Lateral and vertical camera translation, converted to aperture radii and
+	// fed to the same accumulator as the angular impulse above.
+	//
+	// Strafing produces no angular signal at all: the camera and everything it
+	// sees translate together, so a distant reference point keeps its screen
+	// position and the rotation term reads zero. Only weapon animation inertia
+	// leaks through, which is far too little to register as lens lag.
+	//
+	// This gain is much smaller than the angular one because its input is much
+	// larger. A walk is roughly a hundred game units per second against an
+	// aperture radius near three, so an unscaled ratio would contribute half a
+	// radius every frame and saturate instantly. At this value a walk is a
+	// suggestion, a sprint is clearly visible, and Lens Lag still scales the
+	// result the same way it scales a pan.
+	inline constexpr float kTranslationLagGain = 0.05F;
+
 	// Returns the frame-rate independent fraction used by a stateful optical
 	// output to approach a new target. Unlike assigning the target directly,
 	// this response never overshoots and never jumps when the measured eye pose
