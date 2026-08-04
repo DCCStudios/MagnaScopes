@@ -4690,6 +4690,15 @@ namespace Hook
 		const auto* activeProfile =
 			ScopeData::ScopeDataHandler::GetSingleton()->GetCurrentScopeProfile();
 		const auto& verification = MagnaScope::GetSettings();
+		// Counted separately from the non-instanced hook, and before the
+		// readiness gate, because the two hooks are separate detours that can
+		// fail independently. They share one draw ordinal, so a single total
+		// cannot say which of them went quiet.
+		if (activeProfile && activeProfile->autoProfile) {
+			automaticSTSObservedInstancedDrawsThisFrame.fetch_add(
+				1U,
+				std::memory_order_relaxed);
+		}
 		if (!activeProfile || !activeProfile->autoProfile ||
 			!verification.AllowsScopeFadeGeometry() ||
 			!automaticSTSGeometryReady.load(std::memory_order_acquire)) {
@@ -6141,6 +6150,9 @@ namespace Hook
 		automaticSTSObservedDrawsThisFrame.store(
 			0U,
 			std::memory_order_relaxed);
+			automaticSTSObservedInstancedDrawsThisFrame.store(
+			0U,
+			std::memory_order_relaxed);
 		automaticSTSScopeFadeShapedDrawsThisFrame.store(
 			0U,
 			std::memory_order_relaxed);
@@ -6185,6 +6197,10 @@ namespace Hook
 					std::memory_order_acq_rel);
 			const auto observedDraws =
 				automaticSTSObservedDrawsThisFrame.exchange(
+					0U,
+					std::memory_order_acq_rel);
+			const auto observedInstancedDraws =
+				automaticSTSObservedInstancedDrawsThisFrame.exchange(
 					0U,
 					std::memory_order_acq_rel);
 			const auto reticleDraws =
@@ -6266,7 +6282,7 @@ namespace Hook
 			if (firingSighted || changed) {
 				logger::info(
 					"Stage 4d.2d draw telemetry: gunState={} ({}), "
-					"automaticDraws={}/{} observed, "
+					"automaticDraws={} gated, observed DI:{} DII:{}, "
 					"ScopeFade=DI:{} DII:{} @{} shaped:{}, "
 					"Reticle=DI:{} DII:{} @{}, "
 					"Housing=DI:{} DII:{} @{}",
@@ -6279,6 +6295,7 @@ namespace Hook
 											"other"),
 					totalAutomaticDraws,
 					observedDraws,
+					observedInstancedDraws,
 					scopeFadeDraws,
 					scopeFadeInstancedDraws,
 					scopeFadeOrdinal,
@@ -6316,6 +6333,9 @@ namespace Hook
 			// accumulates across every frame the gate was shut and reports a
 			// meaningless total on the frame it reopens.
 			automaticSTSObservedDrawsThisFrame.store(
+				0U,
+				std::memory_order_relaxed);
+				automaticSTSObservedInstancedDrawsThisFrame.store(
 				0U,
 				std::memory_order_relaxed);
 			automaticSTSScopeFadeShapedDrawsThisFrame.store(
@@ -6838,6 +6858,7 @@ namespace Hook
 	std::atomic<float> D3D::scopeTubeDepth{ 0.0F };
 	std::atomic_uint32_t D3D::automaticSTSScopeFadeShapedDrawsThisFrame = 0U;
 	std::atomic_uint32_t D3D::automaticSTSObservedDrawsThisFrame = 0U;
+	std::atomic_uint32_t D3D::automaticSTSObservedInstancedDrawsThisFrame = 0U;
 	std::atomic<float> D3D::scopeLensOffsetX{ 0.0F };
 	std::atomic<float> D3D::scopeLensOffsetY{ 0.0F };
 	std::atomic<float> D3D::scopeLensScale{ 1.0F };

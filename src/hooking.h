@@ -654,6 +654,8 @@ namespace Hook
 		// a frame that never sees ScopeFade stopped being delivered draws or
 		// stopped being allowed to inspect them.
 		static std::atomic_uint32_t automaticSTSObservedDrawsThisFrame;
+		static std::atomic_uint32_t
+			automaticSTSObservedInstancedDrawsThisFrame;
 		// Published at Present from the exact ScopeFade draw count. The game
 		// thread uses this previous-frame fact to begin optical blending only
 		// after the ScopeAiming branch is genuinely visible.
