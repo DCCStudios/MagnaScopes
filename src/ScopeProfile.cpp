@@ -91,6 +91,7 @@ namespace ScopeData
 		p.imageStillness = j.value("imageStillness", 0.0F);
 		p.axialBreathing = j.value("axialBreathing", 0.0F);
 		p.recenterSpeed = j.value("recenterSpeed", 1.0F);
+		p.strafeLag = j.value("strafeLag", 1.0F);
 		p.tubeDepth = j.value("tubeDepth", 0.0F);
 	}
 
@@ -208,6 +209,7 @@ namespace ScopeData
 			{ "imageStillness", p.imageStillness },
 			{ "axialBreathing", p.axialBreathing },
 			{ "recenterSpeed", p.recenterSpeed },
+			{ "strafeLag", p.strafeLag },
 			{ "tubeDepth", p.tubeDepth }
 		};
 	}
@@ -847,6 +849,7 @@ namespace ScopeData
 		profile->shaderData.parallax.imageStillness = 0.65F;
 		profile->shaderData.parallax.axialBreathing = 0.0F;
 		profile->shaderData.parallax.recenterSpeed = 1.0F;
+		profile->shaderData.parallax.strafeLag = 1.0F;
 		profile->shaderData.parallax.tubeDepth = 0.35F;
 
 		// New automatic profiles begin from the weapon's authored sighted zoom

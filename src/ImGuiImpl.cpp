@@ -149,6 +149,7 @@ namespace ImGuiImpl
 		float imageStillness,
 		float axialBreathing,
 		float recenterSpeed,
+		float strafeLag,
 		float tubeDepth,
 		float lensOffsetX,
 		float lensOffsetY,
@@ -211,6 +212,8 @@ namespace ImGuiImpl
 			std::clamp(axialBreathing, 0.0F, 4.0F);
 		editorPreview.recenterSpeed =
 			std::clamp(recenterSpeed, 0.1F, 10.0F);
+		editorPreview.strafeLag =
+			std::clamp(strafeLag, 0.0F, 4.0F);
 		editorPreview.tubeDepth =
 			std::clamp(tubeDepth, 0.0F, 1.0F);
 		editorPreview.lensOffsetX =
@@ -471,6 +474,10 @@ namespace ImGuiImpl
 				std::isfinite(data->shaderData.parallax.tubeDepth) ?
 					std::clamp(data->shaderData.parallax.tubeDepth, 0.0F, 1.0F) :
 					0.0F;
+			ins->strafeLag_UI =
+				std::isfinite(data->shaderData.parallax.strafeLag) ?
+					std::clamp(data->shaderData.parallax.strafeLag, 0.0F, 4.0F) :
+					1.0F;
 			ins->recenterSpeed_UI =
 				std::isfinite(data->shaderData.parallax.recenterSpeed) ?
 					std::clamp(data->shaderData.parallax.recenterSpeed, 0.1F, 10.0F) :
@@ -627,6 +634,8 @@ namespace ImGuiImpl
 				std::clamp(axialBreathing_UI, 0.0F, 4.0F);
 			editedProfile.shaderData.parallax.recenterSpeed =
 				std::clamp(recenterSpeed_UI, 0.1F, 10.0F);
+			editedProfile.shaderData.parallax.strafeLag =
+				std::clamp(strafeLag_UI, 0.0F, 4.0F);
 			editedProfile.shaderData.parallax.tubeDepth =
 				std::clamp(tubeDepth_UI, 0.0F, 1.0F);
 			editedProfile.shaderData.lensOffset[0] =
@@ -1205,6 +1214,25 @@ namespace ImGuiImpl
 				"glass; higher values open that gap and give the optic real\n"
 				"depth for the exit pupil to slide across.");
 			ImGui::DragFloat(
+				"Strafe Lag",
+				&strafeLag_UI,
+				0.01F,
+				0.0F,
+				4.0F,
+				"%.2f");
+			Tip("How much Lens Lag responds to moving rather than turning.\n"
+				"1 is the tuned default, 0 leaves strafing and walking with no\n"
+				"lag at all, higher exaggerates it.\n"
+				"\n"
+				"Separate from Lens Lag because the two measure completely\n"
+				"different things: turning is read from how far the view sweeps\n"
+				"across the screen, moving from a few game units of camera\n"
+				"travel. One gain could only ever suit one of them, which is\n"
+				"why strafing used to produce almost nothing.\n"
+				"\n"
+				"Lens Lag still scales the result, so this sets the balance\n"
+				"between the two and that sets the overall amount.");
+			ImGui::DragFloat(
 				"Recenter Speed",
 				&recenterSpeed_UI,
 				0.01F,
@@ -1411,6 +1439,7 @@ namespace ImGuiImpl
 			instance->imageStillness_UI,
 			instance->axialBreathing_UI,
 			instance->recenterSpeed_UI,
+			instance->strafeLag_UI,
 			instance->tubeDepth_UI,
 			instance->lensOffset_UI[0],
 			instance->lensOffset_UI[1],

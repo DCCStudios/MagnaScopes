@@ -804,6 +804,17 @@ def main() -> int:
         and "kTranslationLagGain" in eyebox_header
         and "impulseX += lateralStep * translationScale;" in main_cpp
         and "impulseY -= verticalStep * translationScale;" in main_cpp
+        # Strafe Lag is its own authored value. Sharing a gain with the angular
+        # response could only ever suit one of them, since the two measure a
+        # distant point's screen sweep against a few game units of camera
+        # travel.
+        and "float strafeLag = 1.0F;" in data_h
+        and '"strafeLag"' in data_cpp
+        and "scopeStrafeLag" in hooking_h
+        and "Hook::D3D::scopeStrafeLag.store(" in main_cpp
+        and "editorPreview.strafeLag" in main_cpp
+        and "kTranslationLagGain *\n\t\t\t\t\tstrafeLag /" in main_cpp
+        and "strafeLag_UI" in imgui
         # Eye travel reaches the pupil through the same exact projective solve
         # the mask coordinate comes from, so the two share one frame by
         # construction with no basis or convention to be guessed at.

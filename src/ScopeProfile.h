@@ -47,6 +47,11 @@ namespace ScopeData
 		float axialBreathing = 0.0F;
 		// Settling rate multiplier for pupil and image recentering.
 		float recenterSpeed = 1.0F;
+		// How much player translation drives lens lag, relative to how much
+		// turning does. Separate because the two have very different inputs:
+		// a pan moves a distant reference point across the screen, a strafe
+		// moves the camera a few game units, and one gain cannot suit both.
+		float strafeLag = 1.0F;
 		// How far the magnified image is recessed toward the front of the
 		// tube, leaving a ring of shadow between it and the rear aperture.
 		float tubeDepth = 0.0F;

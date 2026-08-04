@@ -603,6 +603,10 @@ namespace Hook
 		static std::atomic<float> scopeImageStillness;
 		static std::atomic<float> scopeAxialBreathing;
 		static std::atomic<float> scopeRecenterSpeed;
+		// How much player translation drives lens lag relative to turning.
+		// Separate from the angular response because the two measure very
+		// different quantities and cannot share one gain.
+		static std::atomic<float> scopeStrafeLag;
 		static std::atomic<float> scopeApertureScaleRatio;
 		static std::atomic<float> scopeTubeDepth;
 		// Where the sight picture sits inside the authored housing, and how

@@ -218,6 +218,7 @@ namespace ImGuiImpl
 		float imageStillness = 0.0F;
 		float axialBreathing = 0.0F;
 		float recenterSpeed = 1.0F;
+		float strafeLag = 1.0F;
 		float tubeDepth = 0.0F;
 		float lensOffsetX = 0.0F;
 		float lensOffsetY = 0.0F;
@@ -286,6 +287,7 @@ namespace ImGuiImpl
 		float imageStillness,
 		float axialBreathing,
 		float recenterSpeed,
+		float strafeLag,
 		float tubeDepth,
 		float lensOffsetX,
 		float lensOffsetY,
@@ -347,6 +349,7 @@ namespace ImGuiImpl
 		float imageStillness_UI = 0.0F;
 		float axialBreathing_UI = 0.0F;
 		float recenterSpeed_UI = 1.0F;
+		float strafeLag_UI = 1.0F;
 		float tubeDepth_UI = 0.0F;
 		float lensOffset_UI[2] = { 0.0F, 0.0F };
 		float lensScale_UI = 1.0F;

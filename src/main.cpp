@@ -618,6 +618,14 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		Hook::D3D::scopeRecenterSpeed.load(std::memory_order_acquire),
 		0.1F,
 		10.0F);
+	// Player translation gets its own gain. A pan and a strafe reach the lag
+	// accumulator through completely different measurements -- a distant
+	// point's screen displacement against a few game units of camera motion --
+	// so a single control could only ever suit one of them.
+	const float strafeLag = std::clamp(
+		Hook::D3D::scopeStrafeLag.load(std::memory_order_acquire),
+		0.0F,
+		4.0F);
 	// ScopeFade lies in local X/Z, making local Y its authored optical normal.
 	// Measure the camera against that plane in ScopeFade-local coordinates.
 	// Unlike camera-view Z, this distance cannot change merely because the
@@ -764,7 +772,7 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 			// right sweeps the world left exactly as looking right does, and
 			// rising sweeps it down exactly as looking up does, so both must
 			// push the opening the same way a pan would.
-			if (apertureWorldRadius > 0.001F) {
+			if (apertureWorldRadius > 0.001F && strafeLag > 0.0F) {
 				const RE::NiPoint3 cameraRight =
 					currentCameraRotation.Transpose() *
 					RE::NiPoint3{ 1.0F, 0.0F, 0.0F };
@@ -783,7 +791,8 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 					cameraStep.y * cameraUp.y +
 					cameraStep.z * cameraUp.z;
 				const float translationScale =
-					MagnaScope::EyeBoxRecentering::kTranslationLagGain /
+					MagnaScope::EyeBoxRecentering::kTranslationLagGain *
+					strafeLag /
 					apertureWorldRadius;
 				impulseX += lateralStep * translationScale;
 				impulseY -= verticalStep * translationScale;
@@ -2175,6 +2184,9 @@ void HookedUpdate()
 				Hook::D3D::scopeRecenterSpeed.store(
 					editorPreview.recenterSpeed,
 					std::memory_order_release);
+				Hook::D3D::scopeStrafeLag.store(
+					editorPreview.strafeLag,
+					std::memory_order_release);
 				Hook::D3D::scopeTubeDepth.store(
 					editorPreview.tubeDepth,
 					std::memory_order_release);
@@ -2363,6 +2375,12 @@ void HookedUpdate()
 						currentData->shaderData.parallax.recenterSpeed,
 						0.1F,
 						10.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeStrafeLag.store(
+					std::clamp(
+						currentData->shaderData.parallax.strafeLag,
+						0.0F,
+						4.0F),
 					std::memory_order_release);
 				Hook::D3D::scopeTubeDepth.store(
 					std::clamp(

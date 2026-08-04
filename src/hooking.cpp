@@ -7184,6 +7184,7 @@ namespace Hook
 	std::atomic<float> D3D::scopeImageStillness{ 0.0F };
 	std::atomic<float> D3D::scopeAxialBreathing{ 0.0F };
 	std::atomic<float> D3D::scopeRecenterSpeed{ 1.0F };
+	std::atomic<float> D3D::scopeStrafeLag{ 1.0F };
 	std::atomic<float> D3D::scopeApertureScaleRatio{ 1.0F };
 	std::atomic<float> D3D::scopeTubeDepth{ 0.0F };
 	std::atomic_uint32_t D3D::automaticSTSScopeFadeShapedDrawsThisFrame = 0U;
