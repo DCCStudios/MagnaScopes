@@ -1094,6 +1094,37 @@ bool IsDescendantOf(
 	return false;
 }
 
+// Names that mark authored aiming marks, matched without regard to case.
+//
+// "Reticle" marks a whole subtree, because authors group etched marks, glow
+// and recoil variants under a ReticleNode and every leaf belongs to the group.
+// The rest match individual shapes only. An illuminated dot is commonly a
+// sibling of Reticle:0 rather than a child of it, so a subtree rule never
+// reaches it, but promoting a whole subtree on a token as short as "Dot" would
+// sweep in anything incidentally named for one -- and a housing part pulled
+// into the reticle set renders unmagnified over the sight picture.
+constexpr std::string_view kReticleSubtreeToken = "Reticle";
+constexpr std::string_view kReticleShapeTokens[] = { "Reticle", "Dot" };
+
+[[nodiscard]] bool NameContainsTokenNoCase(
+	std::string_view name,
+	std::string_view token) noexcept
+{
+	if (token.empty() || name.size() < token.size()) {
+		return false;
+	}
+	const auto equalNoCase = [](char left, char right) noexcept {
+		return std::tolower(static_cast<unsigned char>(left)) ==
+		       std::tolower(static_cast<unsigned char>(right));
+	};
+	return std::search(
+			   name.begin(),
+			   name.end(),
+			   token.begin(),
+			   token.end(),
+			   equalNoCase) != name.end();
+}
+
 std::vector<RE::NiAVObject*> FindSTSReticleSurfaces(
 	RE::NiAVObject* scopeViewParts)
 {
@@ -1122,8 +1153,15 @@ std::vector<RE::NiAVObject*> FindSTSReticleSurfaces(
 		const std::string_view name{ object->name.c_str() };
 		const bool insideReticleSubtree =
 			pending[cursor].insideReticleSubtree ||
-			name.find("Reticle") != std::string_view::npos;
-		if (insideReticleSubtree) {
+			NameContainsTokenNoCase(name, kReticleSubtreeToken);
+		bool namedAimingMark = false;
+		for (const auto token : kReticleShapeTokens) {
+			if (NameContainsTokenNoCase(name, token)) {
+				namedAimingMark = true;
+				break;
+			}
+		}
+		if (insideReticleSubtree || namedAimingMark) {
 			if (auto* shape = object->IsTriShape();
 				shape && shape->rendererData &&
 				std::find(result.begin(), result.end(), object) == result.end()) {
