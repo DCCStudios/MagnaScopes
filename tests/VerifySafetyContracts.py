@@ -96,6 +96,14 @@ def main() -> int:
     eyebox_header = (
         project / "src" / "EyeBoxRecentering.h"
     ).read_text(encoding="utf-8")
+
+    # Everything that decides which piece of world the lens shows. Fish-eye,
+    # edge refraction and breathing legitimately live here; transient eye-box
+    # motion must not, because a sight picture that disagrees with the reticle
+    # is what makes the whole optic read as sluggish.
+    sample_section = shader.split("float2 sampleDelta =")[-1].split(
+        "const float2 sampleUv ="
+    )[0]
     stage5d = (
         project / "tests" / "config" / "MagnaScope.Stage5d.ini"
     ).read_text(encoding="utf-8")
@@ -541,25 +549,33 @@ def main() -> int:
         and "const float2 pixelsToUnitX" in shader
         and "const float2 pixelsToUnitZ" in shader
         and "const float2 currentAimPixels" in shader
-        # Image Lag translates the sampled region. It must never move the
-        # sample pivot: the pivot is the fixed point of the magnification, so
-        # it is the player's point of aim, and displacing it makes swinging the
-        # camera move where the shot lands and then settle it back. Only the
-        # authored Lens Center may place that pivot.
+        # Lens Lag moves the visible opening, never the magnified content.
+        #
+        # Nothing transient may touch the sample pivot or the sample delta. The
+        # pivot is the fixed point of the magnification and therefore the point
+        # of aim; the delta chooses which piece of world is shown. Displacing
+        # either shows the player something they are not pointing at, which
+        # makes the sight picture disagree with the reticle and reads as the
+        # whole optic being sluggish -- unfixable by tuning, because the
+        # disagreement is the mechanism. Only the authored Lens Center may
+        # place the pivot.
         and "const float imageLag = clamp(ScopeImageStillness, 0.0f, 8.0f);"
         in shader
         and "aperturePivotPixels += apertureMotionPixels" not in shader
         and "aperturePivotPixels += pixelsToLensOffset - pixelsToCenter;"
         in shader
-        # Added, not subtracted. Published travel already negates the optic's
-        # screen motion, so subtracting negated it twice and the picture led
-        # the swing instead of trailing it.
-        and "sampleDelta +=\n            lagRadii *" in shader
-        and "sampleDelta -=\n            lagRadii *" not in shader
-        # Bounded in aperture radii before it becomes pixels, so raising the
-        # control keeps adding throw to ordinary movement while a recoil spike
-        # cannot slide the picture out of the glass into the sampler's clamp.
-        and "const float2 lagRadii = ScopeShadowSoftLimitVector(" in shader
+        and "lagRadii" not in shader
+        and "SCOPE_EYE_OFFSET" not in sample_section
+        and "eyeTravel" not in sample_section
+        and "apertureMotion" not in sample_section
+        # It reaches the exit pupil instead, additively so that zero leaves the
+        # ordinary eye-box response untouched rather than switching it off, and
+        # identically in both layers or the reticle sits lit inside a crescent
+        # the scene has already darkened.
+        and "const float2 lensLagWindow = ScopeShadowSoftLimitVector(" in shader
+        and "eyeTravelLens * imageLag," in shader
+        and "+ lensLagWindow," in shader
+        and "lensLagWindowLocal" in reticle_shader
         and "const float2 samplePivotUv = aperturePivotPixels * PixelSize"
         in shader
         # Fore/aft breathing must stay independent of lateral parallax so
@@ -785,7 +801,8 @@ def main() -> int:
         # image disc that stays concentric with the aperture only looks
         # smaller; it still tracks the housing one-for-one, and it is eye
         # travel that carries the eye off the optical axis while aiming.
-        and "eyeTravelLens + tubeParallaxLens + breathingPupilLens," in shader
+        and "eyeTravelLens + tubeParallaxLens + breathingPupilLens + lensLagWindow,"
+        in shader
         and "const float2 tubeParallaxLens =\n        -eyeTravelLens * saturate(ScopeTubeDepth);"
         in shader,
         "heading-independent camera-space eye-box inertia or pupil travel regressed",

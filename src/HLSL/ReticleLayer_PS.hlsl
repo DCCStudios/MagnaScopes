@@ -211,9 +211,18 @@ ReticleCompositeOutput main(VertexPosHTex input)
         ScopeBreathingOffset() *
         clamp(SCOPE_BREATH_PUPIL_FOLLOW, 0.0f, 2.0f);
 
+    // Lens Lag, bit-for-bit as the scene replay applies it. The reticle stays
+    // put and its image stays current; only the opening they are seen through
+    // swings, and both layers must agree on where that opening is or the
+    // reticle stays lit inside a crescent the scene has already darkened.
+    const float2 lensLagWindowLocal = ScopeShadowSoftLimitVector(
+        eyeTravelLocal * clamp(ScopeImageStillness, 0.0f, 8.0f),
+        3.0f);
+
     const ScopeShadowLayers shadow = EvaluateScopeShadow(
         shadowLensCoordinates,
-        eyeTravelLocal + tubeParallaxLocal + breathingPupilLocal,
+        eyeTravelLocal + tubeParallaxLocal + breathingPupilLocal +
+            lensLagWindowLocal,
         physicalEyeTravelValid || saturate(ScopeTubeDepth) > 0.0f ||
             dot(breathingPupilLocal, breathingPupilLocal) > 0.0f,
         SCOPE_EYEBOX_RADIUS,

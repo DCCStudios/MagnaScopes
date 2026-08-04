@@ -190,11 +190,14 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
         1.0f);
     const float2 currentCenterUv = centerPixels * PixelSize;
 
-    // Ranges well past 1 because this is the only gain on the image and the
-    // signal it multiplies is small. Published eye travel during a fast swing
-    // is on the order of a tenth of an aperture radius -- the weapon lags the
-    // camera by a few degrees, not by half a lens -- so a gain of 1 produces a
-    // shift barely worth the name.
+    // Lens Lag. How far the visible opening swings off centre as the camera
+    // moves. It scales the exit pupil's displacement, further down; nothing
+    // here delays or displaces what is magnified.
+    //
+    // Ranges well past 1 because the signal it multiplies is small: published
+    // eye travel during a fast swing is on the order of a tenth of an aperture
+    // radius, since the weapon lags the camera by a few degrees rather than by
+    // half a lens.
     const float imageLag = clamp(ScopeImageStillness, 0.0f, 8.0f);
     float2 aperturePivotPixels = currentAimPixels;
     // Lens Center moves the whole optical assembly, not just its mask. The
@@ -220,50 +223,21 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     float2 sampleDelta =
         (screenUv - samplePivotUv) / max(sampleMagnification, 0.0001f);
 
-    // Image Lag. The magnified image sits far behind the aperture, so when the
-    // camera swings it should trail rather than track one-for-one.
+    // Nothing displaces the sampled region either.
     //
-    // This translates the sampled region instead of moving the pivot, which is
-    // the whole difference between "the picture lags" and "the aim lags". A
-    // uniform shift of the sampled window slides the scene beneath a reticle
-    // that has not moved and a point of aim that is still exact once the
-    // motion decays; a pivot shift drags the aim along with it.
+    // Lens Lag used to translate it, on the reasoning that a trailing picture
+    // is what optical depth looks like. It is not what a scope does and it is
+    // not what the effect needs. Shifting the sampled window shows the player
+    // a piece of the world that is not where they are pointing, so the sight
+    // picture stops agreeing with the reticle and the whole optic reads as
+    // sluggish -- no setting tunes that away, because the disagreement is the
+    // mechanism rather than a side effect of it.
     //
-    // Dividing by magnification makes the authored amount apparent screen
-    // motion, so it reads the same at 4x and 12x. The eye-box follower decays
-    // this to zero at Recenter Speed, which is the catch-up.
-    //
-    // The sign is added, not subtracted. Published travel is the eye's
-    // displacement relative to the settled optic, which is already the negation
-    // of the optic's screen motion, so subtracting negated it a second time and
-    // the picture led the swing instead of trailing it. Two comments in this
-    // file previously derived the opposite from the same sentence; the
-    // rendered result is what settled it.
-    if (physicalEyeTravelValid && imageLag > 0.0f) {
-        // Bounded in aperture radii before it becomes pixels.
-        //
-        // The bound is two radii, not one. A soft limiter compresses hard as
-        // its input approaches the limit, so a bound of one radius spent most
-        // of the control's upper range fighting itself: doubling the gain near
-        // the knee bought only a few percent more shift, and the slider felt
-        // dead well before its maximum. Two radii keeps the knee outside the
-        // usable range, so the control stays close to linear all the way up
-        // and the limiter does what it is actually for -- stopping a recoil
-        // spike from throwing the picture clean out of the glass.
-        //
-        // Past about one radius the lens is mostly tube wall, which is the
-        // player's decision to make, not something to clamp away.
-        const float2 lagRadii = ScopeShadowSoftLimitVector(
-            float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y) *
-                saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
-                imageLag,
-            2.0f);
-        sampleDelta +=
-            lagRadii *
-            currentProjectedRadius *
-            PixelSize /
-            opticalMagnification;
-    }
+    // What actually lags in an optic is the *opening*: as the eye leaves the
+    // axis the exit pupil slides across the glass and you see the same image
+    // through a moving window. That is a mask, not a resample, so it costs the
+    // magnified content nothing. Lens Lag scales it further down, where the
+    // scope shadow is evaluated.
     const float radialPosition =
         saturate(length(normalizedLensPosition));
     const float fishEyeAmount =
@@ -295,37 +269,6 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
         radialUv *
         (refractionStrength * edgeWeight) /
         opticalMagnification;
-
-    // Transient eye motion, used from here on only by the exit pupil. The
-    // game thread publishes it in render-target X/Y, normalized by the
-    // projected aperture radius. Do not rotate this value through ScopeFade's
-    // world-facing X/Z basis: doing so made identical camera motion reverse
-    // with heading and pitch.
-    //
-    // The magnified image no longer reads this. It used to lag through a
-    // second, delta-space path scaled by Lens Depth Separation and Scene
-    // Parallax Strength on top of the Optical Lag Strength already folded in
-    // here -- three multiplied gains for one effect, none of which could
-    // actually hold the image still, because a delta shift of d moves the
-    // sampled point by d/M while the pivot shift the aperture itself
-    // contributes carries a (1 - 1/M) factor the delta term cannot cancel.
-    // Image Lag drives the pivot alone; see the sample-pivot block above.
-    float2 physicalEyeTravel = float2(0.0f, 0.0f);
-    if (physicalEyeTravelValid) {
-        physicalEyeTravel =
-            float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y) *
-            saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
-            clamp(SCOPE_OPTICAL_LAG_STRENGTH, 0.0f, 4.0f);
-        // The game-thread EMA already removes pose noise. Do not introduce a
-        // second hard dead zone here: zeroing a nearly centered value makes
-        // the exit pupil snap after it has smoothly approached center.
-        const float travelLength = length(physicalEyeTravel);
-        const float maximumTravel =
-            clamp(SCOPE_EYEBOX_MAX_TRAVEL, 0.0f, 4.0f);
-        if (travelLength > maximumTravel && travelLength > 0.00001f) {
-            physicalEyeTravel *= maximumTravel / travelLength;
-        }
-    }
 
     // Breathing sway. The shooter's whole hold drifts, so the scene swims
     // beneath a housing and reticle that stay put -- which means translating
@@ -520,6 +463,31 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     // coordinate must be uniform across the draw or vary smoothly with it.
     const float2 stableShadowCoordinates =
         normalizedLensPosition - lensUserOffset;
+    // Transient eye motion. Computed here, with the rest of the exit-pupil
+    // work, because the pupil is now its only consumer -- it sat above the
+    // sampling block for as long as the magnified image read it, and leaving
+    // it there would let a future edit quietly wire eye motion back into the
+    // sample. The game thread publishes it in render-target X/Y, normalized by
+    // the projected aperture radius. Do not rotate this value through
+    // ScopeFade's world-facing X/Z basis: doing so made identical camera motion
+    // reverse with heading and pitch.
+    float2 physicalEyeTravel = float2(0.0f, 0.0f);
+    if (physicalEyeTravelValid) {
+        physicalEyeTravel =
+            float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y) *
+            saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
+            clamp(SCOPE_OPTICAL_LAG_STRENGTH, 0.0f, 4.0f);
+        // The game-thread EMA already removes pose noise. Do not introduce a
+        // second hard dead zone here: zeroing a nearly centered value makes
+        // the exit pupil snap after it has smoothly approached center.
+        const float travelLength = length(physicalEyeTravel);
+        const float maximumTravel =
+            clamp(SCOPE_EYEBOX_MAX_TRAVEL, 0.0f, 4.0f);
+        if (travelLength > maximumTravel && travelLength > 0.00001f) {
+            physicalEyeTravel *= maximumTravel / travelLength;
+        }
+    }
+
     // Display-X/Y travel becomes lens-local travel through the same exact
     // projective solve the coordinate above comes from, so the two are in one
     // frame by construction and no basis, radius, or convention has to be
@@ -597,9 +565,22 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     const float2 breathingPupilLens =
         breathingLens * clamp(SCOPE_BREATH_PUPIL_FOLLOW, 0.0f, 2.0f);
 
+    // Lens Lag: the visible opening swings off centre while the image behind
+    // it stays exactly where the reticle says it is.
+    //
+    // Additive rather than a multiplier on eye travel, so zero leaves the
+    // ordinary exit-pupil response untouched instead of switching it off.
+    // Bounded well past the aperture: the pupil disc leaving the glass
+    // entirely is a legitimate look at high settings -- that is what losing
+    // the sight picture behind the tube wall is -- but an unbounded value
+    // could park it there permanently after one recoil spike.
+    const float2 lensLagWindow = ScopeShadowSoftLimitVector(
+        eyeTravelLens * imageLag,
+        3.0f);
+
     const ScopeShadowLayers shadow = EvaluateScopeShadow(
         stableShadowCoordinates,
-        eyeTravelLens + tubeParallaxLens + breathingPupilLens,
+        eyeTravelLens + tubeParallaxLens + breathingPupilLens + lensLagWindow,
         physicalEyeTravelValid || saturate(ScopeTubeDepth) > 0.0f ||
             dot(breathingPupilLens, breathingPupilLens) > 0.0f,
         SCOPE_EYEBOX_RADIUS,

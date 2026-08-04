@@ -1462,13 +1462,19 @@ Output main(Input input)
 		return 1;
 	}
 
-	// Prove the image-lag sign with a directional source rather than a uniform
-	// lens. Image Lag translates the sampled region, so eye travel must move
-	// the sampled point along source X, and setting Image Lag to zero must
-	// restore the neutral sample even when eye-motion telemetry is non-zero.
+	// Lens Lag must never move the magnified content.
 	//
-	// Run at 2x so the magnification division is actually exercised; the
-	// authored amount is apparent screen motion and must not vary with zoom.
+	// It moves the visible opening -- a mask -- so the sampled region has to be
+	// bit-identical whatever the eye-box is doing and whatever the control is
+	// set to. Asserted against a directional source, where any shift of the
+	// sampled window changes the sampled colour immediately.
+	//
+	// This check previously demanded the opposite, that eye travel move the
+	// sample. That was the defect: showing the player a piece of world they
+	// were not pointing at made the sight picture disagree with the reticle and
+	// the whole optic read as sluggish at every setting.
+	//
+	// Run at 2x so magnification is genuinely in the path.
 	submitLensPose(-kCenterNdcX, -kCenterNdcY);
 	resolution.magnification = 2.0F;
 	resolution.aimOffsetValid = 0.0F;
@@ -1511,19 +1517,21 @@ Output main(Input input)
 		return sample;
 	};
 
+	// Sampled well inside the lit disc so the moving opening cannot reach this
+	// pixel and darken it: this check is about the content, not the mask.
 	resolution.eyeOffsetX = 0.0F;
 	resolution.eyeOffsetY = 0.0F;
+	resolution.eyeBoxRadius = 20.0F;
 	const auto neutralOpticalSample = renderOpticalLagSample();
 
-	// Image Lag at zero must pin the image to the optic even with live
-	// telemetry. Optical Lag Strength is deliberately left at 1 here: it drives
-	// the exit pupil, and the image must not respond to it at all.
+	// Optical Lag Strength is deliberately left at 1 throughout: it drives the
+	// exit pupil, and the magnified content must not respond to it either.
 	resolution.eyeOffsetX = 0.30F;
 	setImageLag(0.0F);
 	resolution.opticalLagStrength = 1.0F;
 	const auto disabledOpticalSample = renderOpticalLagSample();
 
-	setImageLag(1.0F);
+	setImageLag(8.0F);
 	const auto positiveOpticalSample = renderOpticalLagSample();
 
 	resolution.eyeOffsetX = -0.30F;
@@ -1537,29 +1545,27 @@ Output main(Input input)
 			disabledOpticalSample[0], neutralOpticalSample[0]) <= 3 &&
 		channelDifference(
 			disabledOpticalSample[1], neutralOpticalSample[1]) <= 3;
-	// Published travel is the eye's displacement relative to the settled optic,
-	// which is already the negation of the optic's screen motion, so it is
-	// added. Subtracting negated it twice and the picture led the swing instead
-	// of trailing it -- visible immediately in game, and not caught here
-	// because this only ever asserted that the sample moved, never which way
-	// the resulting image went.
-	const bool positiveTravelSamplesHigherX =
-		static_cast<int>(positiveOpticalSample[0]) >
-		static_cast<int>(neutralOpticalSample[0]) + 10;
-	const bool negativeTravelSamplesLowerX =
-		static_cast<int>(negativeOpticalSample[0]) + 10 <
-		static_cast<int>(neutralOpticalSample[0]);
+	// Maximum Lens Lag against travel in both directions must leave the
+	// magnified content exactly where it was. A single sampled colour is a
+	// sufficient witness on a directional source: any translation of the
+	// sampled window changes it.
+	const bool positiveTravelLeavesContentPut =
+		channelDifference(
+			positiveOpticalSample[0], neutralOpticalSample[0]) <= 3;
+	const bool negativeTravelLeavesContentPut =
+		channelDifference(
+			negativeOpticalSample[0], neutralOpticalSample[0]) <= 3;
 	const bool verticalChannelRemainsStable =
 		channelDifference(
 			positiveOpticalSample[1], neutralOpticalSample[1]) <= 3 &&
 		channelDifference(
 			negativeOpticalSample[1], neutralOpticalSample[1]) <= 3;
 	if (!zeroLagIsNeutral ||
-		!positiveTravelSamplesHigherX ||
-		!negativeTravelSamplesLowerX ||
+		!positiveTravelLeavesContentPut ||
+		!negativeTravelLeavesContentPut ||
 		!verticalChannelRemainsStable) {
 		std::cerr << std::format(
-			"Optical lag direction failed: neutral=({}, {}, {}), "
+			"Lens Lag moved the magnified content: neutral=({}, {}, {}), "
 			"disabled=({}, {}, {}), positive=({}, {}, {}), "
 			"negative=({}, {}, {})\n",
 			neutralOpticalSample[0],
@@ -2171,6 +2177,54 @@ Output main(Input input)
 		context->Unmap(staging.Get(), 0);
 		return pair;
 	};
+
+	// ------------------------------------------------------------------
+	// Lens Lag moves the visible opening.
+	//
+	// The companion to the content-stability check above: that one proves the
+	// magnified image never moves, this one proves the control is not therefore
+	// inert. On the uniform grey fixture the opening is the only thing that can
+	// change a pixel, so a one-sided crescent under lateral travel is exactly
+	// the window sliding off centre.
+	// ------------------------------------------------------------------
+	restoreCenteredShadowFixture();
+	updateScopeEffect(1.0F, 1.0F);
+	resolution.vignetteReach = 9.0F;
+	resolution.vignetteSharpness = 3.0F;
+	resolution.eyeBoxRadius = 2.0F;
+	resolution.eyeBoxMaxTravel = 4.0F;
+	resolution.eyeOffsetX = 0.15F;
+
+	scopeEffectConstants[88] = 0.0F;
+	updateScopeEffect(1.0F, 1.0F);
+	const auto windowWithoutLag = renderShadowSamples();
+
+	scopeEffectConstants[88] = 8.0F;
+	updateScopeEffect(1.0F, 1.0F);
+	const auto windowWithLag = renderShadowSamples();
+
+	scopeEffectConstants[88] = 0.0F;
+	updateScopeEffect(1.0F, 1.0F);
+
+	// Travel toward +X drives the opening one way, so the two mid-lens samples
+	// must separate far more with the control at maximum than without it.
+	// ShadowSamples is local to renderShadowSamples, so deduce it.
+	const auto lateralSpread = [](const auto& samples) -> unsigned {
+		return samples.midLeft > samples.midRight ?
+			samples.midLeft - samples.midRight :
+			samples.midRight - samples.midLeft;
+	};
+	if (lateralSpread(windowWithLag) < lateralSpread(windowWithoutLag) + 60U) {
+		std::cerr << std::format(
+			"Lens Lag did not move the visible opening: "
+			"withoutLag[midLeft={}, midRight={}], "
+			"withLag[midLeft={}, midRight={}]\n",
+			windowWithoutLag.midLeft,
+			windowWithoutLag.midRight,
+			windowWithLag.midLeft,
+			windowWithLag.midRight);
+		return 1;
+	}
 
 	constexpr float kPi = 3.14159265358979323846F;
 	restoreCenteredShadowFixture();

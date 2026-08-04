@@ -33,16 +33,14 @@ namespace ScopeData
 		// Virtual distance between the authored aperture and the exit-pupil
 		// shadow. Values above one exaggerate pupil travel.
 		float shadowDepth = 1.0F;
-		// Image Lag: the fraction of the aperture's own screen motion the
-		// magnified image declines to follow. 1 leaves the image world-static
-		// while the housing swings over it, which is what makes it trail the
-		// reticle. The eye-box follower supplies the catch-up at recenterSpeed.
+		// Lens Lag: how far the visible opening swings off centre as the camera
+		// moves, like an exit pupil sliding across the glass. It scales the
+		// exit-pupil displacement only. The magnified image is never delayed or
+		// displaced -- an earlier version shifted the sampled region instead,
+		// which showed the player a piece of world they were not pointing at
+		// and made the whole optic read as sluggish at every setting.
 		//
-		// This is the single control for that effect. It used to be one of
-		// four: sceneDepth and sceneParallaxStrength multiplied a second,
-		// delta-space path that could not hold the image still at any setting,
-		// and opticalLagStrength scaled its input again. Both are retired --
-		// old profiles simply carry unread keys.
+		// Keeps its old JSON key so profiles round-trip.
 		float imageStillness = 0.0F;
 		// Fore/aft apparent-size breathing, independent of sceneDepth so
 		// lateral parallax cannot make the image read as moving closer.

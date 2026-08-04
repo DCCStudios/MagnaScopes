@@ -1132,31 +1132,33 @@ namespace ImGuiImpl
 					"brightness; lower values tint the whole scope darker.");
 			}
 			ImGui::DragFloat(
-				"Image Lag",
+				"Lens Lag",
 				&imageStillness_UI,
 				0.02F,
 				0.0F,
 				8.0F,
 				"%.2f");
-			Tip("How far the magnified image trails when you swing the camera.\n"
-				"0 locks the image to the optic so nothing lags.\n"
+			Tip("How far the visible opening swings off centre as you move the\n"
+				"camera, like the exit pupil sliding across the glass when your\n"
+				"eye leaves the scope's axis. 0 keeps the opening centred.\n"
+				"\n"
+				"Nothing about the magnified image is delayed. What you see\n"
+				"through the lens is always the current frame, aligned with the\n"
+				"reticle and your point of aim -- only the window it is seen\n"
+				"through moves. That is why raising this cannot make aiming\n"
+				"feel sluggish however far you take it.\n"
 				"\n"
 				"The range is wide because the signal underneath it is small:\n"
 				"the weapon lags the camera by a few degrees, so a fast swing\n"
 				"moves the optic about a tenth of a lens radius. Values of 4 to\n"
-				"8 are ordinary here, not extreme. Past roughly one radius of\n"
-				"shift the lens is mostly tube wall, which is a look you may or\n"
-				"may not want.\n"
+				"8 are ordinary here, not extreme. High settings will push the\n"
+				"opening far enough that the sight picture disappears behind\n"
+				"the tube wall during a hard swing, which is the real behaviour\n"
+				"of a scope with a tight eye box.\n"
 				"\n"
-				"If it still settles too fast to see, lower Recenter Speed:\n"
-				"this sets how far the image falls behind, that sets how long\n"
-				"it stays there. A fast settle hides a large amplitude.\n"
-				"\n"
-				"Only the picture moves. The reticle stays exactly where the\n"
-				"optic authored it and the point of aim is never displaced, so\n"
-				"this cannot pull your shot off target while you track.\n"
-				"Measured as apparent screen motion, so it reads the same at\n"
-				"every magnification.");
+				"Recenter Speed controls how quickly the opening returns to\n"
+				"centre. This sets how far it goes, that sets how long it takes\n"
+				"to come back.");
 			ImGui::DragFloat(
 				"Shadow Depth Separation",
 				&shadowDepth_UI,
@@ -1209,12 +1211,12 @@ namespace ImGuiImpl
 				0.1F,
 				10.0F,
 				"%.2f");
-			Tip("How quickly the trailing image slides back into place, and the\n"
-				"shadow returns to centre, once motion stops. 1 is the tuned\n"
-				"default, lower is slower and more floaty, higher snaps back\n"
-				"sooner. Companion to Image Lag: that sets how far behind the\n"
-				"picture falls, this sets how long it stays there. Neither\n"
-				"moves the reticle or the point of aim.");
+			Tip("How quickly the opening returns to centre once motion stops.\n"
+				"1 is the tuned default, lower is slower and more floaty,\n"
+				"higher snaps back sooner. Companion to Lens Lag: that sets how\n"
+				"far the opening goes, this sets how long it takes to come\n"
+				"back. Neither moves the reticle, the point of aim, or the\n"
+				"magnified image.");
 		}
 
 		if (ImGui::CollapsingHeader("Breathing")) {
