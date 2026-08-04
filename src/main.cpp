@@ -1171,6 +1171,43 @@ struct STSApertureCandidate
 	bool annulus{ false };
 };
 
+// The first object under a root whose name begins with the given prefix.
+//
+// GetObjectByName matches the whole name, which misses every authored
+// suffix -- ScopeAiming:78 is not "ScopeAiming" -- and it was the reason a
+// scope built that way was rejected before any aperture search began.
+RE::NiAVObject* FindObjectByPrefixNoCase(
+	RE::NiAVObject* searchRoot,
+	std::string_view prefix)
+{
+	if (!searchRoot) {
+		return nullptr;
+	}
+	constexpr std::size_t kMaximumVisitedObjects = 512U;
+	std::vector<RE::NiAVObject*> pending{ searchRoot };
+	for (std::size_t cursor = 0;
+		cursor < pending.size() && cursor < kMaximumVisitedObjects;
+		++cursor) {
+		auto* object = pending[cursor];
+		if (!object) {
+			continue;
+		}
+		if (NameHasPrefixNoCase(
+				std::string_view{ object->name.c_str() },
+				prefix)) {
+			return object;
+		}
+		if (auto* node = object->IsNode()) {
+			for (auto& childPointer : node->children) {
+				if (auto* child = childPointer.get()) {
+					pending.push_back(child);
+				}
+			}
+		}
+	}
+	return nullptr;
+}
+
 // The aperture name the player pinned, or empty for automatic.
 //
 // The live editor wins while a preview is active so the dropdown takes effect
@@ -1343,16 +1380,26 @@ STSApertureSelection FindSTSAperture(RE::NiAVObject* firstPersonRoot)
 		return {};
 	}
 
-	auto* scopeAiming =
-		firstPersonRoot->GetObjectByName("ScopeAiming");
-	auto* scopeViewPartsObject =
-		firstPersonRoot->GetObjectByName("ScopeViewParts");
-	auto* scopeViewParts =
-		scopeViewPartsObject ? scopeViewPartsObject->IsNode() : nullptr;
-	if (!scopeAiming || !scopeViewParts ||
-		!IsDescendantOf(scopeViewParts, scopeAiming)) {
+	// Matched by prefix, because authored names carry arbitrary suffixes.
+	// Exact-name lookups rejected ScopeAiming:78 outright, and requiring
+	// ScopeViewParts to be a node rejected every scope that authors it as a
+	// shape -- both before any aperture search could run, which is why those
+	// weapons showed no scope at all rather than falling back.
+	auto* scopeAiming = FindObjectByPrefixNoCase(firstPersonRoot, "ScopeAiming");
+	if (!scopeAiming) {
 		return {};
 	}
+	auto* scopeViewPartsObject =
+		FindObjectByPrefixNoCase(scopeAiming, "ScopeViewParts");
+
+	// Reticle, aim and extent lookups need a container to search. Prefer
+	// ScopeViewParts when it is one, otherwise fall back to ScopeAiming: a
+	// ScopeViewParts authored as a shape has no children to search, but its
+	// siblings under ScopeAiming still hold the reticle.
+	RE::NiAVObject* partsRoot =
+		scopeViewPartsObject && scopeViewPartsObject->IsNode() ?
+			scopeViewPartsObject :
+			scopeAiming;
 
 	const auto validBound = [](const RE::NiAVObject* object) {
 		if (!object) {
@@ -1374,6 +1421,15 @@ STSApertureSelection FindSTSAperture(RE::NiAVObject* firstPersonRoot)
 	// limited to the three structural names STS itself defines.
 	auto apertureCandidates = FindSTSApertureCandidates(scopeAiming);
 	if (apertureCandidates.empty()) {
+		// A scope with no usable aperture shape produces nothing at all, which
+		// is indistinguishable from the plugin being off. Name it once.
+		static std::once_flag loggedNoCandidates;
+		std::call_once(loggedNoCandidates, [scopeAiming] {
+			logger::warn(
+				"No aperture shape found under '{}': needs a BSTriShape named "
+				"ScopeFade, ScopeViewParts or ScopeAiming",
+				scopeAiming->name.c_str());
+		});
 		return {};
 	}
 	PublishApertureCandidates(apertureCandidates);
@@ -1425,25 +1481,25 @@ STSApertureSelection FindSTSAperture(RE::NiAVObject* firstPersonRoot)
 	const auto& planeBound = opticalPlane->worldBound;
 	const float planeRadius = planeBound.fRadius;
 
-	auto reticleSurfaces = FindSTSReticleSurfaces(scopeViewParts);
+	auto reticleSurfaces = FindSTSReticleSurfaces(partsRoot);
 	RE::NiAVObject* aimReference =
-		scopeViewParts->GetObjectByName("ReticleNode");
-	if (!aimReference || !IsDescendantOf(aimReference, scopeViewParts) ||
+		FindObjectByPrefixNoCase(partsRoot, "ReticleNode");
+	if (!aimReference || !IsDescendantOf(aimReference, scopeAiming) ||
 		!validBound(aimReference)) {
-		aimReference = scopeViewParts->GetObjectByName("Reticle:0");
+		aimReference = FindObjectByPrefixNoCase(partsRoot, "Reticle");
 	}
 	if (!aimReference ||
-		!IsDescendantOf(aimReference, scopeViewParts) ||
+		!IsDescendantOf(aimReference, scopeAiming) ||
 		!validBound(aimReference)) {
 		aimReference = opticalPlane;
 	}
 
 	RE::NiAVObject* extentReference = nullptr;
 	for (const char* extentName :
-		{ "Glass:0", "ScreenWarp:0", "EdgeBlur:0" }) {
-		auto* candidate = scopeViewParts->GetObjectByName(extentName);
+		{ "Glass", "ScreenWarp", "EdgeBlur" }) {
+		auto* candidate = FindObjectByPrefixNoCase(partsRoot, extentName);
 		if (!candidate ||
-			!IsDescendantOf(candidate, scopeViewParts) ||
+			!IsDescendantOf(candidate, scopeAiming) ||
 			!validBound(candidate)) {
 			continue;
 		}
