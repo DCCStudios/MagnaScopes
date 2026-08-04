@@ -319,6 +319,18 @@ struct AutomaticSTSEyeBoxTrackingState
 	float smoothedNormalizedRelief{ 0.0F };
 	RE::NiPoint3 previousCameraTranslation{};
 	RE::NiMatrix3 previousCameraRotation{};
+	// Previous world position of the aperture itself, for the translation
+	// component of the lag.
+	//
+	// The camera node cannot supply this. Its world.translate barely changes
+	// while the player moves -- measured at three to twelve thousandths of a
+	// unit per frame during a hard strafe, against the unit or so the player
+	// actually covers -- so it is evidently expressed in a frame that travels
+	// with the player. The aperture's world centre is a real world position and
+	// moves the full distance, and as a bonus it carries weapon sway, which is
+	// genuine optic motion rather than something to filter out.
+	RE::NiPoint3 previousApertureWorld{};
+	bool previousApertureWorldReady{ false };
 	float angularLagX{ 0.0F };
 	float angularLagY{ 0.0F };
 	// Settled screen position of the aperture itself. The camera-versus-optic
@@ -526,6 +538,8 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		const RE::NiMatrix3 savedCameraRotation =
 			state.previousCameraRotation;
 		const bool savedCameraPoseReady = state.previousCameraPoseReady;
+		const RE::NiPoint3 savedApertureWorld = state.previousApertureWorld;
+		const bool savedApertureWorldReady = state.previousApertureWorldReady;
 		state = {};
 		state.apertureIdentity = aperture;
 		state.profileIdentity = profileIdentity;
@@ -538,6 +552,8 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 			state.previousCameraTranslation = savedCameraTranslation;
 			state.previousCameraRotation = savedCameraRotation;
 			state.previousCameraPoseReady = savedCameraPoseReady;
+			state.previousApertureWorld = savedApertureWorld;
+			state.previousApertureWorldReady = savedApertureWorldReady;
 			state.hasSmoothedOffset = true;
 		}
 	}
@@ -733,6 +749,8 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		state.previousCameraTranslation = currentCameraTranslation;
 		state.previousCameraRotation = currentCameraRotation;
 		state.previousCameraPoseReady = true;
+		state.previousApertureWorld = apertureWorldCenter;
+		state.previousApertureWorldReady = true;
 		state.angularLagX = 0.0F;
 		state.angularLagY = 0.0F;
 	} else {
@@ -784,24 +802,35 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 			// push the opening the same way a pan would.
 			diagRotationBranchRan = true;
 			diagAngularImpulseX = impulseX;
-			if (apertureWorldRadius > 0.001F && strafeLag > 0.0F) {
+			// Measured from the aperture, not the camera.
+			//
+			// The camera node's world.translate does not move with the player:
+			// during a hard strafe it reported three to twelve thousandths of a
+			// unit per frame against the unit or so actually covered, so it is
+			// expressed in a frame that travels along. Everything downstream
+			// was correct and working on a signal that was not there.
+			//
+			// The aperture's world centre is a genuine world position, moves
+			// the full distance, and additionally carries weapon sway, which is
+			// real optic motion and belongs in this term anyway.
+			if (apertureWorldRadius > 0.001F && strafeLag > 0.0F &&
+				state.previousApertureWorldReady) {
 				const RE::NiPoint3 cameraRight =
 					currentCameraRotation.Transpose() *
 					RE::NiPoint3{ 1.0F, 0.0F, 0.0F };
 				const RE::NiPoint3 cameraUp =
 					currentCameraRotation.Transpose() *
 					RE::NiPoint3{ 0.0F, 1.0F, 0.0F };
-				const RE::NiPoint3 cameraStep =
-					currentCameraTranslation -
-					state.previousCameraTranslation;
+				const RE::NiPoint3 apertureStep =
+					apertureWorldCenter - state.previousApertureWorld;
 				const float lateralStep =
-					cameraStep.x * cameraRight.x +
-					cameraStep.y * cameraRight.y +
-					cameraStep.z * cameraRight.z;
+					apertureStep.x * cameraRight.x +
+					apertureStep.y * cameraRight.y +
+					apertureStep.z * cameraRight.z;
 				const float verticalStep =
-					cameraStep.x * cameraUp.x +
-					cameraStep.y * cameraUp.y +
-					cameraStep.z * cameraUp.z;
+					apertureStep.x * cameraUp.x +
+					apertureStep.y * cameraUp.y +
+					apertureStep.z * cameraUp.z;
 				const float translationScale =
 					MagnaScope::EyeBoxRecentering::kTranslationLagGain *
 					strafeLag /
@@ -809,9 +838,9 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 				impulseX += lateralStep * translationScale;
 				impulseY -= verticalStep * translationScale;
 				diagCameraStepLength = std::sqrt(
-					cameraStep.x * cameraStep.x +
-					cameraStep.y * cameraStep.y +
-					cameraStep.z * cameraStep.z);
+					apertureStep.x * apertureStep.x +
+					apertureStep.y * apertureStep.y +
+					apertureStep.z * apertureStep.z);
 				diagLateralStep = lateralStep;
 				diagVerticalStep = verticalStep;
 				diagTranslationImpulseX = lateralStep * translationScale;
@@ -836,6 +865,8 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		}
 		state.previousCameraTranslation = currentCameraTranslation;
 		state.previousCameraRotation = currentCameraRotation;
+		state.previousApertureWorld = apertureWorldCenter;
+		state.previousApertureWorldReady = true;
 	}
 
 	// Follow the aperture's own projected screen position and keep the
@@ -913,7 +944,7 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 			logger::info(
 				"Eye-box strafe path: activation={:.2f}, rotationBranch={}, "
 				"translationApplied={}, strafeLag={:.2f}, "
-				"apertureWorldRadius={:.3f}, cameraStep={:.3f} "
+				"apertureWorldRadius={:.3f}, apertureStep={:.3f} "
 				"(lateral={:.3f}, vertical={:.3f}), impulse=(angular {:.4f}, "
 				"translation {:.4f}), angularLag=({:.3f}, {:.3f}), "
 				"published=({:.3f}, {:.3f})",
