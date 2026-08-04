@@ -704,6 +704,16 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 	// or pitch. prev-current makes the pupil lag opposite the camera movement.
 	const RE::NiPoint3 currentCameraTranslation = camera->world.translate;
 	const RE::NiMatrix3 currentCameraRotation = camera->world.rotate;
+	// Strafe-path telemetry. Every stage between the camera moving and the
+	// opening shifting, so a dead effect can be traced to the stage that
+	// zeroed rather than guessed at from the shader backwards.
+	float diagCameraStepLength = 0.0F;
+	float diagLateralStep = 0.0F;
+	float diagVerticalStep = 0.0F;
+	float diagTranslationImpulseX = 0.0F;
+	float diagAngularImpulseX = 0.0F;
+	bool diagRotationBranchRan = false;
+	bool diagTranslationApplied = false;
 	// Capture fore/aft camera travel before the block below overwrites the
 	// previous pose. This is the only axial signal used; see the eye-relief
 	// note further down for why the aperture-local measurement cannot be.
@@ -772,6 +782,8 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 			// right sweeps the world left exactly as looking right does, and
 			// rising sweeps it down exactly as looking up does, so both must
 			// push the opening the same way a pan would.
+			diagRotationBranchRan = true;
+			diagAngularImpulseX = impulseX;
 			if (apertureWorldRadius > 0.001F && strafeLag > 0.0F) {
 				const RE::NiPoint3 cameraRight =
 					currentCameraRotation.Transpose() *
@@ -796,6 +808,14 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 					apertureWorldRadius;
 				impulseX += lateralStep * translationScale;
 				impulseY -= verticalStep * translationScale;
+				diagCameraStepLength = std::sqrt(
+					cameraStep.x * cameraStep.x +
+					cameraStep.y * cameraStep.y +
+					cameraStep.z * cameraStep.z);
+				diagLateralStep = lateralStep;
+				diagVerticalStep = verticalStep;
+				diagTranslationImpulseX = lateralStep * translationScale;
+				diagTranslationApplied = true;
 			}
 			// Bound the accumulated lag, not the individual impulse. Clamping
 			// each impulse still let the decaying sum settle far past the
@@ -879,6 +899,40 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		screenEyeOffset.x + state.angularLagX + apertureExcursionX;
 	float normalizedY =
 		screenEyeOffset.y + state.angularLagY + apertureExcursionY;
+
+	// Once a second while the optic is live. Reports the strafe path end to
+	// end: how far the camera actually moved, how much of that was lateral,
+	// what impulse it produced against the rotation impulse beside it, what
+	// the accumulator holds, and what finally reaches the shader. Whichever
+	// column reads zero is where the effect dies.
+	{
+		static float diagnosticSeconds = 0.0F;
+		diagnosticSeconds += boundedDeltaSeconds;
+		if (diagnosticSeconds >= 1.0F && activationProgress > 0.001F) {
+			diagnosticSeconds = 0.0F;
+			logger::info(
+				"Eye-box strafe path: activation={:.2f}, rotationBranch={}, "
+				"translationApplied={}, strafeLag={:.2f}, "
+				"apertureWorldRadius={:.3f}, cameraStep={:.3f} "
+				"(lateral={:.3f}, vertical={:.3f}), impulse=(angular {:.4f}, "
+				"translation {:.4f}), angularLag=({:.3f}, {:.3f}), "
+				"published=({:.3f}, {:.3f})",
+				activationProgress,
+				diagRotationBranchRan,
+				diagTranslationApplied,
+				strafeLag,
+				apertureWorldRadius,
+				diagCameraStepLength,
+				diagLateralStep,
+				diagVerticalStep,
+				diagAngularImpulseX,
+				diagTranslationImpulseX,
+				state.angularLagX,
+				state.angularLagY,
+				normalizedX,
+				normalizedY);
+		}
+	}
 	// Fore/aft eye motion is measured against the settled eye-to-aperture
 	// distance, but that distance is taken along the aperture's own local
 	// normal, and the aperture's frame rotates with the weapon. During a yaw
