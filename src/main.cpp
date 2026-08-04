@@ -1232,101 +1232,81 @@ RE::NiAVObject* FindObjectByPrefixNoCase(
 // geometry, so it can neither be replayed nor identified at draw time -- which
 // is why matching the container named ScopeViewParts is not enough on its own.
 std::vector<STSApertureCandidate> FindSTSApertureCandidates(
-	RE::NiAVObject* searchRoot)
+	RE::NiAVObject* scopeAiming)
 {
 	std::vector<STSApertureCandidate> candidates;
-	if (!searchRoot) {
+	if (!scopeAiming) {
 		return candidates;
 	}
 
-	// Searched from the first-person root. Anchoring to the ScopeAiming node
-	// missed scopes whose aperture shape sits outside it: the node existed,
-	// nothing beneath it matched, and the scope showed nothing at all.
-	constexpr std::size_t kMaximumVisitedObjects = 4096U;
-	constexpr std::size_t kMaximumCandidates = 16U;
+	// Anchored to ScopeAiming, and every renderable shape beneath it counts.
+	//
+	// Two earlier attempts were wrong in opposite directions. Matching only
+	// shape names missed scopes that hang their geometry under plain
+	// ScopeAiming and ScopeViewParts nodes; searching the whole first-person
+	// root instead swept in other attachments entirely -- receiver meshes from
+	// unrelated weapons appeared in the list and were selected as the aperture,
+	// and because that tree changes as attachments stream the choice flapped
+	// between frames.
+	//
+	// ScopeAiming is the scope, so its subtree is the correct bound, and taking
+	// descendants rather than direct children reaches shapes nested a level or
+	// two down, which is where at least one weapon keeps them.
+	constexpr std::size_t kMaximumVisitedObjects = 1024U;
+	constexpr std::size_t kMaximumCandidates = 24U;
 
-	const auto usableShape = [](RE::NiAVObject* object) -> RE::BSTriShape* {
+	struct PendingObject
+	{
+		RE::NiAVObject* object{ nullptr };
+		bool insideViewParts{ false };
+	};
+	std::vector<PendingObject> pending{ { scopeAiming, false } };
+
+	for (std::size_t cursor = 0;
+		cursor < pending.size() && cursor < kMaximumVisitedObjects &&
+			candidates.size() < kMaximumCandidates;
+		++cursor) {
+		auto* object = pending[cursor].object;
 		if (!object) {
-			return nullptr;
+			continue;
 		}
+		const std::string_view name{ object->name.c_str() };
+		const bool insideViewParts =
+			pending[cursor].insideViewParts ||
+			NameHasPrefixNoCase(name, "ScopeViewParts");
+
+		if (auto* node = object->IsNode()) {
+			for (auto& childPointer : node->children) {
+				if (auto* child = childPointer.get()) {
+					pending.push_back({ child, insideViewParts });
+				}
+			}
+		}
+
 		auto* shape = object->IsTriShape();
 		if (!shape || !shape->rendererData) {
-			return nullptr;
+			continue;
 		}
 		const auto& bound = object->worldBound;
 		if (!IsFinitePoint(bound.center) ||
 			!std::isfinite(bound.fRadius) ||
 			bound.fRadius <= 0.001F ||
 			bound.fRadius >= 100000.0F) {
-			return nullptr;
-		}
-		return shape;
-	};
-
-	const auto addCandidate =
-		[&](RE::NiAVObject* object, std::size_t rank) {
-			if (candidates.size() >= kMaximumCandidates) {
-				return;
-			}
-			auto* shape = usableShape(object);
-			if (!shape) {
-				return;
-			}
-			for (const auto& existing : candidates) {
-				if (existing.shape == object) {
-					return;
-				}
-			}
-			candidates.push_back({
-				object,
-				std::string{ object->name.c_str() },
-				rank,
-				shape->numTriangles == 48U && shape->numVertices == 48U
-			});
-		};
-
-	std::vector<RE::NiAVObject*> pending{ searchRoot };
-	for (std::size_t cursor = 0;
-		cursor < pending.size() && cursor < kMaximumVisitedObjects &&
-			candidates.size() < kMaximumCandidates;
-		++cursor) {
-		auto* object = pending[cursor];
-		if (!object) {
 			continue;
 		}
-		const std::string_view name{ object->name.c_str() };
 
-		// Two conventions, and scopes in the wild use both.
-		//
-		// Some author the aperture as a shape carrying the structural name --
-		// ScopeFade:0, ScopeViewParts:104, ScopeAiming:78 -- which the name
-		// match below collects. Others make ScopeAiming and ScopeViewParts
-		// plain NiNodes and hang the real geometry beneath them under whatever
-		// name they like, which only the child sweep reaches. Collecting both
-		// can only add candidates, and the dropdown decides between them.
-		if (auto* node = object->IsNode()) {
-			for (auto& childPointer : node->children) {
-				auto* child = childPointer.get();
-				if (!child) {
-					continue;
-				}
-				pending.push_back(child);
-				if (NameHasPrefixNoCase(name, "ScopeViewParts")) {
-					addCandidate(child, 1U);
-				} else if (NameHasPrefixNoCase(name, "ScopeAiming")) {
-					addCandidate(child, 2U);
-				}
-			}
-		}
-
-		for (std::size_t rank = 0U;
-			rank < std::size(kAperturePrefixes);
-			++rank) {
-			if (NameHasPrefixNoCase(name, kAperturePrefixes[rank])) {
-				addCandidate(object, rank);
-				break;
-			}
-		}
+		// ScopeFade first, then anything under ScopeViewParts, then the rest of
+		// the scope. The dropdown reorders by hand when this guesses wrong.
+		const std::size_t rank =
+			NameHasPrefixNoCase(name, "ScopeFade") ? 0U :
+			insideViewParts                       ? 1U :
+													2U;
+		candidates.push_back({
+			object,
+			std::string{ name },
+			rank,
+			shape->numTriangles == 48U && shape->numVertices == 48U
+		});
 	}
 
 	std::stable_sort(
@@ -1334,7 +1314,12 @@ std::vector<STSApertureCandidate> FindSTSApertureCandidates(
 		candidates.end(),
 		[](const STSApertureCandidate& left,
 			const STSApertureCandidate& right) {
-			return left.rank < right.rank;
+			if (left.rank != right.rank) {
+				return left.rank < right.rank;
+			}
+			// Within a rank a real annulus always beats a plain shape: it is
+			// the only topology that can drive the exact geometry replay.
+			return left.annulus && !right.annulus;
 		});
 	return candidates;
 }
@@ -1476,16 +1461,16 @@ STSApertureSelection FindSTSAperture(RE::NiAVObject* firstPersonRoot)
 	// Do not substitute optional Glass, Lens, ScreenWarp or EdgeBlur here:
 	// Stage 4c proved those differ between scope NIFs. The candidates are
 	// limited to the three structural names STS itself defines.
-	auto apertureCandidates = FindSTSApertureCandidates(firstPersonRoot);
+	auto apertureCandidates = FindSTSApertureCandidates(scopeAiming);
 	if (apertureCandidates.empty()) {
 		// A scope with no usable aperture shape produces nothing at all, which
 		// is indistinguishable from the plugin being off. Name it once.
 		static std::once_flag loggedNoCandidates;
-		std::call_once(loggedNoCandidates, [] {
+		std::call_once(loggedNoCandidates, [scopeAiming] {
 			logger::warn(
-				"No aperture shape found on this weapon: needs a BSTriShape "
-				"whose name starts with ScopeFade, ScopeViewParts or "
-				"ScopeAiming");
+				"No renderable shape found anywhere under '{}'; this scope "
+				"cannot supply an aperture",
+				scopeAiming->name.c_str());
 		});
 		return {};
 	}
