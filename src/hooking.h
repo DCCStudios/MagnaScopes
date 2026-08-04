@@ -402,7 +402,32 @@ namespace Hook
 			UINT height,
 			DXGI_FORMAT newFormat,
 			UINT flags);
+		// One detour per hooked target, because MinHook gives each target its
+		// own trampoline and a shared detour cannot tell which one it was
+		// entered through. Both forward into the same dispatch.
 		static void __stdcall DrawIndexedHook(ID3D11DeviceContext* pContext, UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation);
+		static void __stdcall DrawIndexedHookAlternate(ID3D11DeviceContext* pContext, UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation);
+		static void DrawIndexedDispatch(
+			ID3D11DeviceContext* pContext,
+			UINT IndexCount,
+			UINT StartIndexLocation,
+			INT BaseVertexLocation,
+			D3D11DrawIndexedHook original);
+		static void __stdcall DrawIndexedInstancedHookAlternate(
+			ID3D11DeviceContext* pContext,
+			UINT IndexCountPerInstance,
+			UINT InstanceCount,
+			UINT StartIndexLocation,
+			INT BaseVertexLocation,
+			UINT StartInstanceLocation);
+		static void DrawIndexedInstancedDispatch(
+			ID3D11DeviceContext* pContext,
+			UINT IndexCountPerInstance,
+			UINT InstanceCount,
+			UINT StartIndexLocation,
+			INT BaseVertexLocation,
+			UINT StartInstanceLocation,
+			D3D11DrawIndexedInstancedHook original);
 		static void __stdcall DrawIndexedInstancedHook(
 			ID3D11DeviceContext* pContext,
 			UINT IndexCountPerInstance,
@@ -513,6 +538,13 @@ namespace Hook
 			D3D11DrawIndexedHook phookD3D11DrawIndexed = nullptr;
 			D3D11DrawIndexedInstancedHook phookD3D11DrawIndexedInstanced =
 				nullptr;
+			// Fallout's draw entry alternates between d3d11's own function and
+			// a wrapper installed by another mod, so both must stay hooked at
+			// once and each needs its own trampoline. Rebinding to whichever
+			// the vtable held cannot win a race that never stops.
+			D3D11DrawIndexedHook phookD3D11DrawIndexedAlternate = nullptr;
+			D3D11DrawIndexedInstancedHook
+				phookD3D11DrawIndexedInstancedAlternate = nullptr;
 		};
 
 	public:

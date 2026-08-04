@@ -151,13 +151,15 @@ def main() -> int:
         "the retired auxiliary world pass can still be authorized",
     )
 
+    # The detours themselves are now thin per-target wrappers; the behaviour
+    # these contracts describe lives in the shared dispatch each forwards to.
     draw = function_body(
         hooking,
-        "void __stdcall D3D::DrawIndexedHook(",
+        "void D3D::DrawIndexedDispatch(",
     )
     draw_instanced = function_body(
         hooking,
-        "void __stdcall D3D::DrawIndexedInstancedHook(",
+        "void D3D::DrawIndexedInstancedDispatch(",
     )
     require(
         "CaptureBeforeFirstPersonDraw(pContext)" in draw
@@ -187,8 +189,11 @@ def main() -> int:
     require(
         "CaptureAutomaticSTSScopeFadeReplay(" in draw
         and "if (captured)" in draw
+        # The dispatch reaches its trampoline through the parameter it was
+        # handed, so the suppressed replay draw calls original(...) rather than
+        # naming one of the two stored trampolines directly.
         and re.search(
-            r"if\s*\(captured\).*?phookD3D11DrawIndexed\s*\(\s*"
+            r"if\s*\(captured\).*?original\s*\(\s*"
             r"pContext\s*,\s*0\s*,\s*0\s*,\s*0\s*\)",
             draw,
             flags=re.DOTALL,
@@ -421,17 +426,28 @@ def main() -> int:
     # context each frame, so a swapped vtable is caught as well as a swapped
     # entry.
     require(
-        "bool RebindDrawHook(" in hooking
-        and "MH_RemoveHook(hookedTarget);" in hooking
+        "bool BindDrawHookTarget(" in hooking
+        and "struct DrawHookBinding" in hooking
         and "MH_ERROR_ALREADY_CREATED" in hooking
-        and "rebindBudget" in hooking
+        # Never unhook. Rebinding to whichever implementation the slot holds is
+        # a race with no finish line, and it loses about half the time.
+        and "MH_RemoveHook(" not in hooking
+        and "MH_DisableHook(" not in hooking
+        # One detour per target, because MinHook gives each its own trampoline
+        # and a shared detour cannot tell which it was entered through.
+        and "DrawIndexedHookAlternate" in hooking
+        and "DrawIndexedInstancedHookAlternate" in hooking
+        and "phookD3D11DrawIndexedAlternate" in hooking
+        and "phookD3D11DrawIndexedInstancedAlternate" in hooking
+        and "void D3D::DrawIndexedDispatch(" in hooking
+        and "void D3D::DrawIndexedInstancedDispatch(" in hooking
         and "void* const target = reinterpret_cast<void*>(vtable[info.index]);"
         in hooking
-        and "g_hookedDrawIndexedTarget = target;" in hooking
+        and "g_drawIndexedBinding.primaryTarget = target;" in hooking
         and "*reinterpret_cast<DWORD_PTR**>(g_Context.Get());" in hooking
-        and hooking.count("RebindDrawHook(") == 3
+        and hooking.count("BindDrawHookTarget(") == 3
         and "DescribeCodeAddress(" in hooking,
-        "draw hooks do not rebind when d3d11 moves the vtable entry",
+        "draw entries are not kept hooked across both implementations",
     )
 
     # A control that cannot affect anything must not be on screen. The legacy
@@ -931,10 +947,10 @@ def main() -> int:
         indexed_black_begin + 1,
     )
     indexed_black_draw = indexed_reticle.find(
-        "oldFuncs.phookD3D11DrawIndexed("
+        "original("
     )
     indexed_white_draw = indexed_reticle.find(
-        "oldFuncs.phookD3D11DrawIndexed(",
+        "original(",
         indexed_black_draw + 1,
     )
     indexed_suppression = indexed_reticle.find(
@@ -942,7 +958,7 @@ def main() -> int:
         indexed_white_draw + 1,
     )
     indexed_authored_draw = indexed_reticle.find(
-        "oldFuncs.phookD3D11DrawIndexed(",
+        "original(",
         indexed_white_draw + 1,
     )
     indexed_success = indexed_reticle.find(
@@ -962,7 +978,7 @@ def main() -> int:
             "BeginAutomaticSTSReticleLayerCapture("
         ) == 2
         and indexed_reticle.count(
-            "oldFuncs.phookD3D11DrawIndexed("
+            "original("
         ) == 3
         and "bool capturedBlack = false;" in indexed_reticle
         and "bool capturedWhite = false;" in indexed_reticle
@@ -974,8 +990,7 @@ def main() -> int:
         and "ApplyAutomaticSTSReticleColorSuppression(" in indexed_reticle
         and "ScopedContextState restoreAfterSuppression" in indexed_reticle
         and "if (captured) {\n\t\t\t\t\t\t\treturn;" in indexed_reticle
-        and "return oldFuncs.phookD3D11DrawIndexed(pContext, IndexCount"
-        in draw,
+        and "return original(pContext, IndexCount" in draw,
         "indexed reticle can be suppressed without both authored captures",
     )
 
@@ -1008,10 +1023,10 @@ def main() -> int:
         instanced_black_begin + 1,
     )
     instanced_black_draw = instanced_reticle.find(
-        "oldFuncs.phookD3D11DrawIndexedInstanced("
+        "original("
     )
     instanced_white_draw = instanced_reticle.find(
-        "oldFuncs.phookD3D11DrawIndexedInstanced(",
+        "original(",
         instanced_black_draw + 1,
     )
     instanced_suppression = instanced_reticle.find(
@@ -1019,7 +1034,7 @@ def main() -> int:
         instanced_white_draw + 1,
     )
     instanced_authored_draw = instanced_reticle.find(
-        "oldFuncs.phookD3D11DrawIndexedInstanced(",
+        "original(",
         instanced_white_draw + 1,
     )
     instanced_success = instanced_reticle.find(
@@ -1039,7 +1054,7 @@ def main() -> int:
             "BeginAutomaticSTSReticleLayerCapture("
         ) == 2
         and instanced_reticle.count(
-            "oldFuncs.phookD3D11DrawIndexedInstanced("
+            "original("
         ) == 3
         and "bool capturedBlack = false;" in instanced_reticle
         and "bool capturedWhite = false;" in instanced_reticle

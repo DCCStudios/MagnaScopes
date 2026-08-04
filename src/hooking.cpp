@@ -777,8 +777,9 @@ thread_local bool bSelfDraw = false;
 // silently removes our detour from the chain, and the only visible symptom is
 // a draw count far below the frame's real one.
 DWORD_PTR* g_deviceContextVTable = nullptr;
-void* g_hookedDrawIndexedTarget = nullptr;
-void* g_hookedDrawIndexedInstancedTarget = nullptr;
+struct DrawHookBinding;
+extern DrawHookBinding g_drawIndexedBinding;
+extern DrawHookBinding g_drawIndexedInstancedBinding;
 
 // "module.dll+0xOFFSET" for a code address. Which module owns a hook target is
 // the difference between having hooked d3d11's own function and having hooked
@@ -810,63 +811,99 @@ std::string DescribeCodeAddress(const void* address)
 	return std::format("{}+0x{:X}", name, offset);
 }
 
-// Re-point a draw hook at whatever the context's vtable holds now.
+// Keep a draw entry hooked no matter which implementation the vtable points at.
 //
 // MinHook patches a function's prologue, not the vtable slot, so hooking the
-// address a slot happened to contain is only correct while that slot keeps
-// pointing there. It does not. MH_CreateHook takes over a hundred milliseconds
-// per hook, and d3d11 has been observed swapping the immediate context's
-// DrawIndexed entry inside that window -- from d3d11+0x1545A0 to +0x154B70 in
-// one session -- so we patched an implementation the context then did not call.
-// Nothing about that is visible from inside: the detour is installed and
-// healthy, it is simply never reached, and the lens falls through to ordinary
-// See Through Scopes for the rest of the session.
+// address a slot happens to contain is only correct while it keeps pointing
+// there. It does not. Fallout's device context alternates between d3d11's own
+// DrawIndexed and a wrapper another mod installs -- d3d11+0x1545A0 against
+// ShaderEngineCL+0x67520 -- switching several times a second.
 //
-// Re-reading the vtable pointer from the object each frame covers a swapped
-// slot and a swapped vtable alike. Rebinds are capped so an implementation that
-// genuinely alternates degrades to the old behaviour instead of thrashing
-// MinHook, which suspends threads to patch.
-bool RebindDrawHook(
+// Rebinding to whichever address the slot currently holds cannot win that: it
+// is a race with no finish line. An earlier attempt burned its whole sixteen
+// rebind budget in five seconds and then sat on whichever implementation it had
+// last patched, which was the live one about half the time. That is exactly the
+// coin flip this bug always presented as.
+//
+// So hook both and never unhook. Each target gets its own detour and its own
+// trampoline, because a shared detour cannot tell which one it was entered
+// through. Whichever implementation the context calls, one of ours runs.
+struct DrawHookBinding
+{
+	void* primaryTarget = nullptr;
+	void* alternateTarget = nullptr;
+	bool exhausted = false;
+};
+
+DrawHookBinding g_drawIndexedBinding{};
+DrawHookBinding g_drawIndexedInstancedBinding{};
+
+bool BindDrawHookTarget(
 	DWORD_PTR* vtable,
 	std::size_t index,
-	void* detour,
-	void** original,
-	void*& hookedTarget,
+	void* primaryDetour,
+	void** primaryOriginal,
+	void* alternateDetour,
+	void** alternateOriginal,
+	DrawHookBinding& binding,
 	const char* hookName)
 {
 	auto* const current = reinterpret_cast<void*>(vtable[index]);
-	if (!current || current == hookedTarget || current == detour ||
-		!IsExecutableAddress(current)) {
+	if (!current || current == binding.primaryTarget ||
+		current == binding.alternateTarget || current == primaryDetour ||
+		current == alternateDetour || !IsExecutableAddress(current)) {
 		return false;
 	}
-	static std::atomic_uint32_t rebindBudget{ 0U };
-	if (rebindBudget.fetch_add(1U, std::memory_order_relaxed) >= 16U) {
+
+	void* detour = nullptr;
+	void** original = nullptr;
+	void** slot = nullptr;
+	if (!binding.primaryTarget) {
+		detour = primaryDetour;
+		original = primaryOriginal;
+		slot = &binding.primaryTarget;
+	} else if (!binding.alternateTarget) {
+		detour = alternateDetour;
+		original = alternateOriginal;
+		slot = &binding.alternateTarget;
+	} else {
+		// Two implementations is what this game presents. A third would mean
+		// the assumption is wrong; say so once rather than thrash.
+		if (!binding.exhausted) {
+			binding.exhausted = true;
+			logger::error(
+				"{} saw a third implementation at {:p} ({}); only two can be "
+				"hooked and draws through this one will be missed",
+				hookName,
+				current,
+				DescribeCodeAddress(current));
+		}
 		return false;
 	}
-	logger::warn(
-		"{} target moved from {:p} ({}) to {:p} ({}); rebinding",
-		hookName,
-		hookedTarget,
-		DescribeCodeAddress(hookedTarget),
-		current,
-		DescribeCodeAddress(current));
-	if (hookedTarget) {
-		MH_DisableHook(hookedTarget);
-		MH_RemoveHook(hookedTarget);
-	}
+
 	const auto created = MH_CreateHook(current, detour, original);
 	if (created != MH_OK && created != MH_ERROR_ALREADY_CREATED) {
-		logger::error("Failed to create rebound {}", hookName);
-		hookedTarget = nullptr;
+		logger::error(
+			"Failed to hook {} implementation at {:p} ({})",
+			hookName,
+			current,
+			DescribeCodeAddress(current));
 		return false;
 	}
 	if (MH_EnableHook(current) != MH_OK) {
-		logger::error("Failed to enable rebound {}", hookName);
-		hookedTarget = nullptr;
+		logger::error(
+			"Failed to enable {} implementation at {:p} ({})",
+			hookName,
+			current,
+			DescribeCodeAddress(current));
 		return false;
 	}
-	hookedTarget = current;
-	logger::info("Rebound {} to {:p}", hookName, current);
+	*slot = current;
+	logger::info(
+		"Hooked {} implementation at {:p} ({})",
+		hookName,
+		current,
+		DescribeCodeAddress(current));
 	return true;
 }
 
@@ -4164,13 +4201,18 @@ namespace Hook
 		}
 	}
 
-	void __stdcall D3D::DrawIndexedHook(ID3D11DeviceContext* pContext, UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation)
+	void D3D::DrawIndexedDispatch(
+		ID3D11DeviceContext* pContext,
+		UINT IndexCount,
+		UINT StartIndexLocation,
+		INT BaseVertexLocation,
+		D3D11DrawIndexedHook original)
 	{
-		if (!oldFuncs.phookD3D11DrawIndexed || !pContext) {
+		if (!original || !pContext) {
 			return;
 		}
 		if (bSelfDraw) {
-			return oldFuncs.phookD3D11DrawIndexed(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+			return original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
 		}
 		if (MagnaScope::GetSettings().AllowsWorldColorCapture()) {
 			(void)MagnaScope::WorldOnlyScopeRenderer::GetSingleton()
@@ -4383,7 +4425,7 @@ namespace Hook
 									sourceDepth.Get(),
 									false)) {
 								bSelfDraw = true;
-								oldFuncs.phookD3D11DrawIndexed(
+								original(
 									pContext,
 									IndexCount,
 									StartIndexLocation,
@@ -4406,7 +4448,7 @@ namespace Hook
 									sourceDepth.Get(),
 									true)) {
 								bSelfDraw = true;
-								oldFuncs.phookD3D11DrawIndexed(
+								original(
 									pContext,
 									IndexCount,
 									StartIndexLocation,
@@ -4427,7 +4469,7 @@ namespace Hook
 									pContext);
 							if (captured) {
 								bSelfDraw = true;
-								oldFuncs.phookD3D11DrawIndexed(
+								original(
 									pContext,
 									IndexCount,
 									StartIndexLocation,
@@ -4570,13 +4612,13 @@ namespace Hook
 							// It would be magnified and replayed recursively,
 							// producing the stable projected-object and thin
 							// rim artifacts seen above 1x.
-							return oldFuncs.phookD3D11DrawIndexed(
+							return original(
 								pContext,
 								0,
 								0,
 								0);
 						}
-						return oldFuncs.phookD3D11DrawIndexed(
+						return original(
 							pContext,
 							IndexCount,
 							StartIndexLocation,
@@ -4656,7 +4698,7 @@ namespace Hook
 						D3DInstance->m_pPixelShader_STSGeometryProbe.Get(),
 						nullptr,
 						0);
-					oldFuncs.phookD3D11DrawIndexed(
+					original(
 						pContext,
 						IndexCount,
 						StartIndexLocation,
@@ -4702,13 +4744,13 @@ namespace Hook
 			// STS owns its 3D reticle. Suppressing the inherited MagnaScope
 			// fingerprinted draw here would make the reticle disappear in
 			// automatic mode.
-			return oldFuncs.phookD3D11DrawIndexed(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+			return original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
 		}
 
 		std::vector<BufferInfo> vertexInfo;
 		BufferInfo indexInfo;
 		if (!GetVertexBuffersInfo(pContext, vertexInfo) || !GetIndexBufferInfo(pContext, indexInfo)) {
-			return oldFuncs.phookD3D11DrawIndexed(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+			return original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
 		}
 
 		if (IsTargetDrawCall(vertexInfo[0], indexInfo, IndexCount)) {
@@ -4730,14 +4772,14 @@ namespace Hook
 			pContext->PSGetShaderResources(0, 1, DrawIndexedSRV.ReleaseAndGetAddressOf());
 
 			if (!DrawIndexedSRV.Get() || !oldFuncs.phookD3D11DrawIndexed) {
-				oldFuncs.phookD3D11DrawIndexed(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+				original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
 				return;
 			}
 
 			ComPtr<ID3D11Resource> pResource;
 			DrawIndexedSRV->GetResource(pResource.GetAddressOf());
 			if (!pResource.Get()) {
-				return oldFuncs.phookD3D11DrawIndexed(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+				return original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
 			}
 			D3D11_SHADER_RESOURCE_VIEW_DESC tempSRVDesc;
 			DrawIndexedSRV->GetDesc(&tempSRVDesc);
@@ -4767,31 +4809,63 @@ namespace Hook
 						targetStartIndexLocation = StartIndexLocation;
 						targetBaseVertexLocation = BaseVertexLocation;
 
-						return oldFuncs.phookD3D11DrawIndexed(pContext, 0, 0, 0);
+						return original(pContext, 0, 0, 0);
 					}
 				}
 			}
 		}
 
-		return oldFuncs.phookD3D11DrawIndexed(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+		return original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
 	}
 
-	void __stdcall D3D::DrawIndexedInstancedHook(
+	// Two detours per draw entry, one per hooked target. MinHook hands each
+	// target its own trampoline and a shared detour has no way to tell which
+	// one it was entered through, so the pairing has to be static.
+	void __stdcall D3D::DrawIndexedHook(
+		ID3D11DeviceContext* pContext,
+		UINT IndexCount,
+		UINT StartIndexLocation,
+		INT BaseVertexLocation)
+	{
+		DrawIndexedDispatch(
+			pContext,
+			IndexCount,
+			StartIndexLocation,
+			BaseVertexLocation,
+			oldFuncs.phookD3D11DrawIndexed);
+	}
+
+	void __stdcall D3D::DrawIndexedHookAlternate(
+		ID3D11DeviceContext* pContext,
+		UINT IndexCount,
+		UINT StartIndexLocation,
+		INT BaseVertexLocation)
+	{
+		DrawIndexedDispatch(
+			pContext,
+			IndexCount,
+			StartIndexLocation,
+			BaseVertexLocation,
+			oldFuncs.phookD3D11DrawIndexedAlternate);
+	}
+
+	void D3D::DrawIndexedInstancedDispatch(
 		ID3D11DeviceContext* pContext,
 		UINT IndexCountPerInstance,
 		UINT InstanceCount,
 		UINT StartIndexLocation,
 		INT BaseVertexLocation,
-		UINT StartInstanceLocation)
+		UINT StartInstanceLocation,
+		D3D11DrawIndexedInstancedHook original)
 	{
-		if (!oldFuncs.phookD3D11DrawIndexedInstanced) {
+		if (!original) {
 			return;
 		}
 		if (!pContext) {
 			return;
 		}
 		const auto callOriginal = [&] {
-			oldFuncs.phookD3D11DrawIndexedInstanced(
+			original(
 				pContext,
 				IndexCountPerInstance,
 				InstanceCount,
@@ -4967,7 +5041,7 @@ namespace Hook
 							sourceDepth.Get(),
 							false)) {
 						bSelfDraw = true;
-						oldFuncs.phookD3D11DrawIndexedInstanced(
+						original(
 							pContext,
 							IndexCountPerInstance,
 							InstanceCount,
@@ -4987,7 +5061,7 @@ namespace Hook
 							sourceDepth.Get(),
 							true)) {
 						bSelfDraw = true;
-						oldFuncs.phookD3D11DrawIndexedInstanced(
+						original(
 							pContext,
 							IndexCountPerInstance,
 							InstanceCount,
@@ -5006,7 +5080,7 @@ namespace Hook
 							pContext);
 					if (captured) {
 						bSelfDraw = true;
-						oldFuncs.phookD3D11DrawIndexedInstanced(
+						original(
 							pContext,
 							IndexCountPerInstance,
 							InstanceCount,
@@ -5042,6 +5116,42 @@ namespace Hook
 		}
 
 		callOriginal();
+	}
+
+	void __stdcall D3D::DrawIndexedInstancedHook(
+		ID3D11DeviceContext* pContext,
+		UINT IndexCountPerInstance,
+		UINT InstanceCount,
+		UINT StartIndexLocation,
+		INT BaseVertexLocation,
+		UINT StartInstanceLocation)
+	{
+		DrawIndexedInstancedDispatch(
+			pContext,
+			IndexCountPerInstance,
+			InstanceCount,
+			StartIndexLocation,
+			BaseVertexLocation,
+			StartInstanceLocation,
+			oldFuncs.phookD3D11DrawIndexedInstanced);
+	}
+
+	void __stdcall D3D::DrawIndexedInstancedHookAlternate(
+		ID3D11DeviceContext* pContext,
+		UINT IndexCountPerInstance,
+		UINT InstanceCount,
+		UINT StartIndexLocation,
+		INT BaseVertexLocation,
+		UINT StartInstanceLocation)
+	{
+		DrawIndexedInstancedDispatch(
+			pContext,
+			IndexCountPerInstance,
+			InstanceCount,
+			StartIndexLocation,
+			BaseVertexLocation,
+			StartInstanceLocation,
+			oldFuncs.phookD3D11DrawIndexedInstancedAlternate);
 	}
 
 	bool D3D::CaptureVerificationSource(
@@ -6298,28 +6408,34 @@ namespace Hook
 		lastPresentedSwapChain.store(pSwapChain, std::memory_order_release);
 
 		// Re-read the vtable pointer from the context rather than trusting the
-		// one captured at install: this covers d3d11 swapping the whole vtable
-		// as well as swapping a single entry. One load and two compares in the
-		// common case, once a frame.
+		// one captured at install: this covers a swapped vtable as well as a
+		// swapped entry. Once both implementations are hooked this settles to
+		// one load and a couple of compares per frame and never fires again.
 		if (g_Context.Get()) {
 			auto* const contextVTable =
 				*reinterpret_cast<DWORD_PTR**>(g_Context.Get());
 			if (contextVTable) {
 				g_deviceContextVTable = contextVTable;
-				RebindDrawHook(
+				BindDrawHookTarget(
 					contextVTable,
 					12U,
 					reinterpret_cast<void*>(DrawIndexedHook),
 					reinterpret_cast<void**>(&oldFuncs.phookD3D11DrawIndexed),
-					g_hookedDrawIndexedTarget,
+					reinterpret_cast<void*>(DrawIndexedHookAlternate),
+					reinterpret_cast<void**>(
+						&oldFuncs.phookD3D11DrawIndexedAlternate),
+					g_drawIndexedBinding,
 					"DrawIndexedHook");
-				RebindDrawHook(
+				BindDrawHookTarget(
 					contextVTable,
 					20U,
 					reinterpret_cast<void*>(DrawIndexedInstancedHook),
 					reinterpret_cast<void**>(
 						&oldFuncs.phookD3D11DrawIndexedInstanced),
-					g_hookedDrawIndexedInstancedTarget,
+					reinterpret_cast<void*>(DrawIndexedInstancedHookAlternate),
+					reinterpret_cast<void**>(
+						&oldFuncs.phookD3D11DrawIndexedInstancedAlternate),
+					g_drawIndexedInstancedBinding,
 					"DrawIndexedInstancedHook");
 			}
 		}
@@ -6352,12 +6468,11 @@ namespace Hook
 					std::memory_order_acq_rel);
 
 			// A frame with the weapon drawn issues thousands of indexed draws.
-			// Seeing a couple of dozen means our detour is no longer in the
+			// Seeing a couple of dozen means neither of our detours is in the
 			// chain -- not that the gate closed, which the gated/observed pair
-			// already rules out. Report what we hooked against what the vtable
-			// holds now, so a slot replaced after us is visible rather than
-			// inferred, and name the owning module: hooking a wrapped context's
-			// forwarding thunk looks identical from inside except for this.
+			// already rules out. Report both hooked implementations against
+			// what the vtable holds now, with owning modules, so a third
+			// implementation or a failed bind is visible rather than inferred.
 			static std::atomic_uint32_t loggedBypassFrames{ 0U };
 			if (observedDraws + observedInstancedDraws < 64U &&
 				g_deviceContextVTable &&
@@ -6369,18 +6484,17 @@ namespace Hook
 					reinterpret_cast<void*>(g_deviceContextVTable[20]);
 				logger::warn(
 					"Draw hook appears bypassed: observed DI:{} DII:{} this "
-					"frame. DrawIndexed hooked {:p} ({}), vtable now {:p} ({}); "
-					"DrawIndexedInstanced hooked {:p} ({}), vtable now {:p} "
-					"({})",
+					"frame. DrawIndexed hooked {} and {}, vtable now {}; "
+					"DrawIndexedInstanced hooked {} and {}, vtable now {}",
 					observedDraws,
 					observedInstancedDraws,
-					g_hookedDrawIndexedTarget,
-					DescribeCodeAddress(g_hookedDrawIndexedTarget),
-					currentDrawIndexed,
+					DescribeCodeAddress(g_drawIndexedBinding.primaryTarget),
+					DescribeCodeAddress(g_drawIndexedBinding.alternateTarget),
 					DescribeCodeAddress(currentDrawIndexed),
-					g_hookedDrawIndexedInstancedTarget,
-					DescribeCodeAddress(g_hookedDrawIndexedInstancedTarget),
-					currentDrawIndexedInstanced,
+					DescribeCodeAddress(
+						g_drawIndexedInstancedBinding.primaryTarget),
+					DescribeCodeAddress(
+						g_drawIndexedInstancedBinding.alternateTarget),
 					DescribeCodeAddress(currentDrawIndexedInstanced));
 			}
 			const auto reticleDraws =
@@ -6881,10 +6995,11 @@ namespace Hook
 			reinterpret_cast<void*>(pDeviceContextVTable[20]));
 
 		// Record the address each hook actually took, not a re-read afterwards.
-		// The slot can move while MinHook is working -- that is the whole
-		// defect -- and re-reading would store the new value as though we had
-		// hooked it, leaving the per-frame check permanently satisfied by a
-		// hook that is never called.
+		// The slot can move while MinHook is working -- MH_CreateHook takes
+		// over a hundred milliseconds -- and re-reading would store the value
+		// it moved to as though we had hooked it, leaving the per-frame check
+		// satisfied by a hook that is never called. The other implementation is
+		// picked up by the first Present that sees it.
 		for (const auto& [vtable, info] : hooks) {
 			void* const target = reinterpret_cast<void*>(vtable[info.index]);
 			if (!CreateAndEnableHook(
@@ -6898,9 +7013,9 @@ namespace Hook
 				continue;
 			}
 			if (info.index == 12) {
-				g_hookedDrawIndexedTarget = target;
+				g_drawIndexedBinding.primaryTarget = target;
 			} else if (info.index == 20) {
-				g_hookedDrawIndexedInstancedTarget = target;
+				g_drawIndexedInstancedBinding.primaryTarget = target;
 			}
 		}
 
