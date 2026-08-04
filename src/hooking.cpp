@@ -3736,6 +3736,32 @@ namespace Hook
 			scopeData.ScopeEffect_OriPositionOffset = ToFloat2(LFA(shaderData.OriPositionOffset, 2));
 			scopeData.ScopeEffect_OriSize = ToFloat2(shaderData.OriSize);
 			scopeData.ScopeEffect_Size = ToFloat2(LFA(shaderData.Size, 2));
+			// Size the screen-space circle from the aperture actually chosen.
+			//
+			// Only the centre used to come from the projection; the radius was
+			// the legacy Circle Size, a fixed 700 by default. So selecting a
+			// non-annulus aperture moved the opening to the right place at
+			// entirely the wrong size, and the control that would have fixed it
+			// is hidden on automatic profiles.
+			//
+			// The shader derives its diameter as Size.x scaled by height/1080,
+			// so inverting that puts the circle exactly on the projected shape.
+			if (!automaticSTSApertureSupportsExactReplay.load(
+					std::memory_order_acquire)) {
+				const float projectedRadius = 0.5F *
+					(projectedLensRadiusX.load(std::memory_order_acquire) +
+						projectedLensRadiusY.load(std::memory_order_acquire));
+				const float publishedHeight =
+					projectedSourceHeight.load(std::memory_order_acquire);
+				const float renderHeight =
+					publishedHeight > 1.0F ? publishedHeight : 1080.0F;
+				if (std::isfinite(projectedRadius) && projectedRadius > 1.0F) {
+					const float authoredDiameter =
+						2.0F * projectedRadius * (1080.0F / renderHeight);
+					scopeData.ScopeEffect_Size = { authoredDiameter,
+						authoredDiameter };
+				}
+			}
 			scopeData.rect = ToFloat4(LFA(shaderData.rectSize, 4));
 
 			// 视差参数

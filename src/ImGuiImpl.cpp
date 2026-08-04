@@ -912,15 +912,28 @@ namespace ImGuiImpl
 		// Gated on the setting as well as the profile, so turning geometry
 		// magnification off in the INI hands the overlay back its controls
 		// rather than leaving them permanently hidden.
-		const bool geometryReplayOwnsLens =
+		// The aperture dropdown belongs to every automatic profile, whichever
+		// shape is selected. Gating it on the same condition as the overlay
+		// controls would make a non-annulus choice hide the control that made
+		// it, leaving no way back.
+		const bool automaticProfile =
 			currData && currData->autoProfile &&
 			MagnaScope::GetSettings().AllowsGeometryMagnification();
+
+		// The overlay's own placement controls are inert only while the replay
+		// owns the lens. A non-annulus selection magnifies through that overlay
+		// instead, so they are live again and must reappear -- hiding them then
+		// left the circle unadjustable on exactly the scopes that need it.
+		const bool geometryReplayOwnsLens =
+			automaticProfile &&
+			Hook::D3D::automaticSTSApertureSupportsExactReplay.load(
+				std::memory_order_acquire);
 
 		if (ImGui::CollapsingHeader("Magnified Image")) {
 			// Which authored shape is the aperture. Populated from whatever the
 			// equipped scope actually offers, because the names carry arbitrary
 			// suffixes and differ between meshes.
-			if (geometryReplayOwnsLens) {
+			if (automaticProfile) {
 				const auto candidates = GetApertureCandidates();
 				std::string preview = apertureSurface_UI.empty() ?
 					std::string{ "Automatic" } :
