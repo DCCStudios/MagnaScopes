@@ -3938,14 +3938,34 @@ namespace Hook
 					automaticSTSExactScopeFadeReplacementThisFrame.load(
 						std::memory_order_acquire);
 				if (!exactScopeFadeReady) {
-					// Automatic STS magnification owns only the exact,
-					// published ScopeFade draw. Falling through to the legacy
-					// fullscreen circle would detach the effect from authored
-					// lens geometry and can cover weapon or world pixels that
-					// are outside the optic. Keep the ordinary STS draw when
-					// exact capture was unavailable.
-					return false;
-				}
+					// Two different situations reach here and they need
+					// opposite answers.
+					//
+					// A transient failure -- capture lost for a frame, geometry
+					// momentarily unpublished -- must keep the ordinary STS
+					// draw. Falling through then would detach the effect from
+					// authored lens geometry and flash a fullscreen circle over
+					// weapon or world pixels outside the optic.
+					//
+					// An aperture that is not a 48-vertex annulus can never
+					// drive the exact replay, so waiting for it means the scope
+					// shows no magnification at all, forever. That is what a
+					// non-ScopeFade selection in the editor did: the aperture
+					// was chosen, projected and masked correctly, and nothing
+					// was ever drawn through it. Those hand over to the
+					// screen-space path, which masks from the same published
+					// centre and radius and so stays inside the chosen shape.
+					if (automaticSTSApertureSupportsExactReplay.load(
+							std::memory_order_acquire)) {
+						return false;
+					}
+					static std::once_flag loggedScreenSpaceFallback;
+					std::call_once(loggedScreenSpaceFallback, [] {
+						logger::info(
+							"Selected aperture cannot drive the exact replay; "
+							"magnifying through the screen-space path instead");
+					});
+				} else {
 
 				// Replay the exact aperture against the composite target's own
 				// content rather than the retired pre-first-person RT4
@@ -4019,12 +4039,13 @@ namespace Hook
 				// lens for one frame instead of sampling contaminated glass or
 				// drawing a mismatched fullscreen circle.
 				static std::once_flag loggedLateScopeFadeReplayFailure;
-				std::call_once(loggedLateScopeFadeReplayFailure, [] {
-					logger::warn(
-							"Automatic STS late ScopeFade replay was unavailable "
-							"after aperture capture; this frame remains clear");
-				});
-				return false;
+					std::call_once(loggedLateScopeFadeReplayFailure, [] {
+						logger::warn(
+								"Automatic STS late ScopeFade replay was unavailable "
+								"after aperture capture; this frame remains clear");
+					});
+					return false;
+				}
 			}
 			// 旧版特定参数
 
@@ -7109,6 +7130,7 @@ namespace Hook
 	std::atomic_uint32_t D3D::automaticSTSVertexDataOffset = 0;
 	std::atomic_uint32_t D3D::automaticSTSIndexDataOffset = 0;
 	std::atomic_bool D3D::automaticSTSGeometryReady = false;
+	std::atomic_bool D3D::automaticSTSApertureSupportsExactReplay = true;
 	std::atomic<std::uintptr_t> D3D::automaticSTSReticleVertexBuffer = 0;
 	std::atomic<std::uintptr_t> D3D::automaticSTSReticleIndexBuffer = 0;
 	std::atomic_uint32_t D3D::automaticSTSReticleIndexCount = 0;

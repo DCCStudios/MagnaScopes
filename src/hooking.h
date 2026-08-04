@@ -659,6 +659,13 @@ namespace Hook
 		static std::atomic_uint32_t automaticSTSVertexDataOffset;
 		static std::atomic_uint32_t automaticSTSIndexDataOffset;
 		static std::atomic_bool automaticSTSGeometryReady;
+		// False when the selected aperture is not a 48-vertex annulus, so the
+		// exact replay is impossible rather than merely unavailable this frame.
+		// The composite needs that distinction: a transient capture failure
+		// must keep the ordinary STS draw, but a permanently ineligible
+		// aperture should hand over to the screen-space path instead of
+		// leaving the scope with no magnification at all.
+		static std::atomic_bool automaticSTSApertureSupportsExactReplay;
 		static std::atomic<std::uintptr_t> automaticSTSReticleVertexBuffer;
 		static std::atomic<std::uintptr_t> automaticSTSReticleIndexBuffer;
 		static std::atomic_uint32_t automaticSTSReticleIndexCount;

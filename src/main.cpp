@@ -2937,6 +2937,12 @@ void HookedUpdate()
 				// shader cannot derive, which renders a confidently wrong lens
 				// rather than falling back. The projection below is published
 				// either way, so the screen-space path keeps the opening.
+				// The composite needs to tell "not this frame" from "not ever".
+				// Without it a non-annulus aperture waits for a replay that
+				// cannot happen and the scope shows nothing at all.
+				Hook::D3D::automaticSTSApertureSupportsExactReplay.store(
+					aperture.supportsExactReplay,
+					std::memory_order_release);
 				hookIns->PublishAutomaticSTSGeometry(
 					aperture.supportsExactReplay ?
 						aperture.renderSurface :
