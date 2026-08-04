@@ -458,6 +458,35 @@ def main() -> int:
         "draw entries are not kept hooked across both implementations",
     )
 
+    # The aperture may come from ScopeFade, ScopeViewParts or ScopeAiming, in
+    # that order, pinned per profile by the editor's dropdown.
+    #
+    # Candidates must be BSTriShapes: an NiNode of the same name carries a
+    # transform and a bound but no geometry, so it can neither be replayed nor
+    # identified at draw time. Names carry arbitrary authored suffixes, so
+    # matching is by prefix and the discovered string is what gets stored.
+    #
+    # Only a 48-vertex annulus may reach the geometry replay. Publishing any
+    # other mesh as the render surface would let the replay match and replace
+    # it while the fill shader derives lens coordinates from primitive order it
+    # does not have, rendering a confidently wrong lens instead of falling back
+    # to the screen-space path.
+    require(
+        "kAperturePrefixes" in main_cpp
+        and "NameHasPrefixNoCase(" in main_cpp
+        and "FindSTSApertureCandidates(" in main_cpp
+        and "object->IsTriShape();" in main_cpp
+        and "bool supportsExactReplay{ false };" in main_cpp
+        and "aperture.supportsExactReplay ?" in main_cpp
+        and "std::string apertureSurface;" in data_h
+        and '"ApertureSurface"' in data_cpp
+        and "GetSelectedApertureSurfaceName()" in main_cpp
+        and "PublishApertureCandidates(" in main_cpp
+        and "ApertureCandidateInfo" in imgui
+        and '"Aperture Surface"' in imgui,
+        "aperture surface selection is not discovered, gated, or persisted",
+    )
+
     # A control that cannot affect anything must not be on screen. The legacy
     # overlay's shape and placement fields still feed AutoSTS_PS, so they are
     # not dead code, but nothing they touch reaches the screen once the

@@ -276,6 +276,12 @@ struct STSApertureSelection
 	// thread. The authored object remains under ScopeAiming, so Fallout owns
 	// its animation, culling, depth, and draw order.
 	RE::NiAVObject* renderSurface{ nullptr };
+	// True only for a 48-vertex ScopeFade annulus. The fill shader assigns lens
+	// coordinates from primitive order across 24 segments, so on any other mesh
+	// they would be meaningless -- the draw would still match and still be
+	// replaced, producing a confidently wrong lens. Everything else the
+	// aperture supplies, projection and eye box and mask, works on any shape.
+	bool supportsExactReplay{ false };
 	// The reticle remains a separate aim reference. Its authored offset is not
 	// forced to screen center and will later drive the magnified sample origin.
 	RE::NiAVObject* aimReference{ nullptr };
@@ -1125,6 +1131,158 @@ constexpr std::string_view kReticleShapeTokens[] = { "Reticle", "Dot" };
 			   equalNoCase) != name.end();
 }
 
+[[nodiscard]] bool NameHasPrefixNoCase(
+	std::string_view name,
+	std::string_view prefix) noexcept
+{
+	if (prefix.empty() || name.size() < prefix.size()) {
+		return false;
+	}
+	for (std::size_t index = 0; index < prefix.size(); ++index) {
+		if (std::tolower(static_cast<unsigned char>(name[index])) !=
+			std::tolower(static_cast<unsigned char>(prefix[index]))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Shapes that can serve as the aperture, in preference order.
+//
+// Authored names carry arbitrary numeric suffixes -- ScopeViewParts:378,
+// ScopeAiming:78 -- so these are prefixes, matched without regard to case, and
+// the discovered name is what the editor pins and the profile stores.
+constexpr std::string_view kAperturePrefixes[] = {
+	"ScopeFade",
+	"ScopeViewParts",
+	"ScopeAiming"
+};
+
+struct STSApertureCandidate
+{
+	RE::NiAVObject* shape{ nullptr };
+	std::string name;
+	// Index into kAperturePrefixes. Lower wins when choosing automatically.
+	std::size_t rank{ 0U };
+	// A 48-vertex, 48-triangle annulus, which is the only topology the exact
+	// geometry replay can drive: its fill shader derives lens coordinates from
+	// primitive order on that specific mesh. Anything else still supplies the
+	// aperture's projection, eye box and mask.
+	bool annulus{ false };
+};
+
+// The aperture name the player pinned, or empty for automatic.
+//
+// The live editor wins while a preview is active so the dropdown takes effect
+// without saving first; otherwise the selected profile is authoritative.
+[[nodiscard]] const std::string& GetSelectedApertureSurfaceName()
+{
+	static std::string selected;
+	const auto preview = ImGuiImpl::GetEditorPreviewSnapshot();
+	if (preview.active) {
+		selected = preview.apertureSurface;
+		return selected;
+	}
+	const auto* current =
+		ScopeData::ScopeDataHandler::GetSingleton()->GetCurrentScopeProfile();
+	selected = current ? current->shaderData.apertureSurface : std::string{};
+	return selected;
+}
+
+// Every usable aperture shape under the given root, best first.
+//
+// Only BSTriShapes qualify. An NiNode carries a transform and a bound but no
+// geometry, so it can neither be replayed nor identified at draw time -- which
+// is why matching the container named ScopeViewParts is not enough on its own.
+std::vector<STSApertureCandidate> FindSTSApertureCandidates(
+	RE::NiAVObject* searchRoot)
+{
+	std::vector<STSApertureCandidate> candidates;
+	if (!searchRoot) {
+		return candidates;
+	}
+
+	constexpr std::size_t kMaximumVisitedObjects = 512U;
+	constexpr std::size_t kMaximumCandidates = 16U;
+	std::vector<RE::NiAVObject*> pending{ searchRoot };
+	for (std::size_t cursor = 0;
+		cursor < pending.size() && cursor < kMaximumVisitedObjects &&
+			candidates.size() < kMaximumCandidates;
+		++cursor) {
+		auto* object = pending[cursor];
+		if (!object) {
+			continue;
+		}
+		if (auto* node = object->IsNode()) {
+			for (auto& childPointer : node->children) {
+				if (auto* child = childPointer.get()) {
+					pending.push_back(child);
+				}
+			}
+		}
+		auto* shape = object->IsTriShape();
+		if (!shape || !shape->rendererData) {
+			continue;
+		}
+		const std::string_view name{ object->name.c_str() };
+		for (std::size_t rank = 0U;
+			rank < std::size(kAperturePrefixes);
+			++rank) {
+			if (!NameHasPrefixNoCase(name, kAperturePrefixes[rank])) {
+				continue;
+			}
+			const auto& bound = object->worldBound;
+			if (!IsFinitePoint(bound.center) ||
+				!std::isfinite(bound.fRadius) ||
+				bound.fRadius <= 0.001F ||
+				bound.fRadius >= 100000.0F) {
+				break;
+			}
+			candidates.push_back({
+				object,
+				std::string{ name },
+				rank,
+				shape->numTriangles == 48U && shape->numVertices == 48U
+			});
+			break;
+		}
+	}
+
+	std::stable_sort(
+		candidates.begin(),
+		candidates.end(),
+		[](const STSApertureCandidate& left,
+			const STSApertureCandidate& right) {
+			return left.rank < right.rank;
+		});
+	return candidates;
+}
+
+// Copy the discovered names to the editor so its dropdown lists what this
+// weapon actually has. Republished only on change: this runs every frame the
+// optic is live, and the list is stable for a given scope.
+void PublishApertureCandidates(
+	const std::vector<STSApertureCandidate>& candidates)
+{
+	static std::vector<std::string> lastPublished;
+	std::vector<std::string> names;
+	names.reserve(candidates.size());
+	for (const auto& candidate : candidates) {
+		names.push_back(candidate.name);
+	}
+	if (names == lastPublished) {
+		return;
+	}
+	lastPublished = names;
+
+	std::vector<ImGuiImpl::ApertureCandidateInfo> published;
+	published.reserve(candidates.size());
+	for (const auto& candidate : candidates) {
+		published.push_back({ candidate.name, candidate.annulus });
+	}
+	ImGuiImpl::PublishApertureCandidates(published);
+}
+
 std::vector<RE::NiAVObject*> FindSTSReticleSurfaces(
 	RE::NiAVObject* scopeViewParts)
 {
@@ -1207,29 +1365,63 @@ STSApertureSelection FindSTSAperture(RE::NiAVObject* firstPersonRoot)
 		       bound.fRadius < 100000.0F;
 	};
 
-	// ScopeFade is the required STS optical plane. Do not substitute optional
-	// Glass, Lens, ScreenWarp, or EdgeBlur shapes here: Stage 4c proved those
-	// differ between scope NIFs. ScopeFade supplies the one guaranteed authored
-	// transform, depth, visibility branch, and renderer property contract.
-	auto* opticalPlane = scopeViewParts->GetObjectByName("ScopeFade:0");
-	if (!opticalPlane ||
-		!IsDescendantOf(opticalPlane, scopeViewParts) ||
-		!validBound(opticalPlane)) {
+	// ScopeFade is the preferred optical plane, but not every scope ships one.
+	// Search ScopeAiming's whole subtree for any usable aperture shape and take
+	// the best available, unless the profile pins one by name.
+	//
+	// Do not substitute optional Glass, Lens, ScreenWarp or EdgeBlur here:
+	// Stage 4c proved those differ between scope NIFs. The candidates are
+	// limited to the three structural names STS itself defines.
+	auto apertureCandidates = FindSTSApertureCandidates(scopeAiming);
+	if (apertureCandidates.empty()) {
 		return {};
+	}
+	PublishApertureCandidates(apertureCandidates);
+
+	const auto& pinnedName = GetSelectedApertureSurfaceName();
+	const STSApertureCandidate* chosen = nullptr;
+	if (!pinnedName.empty()) {
+		for (const auto& candidate : apertureCandidates) {
+			if (candidate.name == pinnedName) {
+				chosen = &candidate;
+				break;
+			}
+		}
+		if (!chosen) {
+			// A pinned name that is absent on this weapon must not disable the
+			// optic. Fall through to the automatic choice and say so once.
+			static std::once_flag loggedMissingPin;
+			std::call_once(loggedMissingPin, [&pinnedName] {
+				logger::warn(
+					"Pinned aperture surface '{}' is not present on this "
+					"scope; falling back to automatic selection",
+					pinnedName);
+			});
+		}
+	}
+	if (!chosen) {
+		chosen = &apertureCandidates.front();
 	}
 
-	auto* scopeFade = opticalPlane->IsTriShape();
-	if (!scopeFade || scopeFade->numTriangles != 48U ||
-		scopeFade->numVertices != 48U || !scopeFade->rendererData) {
-		logger::error(
-			"Automatic STS ScopeFade topology is unsupported: "
-			"triangles={}, vertices={}, rendererData={}",
-			scopeFade ? scopeFade->numTriangles : 0U,
-			scopeFade ? scopeFade->numVertices : 0U,
-			scopeFade ? scopeFade->rendererData != nullptr : false);
+	RE::NiAVObject* opticalPlane = chosen->shape;
+	if (!validBound(opticalPlane)) {
 		return {};
 	}
-	RE::NiAVObject* renderSurface = scopeFade;
+	RE::NiAVObject* renderSurface = opticalPlane;
+	// Only the standardized annulus can drive the exact geometry replay. Say
+	// which mode this scope is in rather than leaving a silently wrong lens:
+	// the fill shader assigns lens coordinates from primitive order across 24
+	// segments, so on any other mesh those coordinates are meaningless.
+	if (!chosen->annulus) {
+		static std::once_flag loggedNonAnnulusAperture;
+		std::call_once(loggedNonAnnulusAperture, [chosen] {
+			logger::warn(
+				"Aperture '{}' is not a 48-vertex ScopeFade annulus; it "
+				"supplies projection, eye box and mask, but the exact "
+				"geometry replay is unavailable on this topology",
+				chosen->name);
+		});
+	}
 	const auto& planeBound = opticalPlane->worldBound;
 	const float planeRadius = planeBound.fRadius;
 
@@ -1319,6 +1511,7 @@ STSApertureSelection FindSTSAperture(RE::NiAVObject* firstPersonRoot)
 	return {
 		opticalPlane,
 		renderSurface,
+		chosen->annulus,
 		aimReference,
 		std::move(reticleSurfaces),
 		extentReference,
@@ -2610,8 +2803,16 @@ void HookedUpdate()
 			if (currentData->autoProfile) {
 				const auto aperture = FindSTSAperture(firstPersonRoot);
 				scopeNode = aperture.opticalPlane;
+				// Withhold the draw identity when the aperture is not the
+				// standardized annulus. Publishing it would let the replay
+				// match and replace a mesh whose lens coordinates the fill
+				// shader cannot derive, which renders a confidently wrong lens
+				// rather than falling back. The projection below is published
+				// either way, so the screen-space path keeps the opening.
 				hookIns->PublishAutomaticSTSGeometry(
-					aperture.renderSurface,
+					aperture.supportsExactReplay ?
+						aperture.renderSurface :
+						nullptr,
 					aperture.reticleSurfaces,
 					aperture.extentReference);
 				scopeProjectionPoint = aperture.worldCenter;

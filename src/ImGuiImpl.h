@@ -226,8 +226,26 @@ namespace ImGuiImpl
 		// Six related values, carried as a struct rather than six more
 		// positional parameters on an already long publish call.
 		ScopeData::Breathing breathing;
+		// Pinned aperture shape name, empty for automatic. A string rather
+		// than an index because the candidate list changes with the weapon.
+		std::string apertureSurface;
 		bool active = false;
 	};
+
+	// One aperture shape the equipped scope offers, discovered on the game
+	// thread and copied here for the dropdown. Names carry arbitrary authored
+	// suffixes, so the exact string is what gets pinned and saved.
+	struct ApertureCandidateInfo
+	{
+		std::string name;
+		// A 48-vertex ScopeFade annulus, the only topology the exact geometry
+		// replay can drive. Shown in the list so the choice is informed.
+		bool annulus{ false };
+	};
+
+	void PublishApertureCandidates(
+		const std::vector<ApertureCandidateInfo>& candidates);
+	[[nodiscard]] std::vector<ApertureCandidateInfo> GetApertureCandidates();
 
 	struct AuthoredZoomSnapshot
 	{
@@ -292,7 +310,8 @@ namespace ImGuiImpl
 		float lensOffsetX,
 		float lensOffsetY,
 		float lensScale,
-		const ScopeData::Breathing& breathing);
+		const ScopeData::Breathing& breathing,
+		const std::string& apertureSurface);
 	[[nodiscard]] EditorPreviewSnapshot GetEditorPreviewSnapshot();
 	void ClearEditorPreview();
 	void RequestProfileAction(ProfileRequest request);
@@ -350,6 +369,7 @@ namespace ImGuiImpl
 		float axialBreathing_UI = 0.0F;
 		float recenterSpeed_UI = 1.0F;
 		float strafeLag_UI = 1.0F;
+		std::string apertureSurface_UI;
 		float tubeDepth_UI = 0.0F;
 		float lensOffset_UI[2] = { 0.0F, 0.0F };
 		float lensScale_UI = 1.0F;

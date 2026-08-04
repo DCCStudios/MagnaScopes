@@ -157,6 +157,7 @@ namespace ScopeData
 			j.value("ReticleParallaxStrength", 1.0F);
 		ReadFloatArray(j, "LensOffset", s.lensOffset, { "x", "y" });
 		s.lensScale = j.value("LensScale", 1.0F);
+		s.apertureSurface = j.value("ApertureSurface", std::string{});
 		s.fovAdjust = j.value("fovAdjust", 0.0F);
 		s.parallax = j.value("Parallax", Parallax());
 		s.breathing = j.value("Breathing", Breathing());
@@ -272,6 +273,7 @@ namespace ScopeData
 			{ "ReticleParallaxStrength", s.reticleParallaxStrength },
 			{ "LensOffset", { { "x", s.lensOffset[0] }, { "y", s.lensOffset[1] } } },
 			{ "LensScale", s.lensScale },
+			{ "ApertureSurface", s.apertureSurface },
 			{ "fovAdjust", s.fovAdjust },
 			//
 			{ "Parallax", s.parallax },

@@ -169,6 +169,21 @@ namespace ScopeData
 		float lensOffset[2] = { 0.0F, 0.0F };
 		float lensScale = 1.0F;
 
+		// Which authored shape supplies the aperture, by name.
+		//
+		// Empty means automatic: the first usable candidate in the order
+		// ScopeFade, ScopeViewParts, ScopeAiming. Authored names carry
+		// arbitrary numeric suffixes -- ScopeViewParts:378, ScopeAiming:78 --
+		// so candidates are matched by prefix and the exact discovered name is
+		// stored here once the editor pins one.
+		//
+		// Only a ScopeFade annulus of 48 vertices and 48 triangles can drive
+		// the exact geometry replay: its fill shader derives lens coordinates
+		// from primitive order on that specific topology. Any other shape still
+		// supplies the aperture's projection, eye box and mask, but the
+		// magnified image comes from the screen-space path instead.
+		std::string apertureSurface;
+
 		Breathing breathing;
 
 		float fovAdjust = 0;

@@ -121,6 +121,22 @@ namespace ImGuiImpl
 		return authoredZoomSnapshot;
 	}
 
+	std::mutex apertureCandidateMutex;
+	std::vector<ApertureCandidateInfo> apertureCandidates;
+
+	void PublishApertureCandidates(
+		const std::vector<ApertureCandidateInfo>& candidates)
+	{
+		std::scoped_lock lock(apertureCandidateMutex);
+		apertureCandidates = candidates;
+	}
+
+	std::vector<ApertureCandidateInfo> GetApertureCandidates()
+	{
+		std::scoped_lock lock(apertureCandidateMutex);
+		return apertureCandidates;
+	}
+
 	void PublishEditorPreview(
 		const ScopeData::ZoomDataOverwrite& zoomOverride,
 		std::uint64_t selectionRevision,
@@ -154,9 +170,11 @@ namespace ImGuiImpl
 		float lensOffsetX,
 		float lensOffsetY,
 		float lensScale,
-		const ScopeData::Breathing& breathing)
+		const ScopeData::Breathing& breathing,
+		const std::string& apertureSurface)
 	{
 		std::scoped_lock lock(editorPreviewMutex);
+		editorPreview.apertureSurface = apertureSurface;
 		editorPreview.zoomOverride = zoomOverride;
 		editorPreview.selectionRevision = selectionRevision;
 		editorPreview.magnification =
@@ -474,6 +492,7 @@ namespace ImGuiImpl
 				std::isfinite(data->shaderData.parallax.tubeDepth) ?
 					std::clamp(data->shaderData.parallax.tubeDepth, 0.0F, 1.0F) :
 					0.0F;
+			ins->apertureSurface_UI = data->shaderData.apertureSurface;
 			ins->strafeLag_UI =
 				std::isfinite(data->shaderData.parallax.strafeLag) ?
 					std::clamp(data->shaderData.parallax.strafeLag, 0.0F, 4.0F) :
@@ -634,6 +653,7 @@ namespace ImGuiImpl
 				std::clamp(axialBreathing_UI, 0.0F, 4.0F);
 			editedProfile.shaderData.parallax.recenterSpeed =
 				std::clamp(recenterSpeed_UI, 0.1F, 10.0F);
+			editedProfile.shaderData.apertureSurface = apertureSurface_UI;
 			editedProfile.shaderData.parallax.strafeLag =
 				std::clamp(strafeLag_UI, 0.0F, 4.0F);
 			editedProfile.shaderData.parallax.tubeDepth =
@@ -897,6 +917,52 @@ namespace ImGuiImpl
 			MagnaScope::GetSettings().AllowsGeometryMagnification();
 
 		if (ImGui::CollapsingHeader("Magnified Image")) {
+			// Which authored shape is the aperture. Populated from whatever the
+			// equipped scope actually offers, because the names carry arbitrary
+			// suffixes and differ between meshes.
+			if (geometryReplayOwnsLens) {
+				const auto candidates = GetApertureCandidates();
+				std::string preview = apertureSurface_UI.empty() ?
+					std::string{ "Automatic" } :
+					apertureSurface_UI;
+				if (ImGui::BeginCombo("Aperture Surface", preview.c_str())) {
+					if (ImGui::Selectable(
+							"Automatic",
+							apertureSurface_UI.empty())) {
+						apertureSurface_UI.clear();
+					}
+					for (const auto& candidate : candidates) {
+						const std::string label =
+							candidate.name +
+							(candidate.annulus ?
+									"  (exact replay)" :
+									"  (screen-space)");
+						if (ImGui::Selectable(
+								label.c_str(),
+								apertureSurface_UI == candidate.name)) {
+							apertureSurface_UI = candidate.name;
+						}
+					}
+					ImGui::EndCombo();
+				}
+				Tip("Which authored shape supplies the scope's opening.\n"
+					"\n"
+					"Automatic takes the first available in the order\n"
+					"ScopeFade, ScopeViewParts, ScopeAiming. Pin one here if a\n"
+					"scope's preferred shape is the wrong size or in the wrong\n"
+					"place. Only shapes with real geometry are listed, so a\n"
+					"container node of the same name never appears.\n"
+					"\n"
+					"Exact replay means a 48-vertex ScopeFade ring, the only\n"
+					"shape the magnified image can be drawn directly onto.\n"
+					"Screen-space shapes still give the opening its position,\n"
+					"size, eye box and shadow, but the magnification comes from\n"
+					"the older overlay instead.\n"
+					"\n"
+					"A pinned shape that a weapon does not have falls back to\n"
+					"Automatic rather than disabling the scope.");
+				ImGui::Spacing();
+			}
 			if (!geometryReplayOwnsLens) {
 				ImGui::Checkbox("Circular Area", &IsCircle_UI);
 				Tip("Draws the magnified image as a circle. Turn off for a rectangular\n"
@@ -1450,7 +1516,8 @@ namespace ImGuiImpl
 				instance->breathDrift_UI,
 				instance->breathFigure_UI,
 				instance->breathHold_UI,
-				instance->breathPupilFollow_UI });
+				instance->breathPupilFollow_UI },
+			instance->apertureSurface_UI);
 
 		ImGui::PopItemWidth();
 	}
