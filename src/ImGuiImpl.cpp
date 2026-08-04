@@ -872,16 +872,33 @@ namespace ImGuiImpl
 
 	void ImGuiImplClass::ShaderDataSection()
 	{
+		// When the geometry replay owns the lens, the scope's own ScopeFade
+		// mesh is the aperture and the screen-space overlay contributes
+		// nothing -- the in-game probe records its draw changing no pixels at
+		// the scope centre. Its shape and placement controls still feed
+		// AutoSTS_PS, so they are not dead code; they simply cannot affect
+		// anything that reaches the screen in this configuration. Lens Size
+		// and Lens Center are their replacements.
+		//
+		// Gated on the setting as well as the profile, so turning geometry
+		// magnification off in the INI hands the overlay back its controls
+		// rather than leaving them permanently hidden.
+		const bool geometryReplayOwnsLens =
+			currData && currData->autoProfile &&
+			MagnaScope::GetSettings().AllowsGeometryMagnification();
+
 		if (ImGui::CollapsingHeader("Magnified Image")) {
-			ImGui::Checkbox("Circular Area", &IsCircle_UI);
-			Tip("Draws the magnified image as a circle. Turn off for a rectangular\n"
-				"area, which fits holographic sights and camera-style scopes.");
+			if (!geometryReplayOwnsLens) {
+				ImGui::Checkbox("Circular Area", &IsCircle_UI);
+				Tip("Draws the magnified image as a circle. Turn off for a rectangular\n"
+					"area, which fits holographic sights and camera-style scopes.");
 
-			ImGui::DragFloat("Eye Relief Response", &camDepth_UI, 0.01F, 0, 15);
-			Tip("How strongly the magnified image shifts against your view movement,\n"
-				"simulating eye relief behind the scope. Higher values move less.");
+				ImGui::DragFloat("Eye Relief Response", &camDepth_UI, 0.01F, 0, 15);
+				Tip("How strongly the magnified image shifts against your view movement,\n"
+					"simulating eye relief behind the scope. Higher values move less.");
 
-			ImGui::Spacing();
+				ImGui::Spacing();
+			}
 
 			ImGui::DragFloat(
 				"Magnification",
@@ -985,37 +1002,39 @@ namespace ImGuiImpl
 
 			ImGui::Spacing();
 
-			if (bLegacyMode)
-				ImGui::DragFloat2("Circle Position", PositionOffset_UI, 0.1F, -3840, 3840);
-			else
-				ImGui::DragFloat2("Circle Position", PositionOffset_UI, 0.1F, -1000, 1000, "%.2f");
-			Tip("Moves the magnified area on screen, in 1080p reference pixels from\n"
-				"the scope's center. Use it to line the circle up with the lens.");
+			if (!geometryReplayOwnsLens) {
+				if (bLegacyMode)
+					ImGui::DragFloat2("Circle Position", PositionOffset_UI, 0.1F, -3840, 3840);
+				else
+					ImGui::DragFloat2("Circle Position", PositionOffset_UI, 0.1F, -1000, 1000, "%.2f");
+				Tip("Moves the magnified area on screen, in 1080p reference pixels from\n"
+					"the scope's center. Use it to line the circle up with the lens.");
 
-			if (bLegacyMode) {
-				ImGui::DragFloat2("Circle Size", Size_UI, 1.0F, 0, 3840, "%.4f");
-				Tip("Diameter of the magnified circle, in 1080p reference pixels.");
-			} else {
-				if (IsCircle_UI) {
+				if (bLegacyMode) {
 					ImGui::DragFloat2("Circle Size", Size_UI, 1.0F, 0, 3840, "%.4f");
 					Tip("Diameter of the magnified circle, in 1080p reference pixels.");
 				} else {
-					ImGui::DragFloat4("Rectangle Bounds", Size_rect_UI, 1.0F, -1200, 1200, "%.2f");
-					Tip("Left, top, right and bottom bounds of the rectangular area,\n"
-						"in 1080p reference pixels.");
+					if (IsCircle_UI) {
+						ImGui::DragFloat2("Circle Size", Size_UI, 1.0F, 0, 3840, "%.4f");
+						Tip("Diameter of the magnified circle, in 1080p reference pixels.");
+					} else {
+						ImGui::DragFloat4("Rectangle Bounds", Size_rect_UI, 1.0F, -1200, 1200, "%.2f");
+						Tip("Left, top, right and bottom bounds of the rectangular area,\n"
+							"in 1080p reference pixels.");
+					}
 				}
+
+				ImGui::Spacing();
+
+				if (bLegacyMode)
+					ImGui::DragFloat2("Source Position", OriPositionOffset_UI, 0.1F, -3840, 3840);
+				else
+					ImGui::DragFloat2("Source Position", OriPositionOffset_UI, 0.1F, -1000, 1000, "%.2f");
+				Tip("Moves the area of the scene that gets magnified, without moving the\n"
+					"circle itself. Use it when the zoomed image looks off-center.");
+
+				ImGui::Spacing();
 			}
-
-			ImGui::Spacing();
-
-			if (bLegacyMode)
-				ImGui::DragFloat2("Source Position", OriPositionOffset_UI, 0.1F, -3840, 3840);
-			else
-				ImGui::DragFloat2("Source Position", OriPositionOffset_UI, 0.1F, -1000, 1000, "%.2f");
-			Tip("Moves the area of the scene that gets magnified, without moving the\n"
-				"circle itself. Use it when the zoomed image looks off-center.");
-
-			ImGui::Spacing();
 
 			ImGui::DragFloat("Reticle Size", &ReticleSize_UI, 0.01F, 0, 128);
 			Tip("Scales the isolated STS reticle around its authored geometric\n"

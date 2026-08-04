@@ -76,6 +76,7 @@ def main() -> int:
     data_h = (project / "src" / "ScopeProfile.h").read_text(encoding="utf-8")
     data_cpp = (project / "src" / "ScopeProfile.cpp").read_text(encoding="utf-8")
     settings = (project / "src" / "Settings.h").read_text(encoding="utf-8")
+    imgui = (project / "src" / "ImGuiImpl.cpp").read_text(encoding="utf-8")
     xmake = (project / "xmake.lua").read_text(encoding="utf-8")
     shader = (
         project / "src" / "HLSL" / "ScopeGeometryMagnify_PS.hlsl"
@@ -403,6 +404,29 @@ def main() -> int:
         and "SCOPE_LENS_SCALE" in shader
         and "SCOPE_LENS_SCALE" in reticle_shader,
         "Lens Center or Lens Size is not wired through to the optics",
+    )
+
+    # A control that cannot affect anything must not be on screen. The legacy
+    # overlay's shape and placement fields still feed AutoSTS_PS, so they are
+    # not dead code, but nothing they touch reaches the screen once the
+    # geometry replay owns the lens -- and a visible slider that does nothing
+    # is exactly how Circle Size wasted a tuning session. Gated on the setting
+    # too, so disabling geometry magnification hands the overlay its controls
+    # back instead of hiding them forever.
+    require(
+        "const bool geometryReplayOwnsLens =" in imgui
+        and "AllowsGeometryMagnification()" in imgui
+        and imgui.count("if (!geometryReplayOwnsLens) {") == 2
+        and '"Circle Position"' in imgui
+        and '"Circle Size"' in imgui
+        and '"Source Position"' in imgui
+        # Their replacements have to stay unconditionally visible.
+        and imgui.index('"Lens Size"') > 0
+        and imgui.index('"Lens Center"') > 0
+        # Night vision is genuinely live on automatic profiles -- AutoSTS_PS
+        # composites it -- so it must not be swept up in the same gate.
+        and '"Night Vision"' in imgui,
+        "inert legacy overlay controls are still shown, or live ones were hidden",
     )
 
     # Breathing must not be routed through the eye-box travel that carries
