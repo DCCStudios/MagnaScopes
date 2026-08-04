@@ -406,6 +406,34 @@ def main() -> int:
         "Lens Center or Lens Size is not wired through to the optics",
     )
 
+    # MinHook patches a function's prologue, not the vtable slot, so hooking
+    # whatever address a slot happened to hold is only correct while it keeps
+    # pointing there. It does not: MH_CreateHook takes over a hundred
+    # milliseconds per hook, and d3d11 was observed moving the immediate
+    # context's DrawIndexed entry inside that window, leaving a healthy detour
+    # installed on an implementation the context no longer called. The lens
+    # then fell through to ordinary See Through Scopes for the whole session
+    # with nothing failing.
+    #
+    # The stored target has to be the address actually hooked -- re-reading the
+    # slot afterwards would record the value that moved and leave the check
+    # permanently satisfied -- and the vtable pointer has to come from the
+    # context each frame, so a swapped vtable is caught as well as a swapped
+    # entry.
+    require(
+        "bool RebindDrawHook(" in hooking
+        and "MH_RemoveHook(hookedTarget);" in hooking
+        and "MH_ERROR_ALREADY_CREATED" in hooking
+        and "rebindBudget" in hooking
+        and "void* const target = reinterpret_cast<void*>(vtable[info.index]);"
+        in hooking
+        and "g_hookedDrawIndexedTarget = target;" in hooking
+        and "*reinterpret_cast<DWORD_PTR**>(g_Context.Get());" in hooking
+        and hooking.count("RebindDrawHook(") == 3
+        and "DescribeCodeAddress(" in hooking,
+        "draw hooks do not rebind when d3d11 moves the vtable entry",
+    )
+
     # A control that cannot affect anything must not be on screen. The legacy
     # overlay's shape and placement fields still feed AutoSTS_PS, so they are
     # not dead code, but nothing they touch reaches the screen once the

@@ -810,6 +810,66 @@ std::string DescribeCodeAddress(const void* address)
 	return std::format("{}+0x{:X}", name, offset);
 }
 
+// Re-point a draw hook at whatever the context's vtable holds now.
+//
+// MinHook patches a function's prologue, not the vtable slot, so hooking the
+// address a slot happened to contain is only correct while that slot keeps
+// pointing there. It does not. MH_CreateHook takes over a hundred milliseconds
+// per hook, and d3d11 has been observed swapping the immediate context's
+// DrawIndexed entry inside that window -- from d3d11+0x1545A0 to +0x154B70 in
+// one session -- so we patched an implementation the context then did not call.
+// Nothing about that is visible from inside: the detour is installed and
+// healthy, it is simply never reached, and the lens falls through to ordinary
+// See Through Scopes for the rest of the session.
+//
+// Re-reading the vtable pointer from the object each frame covers a swapped
+// slot and a swapped vtable alike. Rebinds are capped so an implementation that
+// genuinely alternates degrades to the old behaviour instead of thrashing
+// MinHook, which suspends threads to patch.
+bool RebindDrawHook(
+	DWORD_PTR* vtable,
+	std::size_t index,
+	void* detour,
+	void** original,
+	void*& hookedTarget,
+	const char* hookName)
+{
+	auto* const current = reinterpret_cast<void*>(vtable[index]);
+	if (!current || current == hookedTarget || current == detour ||
+		!IsExecutableAddress(current)) {
+		return false;
+	}
+	static std::atomic_uint32_t rebindBudget{ 0U };
+	if (rebindBudget.fetch_add(1U, std::memory_order_relaxed) >= 16U) {
+		return false;
+	}
+	logger::warn(
+		"{} target moved from {:p} ({}) to {:p} ({}); rebinding",
+		hookName,
+		hookedTarget,
+		DescribeCodeAddress(hookedTarget),
+		current,
+		DescribeCodeAddress(current));
+	if (hookedTarget) {
+		MH_DisableHook(hookedTarget);
+		MH_RemoveHook(hookedTarget);
+	}
+	const auto created = MH_CreateHook(current, detour, original);
+	if (created != MH_OK && created != MH_ERROR_ALREADY_CREATED) {
+		logger::error("Failed to create rebound {}", hookName);
+		hookedTarget = nullptr;
+		return false;
+	}
+	if (MH_EnableHook(current) != MH_OK) {
+		logger::error("Failed to enable rebound {}", hookName);
+		hookedTarget = nullptr;
+		return false;
+	}
+	hookedTarget = current;
+	logger::info("Rebound {} to {:p}", hookName, current);
+	return true;
+}
+
 bool isActive_TAA = false;
 bool isActive_DOF = false;
 bool renderedAtTAAThisFrame = false;
@@ -6237,6 +6297,33 @@ namespace Hook
 		bSelfDraw = false;
 		lastPresentedSwapChain.store(pSwapChain, std::memory_order_release);
 
+		// Re-read the vtable pointer from the context rather than trusting the
+		// one captured at install: this covers d3d11 swapping the whole vtable
+		// as well as swapping a single entry. One load and two compares in the
+		// common case, once a frame.
+		if (g_Context.Get()) {
+			auto* const contextVTable =
+				*reinterpret_cast<DWORD_PTR**>(g_Context.Get());
+			if (contextVTable) {
+				g_deviceContextVTable = contextVTable;
+				RebindDrawHook(
+					contextVTable,
+					12U,
+					reinterpret_cast<void*>(DrawIndexedHook),
+					reinterpret_cast<void**>(&oldFuncs.phookD3D11DrawIndexed),
+					g_hookedDrawIndexedTarget,
+					"DrawIndexedHook");
+				RebindDrawHook(
+					contextVTable,
+					20U,
+					reinterpret_cast<void*>(DrawIndexedInstancedHook),
+					reinterpret_cast<void**>(
+						&oldFuncs.phookD3D11DrawIndexedInstanced),
+					g_hookedDrawIndexedInstancedTarget,
+					"DrawIndexedInstancedHook");
+			}
+		}
+
 		const auto& verification = MagnaScope::GetSettings();
 		if (verification.AllowsScopeFadeGeometry() &&
 			automaticSTSGeometryReady.load(std::memory_order_acquire)) {
@@ -6793,13 +6880,29 @@ namespace Hook
 			reinterpret_cast<void*>(pDeviceContextVTable[12]),
 			reinterpret_cast<void*>(pDeviceContextVTable[20]));
 
+		// Record the address each hook actually took, not a re-read afterwards.
+		// The slot can move while MinHook is working -- that is the whole
+		// defect -- and re-reading would store the new value as though we had
+		// hooked it, leaving the per-frame check permanently satisfied by a
+		// hook that is never called.
 		for (const auto& [vtable, info] : hooks) {
-			CreateAndEnableHook(reinterpret_cast<void*>(vtable[info.index]), info.hook, info.original, info.name);
+			void* const target = reinterpret_cast<void*>(vtable[info.index]);
+			if (!CreateAndEnableHook(
+					target,
+					info.hook,
+					info.original,
+					info.name)) {
+				continue;
+			}
+			if (vtable != pDeviceContextVTable) {
+				continue;
+			}
+			if (info.index == 12) {
+				g_hookedDrawIndexedTarget = target;
+			} else if (info.index == 20) {
+				g_hookedDrawIndexedInstancedTarget = target;
+			}
 		}
-		g_hookedDrawIndexedTarget =
-			reinterpret_cast<void*>(pDeviceContextVTable[12]);
-		g_hookedDrawIndexedInstancedTarget =
-			reinterpret_cast<void*>(pDeviceContextVTable[20]);
 
 		if (MagnaScope::GetSettings().AllowsTAACapture() &&
 			!InstallGuardedTAAHook()) {
