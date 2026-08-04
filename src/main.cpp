@@ -1239,13 +1239,52 @@ std::vector<STSApertureCandidate> FindSTSApertureCandidates(
 		return candidates;
 	}
 
-	// Searched from the first-person root, not from the ScopeAiming node.
-	// Anchoring to that node missed scopes whose aperture shape sits outside
-	// it -- the node exists, nothing beneath it matches, and the scope showed
-	// nothing. The three names are STS-specific enough to search wider, and
-	// the visit bound rises to suit the larger tree.
+	// Searched from the first-person root. Anchoring to the ScopeAiming node
+	// missed scopes whose aperture shape sits outside it: the node existed,
+	// nothing beneath it matched, and the scope showed nothing at all.
 	constexpr std::size_t kMaximumVisitedObjects = 4096U;
 	constexpr std::size_t kMaximumCandidates = 16U;
+
+	const auto usableShape = [](RE::NiAVObject* object) -> RE::BSTriShape* {
+		if (!object) {
+			return nullptr;
+		}
+		auto* shape = object->IsTriShape();
+		if (!shape || !shape->rendererData) {
+			return nullptr;
+		}
+		const auto& bound = object->worldBound;
+		if (!IsFinitePoint(bound.center) ||
+			!std::isfinite(bound.fRadius) ||
+			bound.fRadius <= 0.001F ||
+			bound.fRadius >= 100000.0F) {
+			return nullptr;
+		}
+		return shape;
+	};
+
+	const auto addCandidate =
+		[&](RE::NiAVObject* object, std::size_t rank) {
+			if (candidates.size() >= kMaximumCandidates) {
+				return;
+			}
+			auto* shape = usableShape(object);
+			if (!shape) {
+				return;
+			}
+			for (const auto& existing : candidates) {
+				if (existing.shape == object) {
+					return;
+				}
+			}
+			candidates.push_back({
+				object,
+				std::string{ object->name.c_str() },
+				rank,
+				shape->numTriangles == 48U && shape->numVertices == 48U
+			});
+		};
+
 	std::vector<RE::NiAVObject*> pending{ searchRoot };
 	for (std::size_t cursor = 0;
 		cursor < pending.size() && cursor < kMaximumVisitedObjects &&
@@ -1255,38 +1294,38 @@ std::vector<STSApertureCandidate> FindSTSApertureCandidates(
 		if (!object) {
 			continue;
 		}
+		const std::string_view name{ object->name.c_str() };
+
+		// Two conventions, and scopes in the wild use both.
+		//
+		// Some author the aperture as a shape carrying the structural name --
+		// ScopeFade:0, ScopeViewParts:104, ScopeAiming:78 -- which the name
+		// match below collects. Others make ScopeAiming and ScopeViewParts
+		// plain NiNodes and hang the real geometry beneath them under whatever
+		// name they like, which only the child sweep reaches. Collecting both
+		// can only add candidates, and the dropdown decides between them.
 		if (auto* node = object->IsNode()) {
 			for (auto& childPointer : node->children) {
-				if (auto* child = childPointer.get()) {
-					pending.push_back(child);
+				auto* child = childPointer.get();
+				if (!child) {
+					continue;
+				}
+				pending.push_back(child);
+				if (NameHasPrefixNoCase(name, "ScopeViewParts")) {
+					addCandidate(child, 1U);
+				} else if (NameHasPrefixNoCase(name, "ScopeAiming")) {
+					addCandidate(child, 2U);
 				}
 			}
 		}
-		auto* shape = object->IsTriShape();
-		if (!shape || !shape->rendererData) {
-			continue;
-		}
-		const std::string_view name{ object->name.c_str() };
+
 		for (std::size_t rank = 0U;
 			rank < std::size(kAperturePrefixes);
 			++rank) {
-			if (!NameHasPrefixNoCase(name, kAperturePrefixes[rank])) {
-				continue;
-			}
-			const auto& bound = object->worldBound;
-			if (!IsFinitePoint(bound.center) ||
-				!std::isfinite(bound.fRadius) ||
-				bound.fRadius <= 0.001F ||
-				bound.fRadius >= 100000.0F) {
+			if (NameHasPrefixNoCase(name, kAperturePrefixes[rank])) {
+				addCandidate(object, rank);
 				break;
 			}
-			candidates.push_back({
-				object,
-				std::string{ name },
-				rank,
-				shape->numTriangles == 48U && shape->numVertices == 48U
-			});
-			break;
 		}
 	}
 
@@ -1316,6 +1355,19 @@ void PublishApertureCandidates(
 		return;
 	}
 	lastPublished = names;
+
+	// The list changed, so this is a different scope. Record what it offers:
+	// when a weapon shows nothing, the difference between "no candidates" and
+	// "candidates found but the wrong one chosen" is the whole diagnosis.
+	std::string summary;
+	for (const auto& candidate : candidates) {
+		if (!summary.empty()) {
+			summary += ", ";
+		}
+		summary += candidate.name;
+		summary += candidate.annulus ? " (annulus)" : " (plain)";
+	}
+	logger::info("Aperture candidates: {}", summary);
 
 	std::vector<ImGuiImpl::ApertureCandidateInfo> published;
 	published.reserve(candidates.size());
