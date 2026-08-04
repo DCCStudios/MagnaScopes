@@ -497,14 +497,16 @@ def main() -> int:
         and "const float2 pixelsToUnitX" in shader
         and "const float2 pixelsToUnitZ" in shader
         and "const float2 currentAimPixels" in shader
-        # Image Lag is the single control for the image trailing the reticle,
-        # and it declines a fraction of the aperture's own screen motion at the
-        # sample pivot. Scaling the pivot rather than the delta is required:
-        # only the pivot form cancels that motion identically at every
-        # magnification, which is why the delta path it replaced could not hold
-        # the image still however many gains were stacked on it.
+        # Image Lag translates the sampled region. It must never move the
+        # sample pivot: the pivot is the fixed point of the magnification, so
+        # it is the player's point of aim, and displacing it makes swinging the
+        # camera move where the shot lands and then settle it back. Only the
+        # authored Lens Center may place that pivot.
         and "const float imageLag = saturate(ScopeImageStillness);" in shader
-        and "aperturePivotPixels += apertureMotionPixels * imageLag;" in shader
+        and "aperturePivotPixels += apertureMotionPixels" not in shader
+        and "aperturePivotPixels += pixelsToLensOffset - pixelsToCenter;"
+        in shader
+        and "sampleDelta -=\n            apertureMotionPixels *" in shader
         and "const float2 samplePivotUv = aperturePivotPixels * PixelSize"
         in shader
         # Fore/aft breathing must stay independent of lateral parallax so
@@ -1102,13 +1104,17 @@ def main() -> int:
         and "SCOPE_RETICLE_SIZE" in reticle_shader
         and "SCOPE_RETICLE_OFFSET_X" in reticle_shader
         and "SCOPE_RETICLE_OFFSET_Y" in reticle_shader
-        # The reticle follows the lagging image through the same raw aperture
-        # motion and the same Image Lag the scene replay pivots by. Rebuilding
-        # the retired delta path's chain of gains here is what made the two
-        # disagree during fast inertia.
-        and "saturate(ScopeImageStillness) *" in reticle_shader
-        and "clamp(SCOPE_RETICLE_PARALLAX_STRENGTH, 0.0f, 4.0f);"
+        # The reticle is the point of aim and never translates. Following the
+        # lagging image moved the aiming mark out from under the shot while the
+        # player was tracking a target. Its exit pupil still follows, which is
+        # an optical layer crossing a stationary reticle, not the reticle
+        # moving.
+        and "const float2 opticalTranslation = float2(0.0f, 0.0f);"
         in reticle_shader
+        and "SCOPE_RETICLE_PARALLAX_STRENGTH" not in reticle_shader
+        # Declared once as a zero constant and read once. Any third mention
+        # would be an assignment putting the reticle back in motion.
+        and reticle_shader.count("opticalTranslation") == 2
         and "SCOPE_EYE_OFFSET_X" in reticle_shader
         and "reticle.sourceContribution *= reticleVisibility"
         in reticle_shader

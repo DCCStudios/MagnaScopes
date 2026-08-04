@@ -842,8 +842,14 @@ try {
 			"reticle local offset was scaled or changed reticle coverage");
 	}
 
-	// The isolated reticle follows the lagging image while remaining
-	// independent of scene magnification.
+	// The reticle is the player's point of aim and must not translate for any
+	// reason. Eye travel at half an aperture radius, with Image Lag at full and
+	// Optical Lag Strength at 1, must leave it exactly where it was authored:
+	// the scene behind it lags, the aiming mark does not.
+	//
+	// It previously followed by a configurable fraction, which moved the mark
+	// out from under the shot while tracking a target and made the sight
+	// picture read as settling rather than as an image with depth behind it.
 	ResolutionConstants movingConstants{};
 	movingConstants.eyeOffsetX = 0.5F;
 	movingConstants.opticalLagStrength = 1.0F;
@@ -853,20 +859,15 @@ try {
 	const auto movingOneMetrics = AnalyzeDifference(movingOneX);
 	movingConstants.sceneMagnification = 4.0F;
 	const auto movingFourX = fixture.Render(movingConstants, centeredLayer);
-	// Raw aperture motion times Image Lag times Reticle Parallax Strength,
-	// which is exactly the pivot displacement the scene replay applies. It is
-	// deliberately not passed through the soft limiter or scaled by Optical Lag
-	// Strength: reproducing the retired delta path's chain of gains here is
-	// what previously let the reticle track a curve the image was not on.
-	constexpr double kTravel = 0.5;
-	const double expectedTravelPixels = kTravel * 56.0;
 	if (movingOneX != movingFourX ||
 		std::abs(
 			movingOneMetrics.centerX -
-			AnalyzeDifference(oneX).centerX -
-			expectedTravelPixels) > 0.15) {
+			AnalyzeDifference(oneX).centerX) > 0.15 ||
+		std::abs(
+			movingOneMetrics.centerY -
+			AnalyzeDifference(oneX).centerY) > 0.15) {
 		throw std::runtime_error(
-			"reticle optical translation depended on scene zoom or used wrong sign");
+			"eye travel displaced the reticle or its position tracked scene zoom");
 	}
 
 	// Eye motion is already expressed in display X/Y. Rotating the published

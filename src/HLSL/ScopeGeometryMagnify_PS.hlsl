@@ -190,21 +190,6 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
         1.0f);
     const float2 currentCenterUv = centerPixels * PixelSize;
 
-    // Image Lag. The authored aperture is the near end of a tube and the
-    // magnified image sits far behind it, so when the housing swings the image
-    // should not travel with it one-for-one. The game thread publishes how far
-    // the aperture has moved from its settled screen position, in aperture
-    // radii; declining to follow that fraction of the motion is what reads as
-    // the image trailing the reticle. The eye-box follower supplies the
-    // catch-up, at the rate Recenter Speed sets.
-    //
-    // This is now the only path by which the image lags, and it scales the
-    // sample pivot rather than the sample delta. A pivot shift of d changes
-    // the sampled point by d * (1 - 1/M) while a delta shift changes it by
-    // d / M, so only the pivot form cancels the aperture's own motion
-    // identically at every magnification. The retired delta path could not,
-    // which is why stacking Lens Depth Separation and Scene Parallax Strength
-    // on top of it still never held the image still.
     const float imageLag = saturate(ScopeImageStillness);
     float2 aperturePivotPixels = currentAimPixels;
     // Lens Center moves the whole optical assembly, not just its mask. The
@@ -216,33 +201,46 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     if (lensOffsetSolveValid) {
         aperturePivotPixels += pixelsToLensOffset - pixelsToCenter;
     }
+    // Nothing transient may move this pivot.
+    //
+    // The pivot is the fixed point of the magnification: the screen position
+    // whose displayed content is the same world point it would be without any
+    // magnification at all. That is the player's point of aim. Image Lag used
+    // to displace it, which meant swinging the camera moved where the shot
+    // would land and then settled it back -- the aim itself drifting, not just
+    // the picture. It has to stay welded to the authored reticle.
+    const float2 samplePivotUv = aperturePivotPixels * PixelSize;
+
+    const float sampleMagnification = opticalMagnification;
+    float2 sampleDelta =
+        (screenUv - samplePivotUv) / max(sampleMagnification, 0.0001f);
+
+    // Image Lag. The magnified image sits far behind the aperture, so when the
+    // camera swings it should trail rather than track one-for-one.
+    //
+    // This translates the sampled region instead of moving the pivot, which is
+    // the whole difference between "the picture lags" and "the aim lags". A
+    // uniform shift of the sampled window slides the scene beneath a reticle
+    // that has not moved and a point of aim that is still exact once the
+    // motion decays; a pivot shift drags the aim along with it.
+    //
+    // Dividing by magnification makes the authored amount apparent screen
+    // motion, so it reads the same at 4x and 12x. Subtracting is what makes it
+    // trail: published travel is the eye's displacement, the negation of the
+    // optic's screen motion, so sampling further back along it shows the scene
+    // where it was a moment ago. The eye-box follower decays this to zero at
+    // Recenter Speed, which is the catch-up.
     if (physicalEyeTravelValid && imageLag > 0.0f) {
         const float2 apertureMotionPixels =
             float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y) *
             saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
             currentProjectedRadius;
-        // Published travel is the eye's displacement, which is the negation of
-        // the optic's screen motion. Adding it therefore removes the aperture's
-        // excursion from the pivot and leaves the image where it settled.
-        aperturePivotPixels += apertureMotionPixels * imageLag;
+        sampleDelta -=
+            apertureMotionPixels *
+            imageLag *
+            PixelSize /
+            opticalMagnification;
     }
-    const float2 samplePivotUv = aperturePivotPixels * PixelSize;
-
-    // Apparent-size stillness. Fore/aft motion barely moves the aperture's
-    // centre but swings its projected radius by well over ten percent, so the
-    // housing visibly looms while the image behind it stayed locked. If the
-    // aperture grew by ratio r, dividing the sampled extent by r holds the
-    // image world-static: extent = R / (M * r) = R_settled / M, independent of
-    // how large the housing has become.
-    const float apertureScaleRatio =
-        ScopeApertureScaleRatio > 0.01f ?
-            clamp(ScopeApertureScaleRatio, 0.25f, 4.0f) :
-            1.0f;
-    const float sampleMagnification =
-        opticalMagnification *
-        lerp(1.0f, apertureScaleRatio, imageLag);
-    float2 sampleDelta =
-        (screenUv - samplePivotUv) / max(sampleMagnification, 0.0001f);
     const float radialPosition =
         saturate(length(normalizedLensPosition));
     const float fishEyeAmount =

@@ -1062,14 +1062,9 @@ namespace ImGuiImpl
 					1.0F,
 					"%.2f");
 				Tip("Controls how strongly the exit-pupil shadow dims the reticle. 0 keeps the reticle visible across the aperture.");
-				ImGui::DragFloat(
-					"Reticle Parallax Strength",
-					&reticleParallaxStrength_UI,
-					0.01F,
-					0.0F,
-					4.0F,
-					"%.2f");
-				Tip("Scales reticle motion with optical parallax without changing its size.");
+				// Reticle Parallax Strength is gone. The reticle is the point
+				// of aim and no longer translates for any reason, so the
+				// control had nothing left to scale.
 			}
 		}
 
@@ -1143,15 +1138,15 @@ namespace ImGuiImpl
 				0.0F,
 				1.0F,
 				"%.2f");
-			Tip("How far the magnified image trails the reticle when you swing\n"
-				"the camera. 0 locks the image to the optic so nothing lags. 1\n"
-				"holds it world-static while the housing swings over it, which\n"
-				"reads as a long tube with the image far behind the glass.\n"
+			Tip("How far the magnified image trails when you swing the camera.\n"
+				"0 locks the image to the optic so nothing lags; higher values\n"
+				"let the scene slide further behind before catching up.\n"
 				"Recenter Speed below controls how fast it catches back up.\n"
 				"\n"
-				"This replaces Scene Parallax Strength and Lens Depth\n"
-				"Separation, which multiplied a second path that could not hold\n"
-				"the image still at any setting. It behaves identically at\n"
+				"Only the picture moves. The reticle stays exactly where the\n"
+				"optic authored it and the point of aim is never displaced, so\n"
+				"this cannot pull your shot off target while you track.\n"
+				"Measured as apparent screen motion, so it reads the same at\n"
 				"every magnification.");
 			ImGui::DragFloat(
 				"Shadow Depth Separation",
@@ -1205,11 +1200,12 @@ namespace ImGuiImpl
 				0.1F,
 				10.0F,
 				"%.2f");
-			Tip("How quickly the image catches back up to the reticle, and the\n"
-				"shadow to centre, once motion stops. 1 is the tuned default,\n"
-				"lower is slower and more floaty, higher snaps back sooner.\n"
-				"This is the companion to Image Lag: that sets how far behind\n"
-				"the image falls, this sets how long it stays there.");
+			Tip("How quickly the trailing image slides back into place, and the\n"
+				"shadow returns to centre, once motion stops. 1 is the tuned\n"
+				"default, lower is slower and more floaty, higher snaps back\n"
+				"sooner. Companion to Image Lag: that sets how far behind the\n"
+				"picture falls, this sets how long it stays there. Neither\n"
+				"moves the reticle or the point of aim.");
 		}
 
 		if (ImGui::CollapsingHeader("Breathing")) {

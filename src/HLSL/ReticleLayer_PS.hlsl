@@ -113,27 +113,18 @@ ReticleCompositeOutput main(VertexPosHTex input)
         }
     }
 
-    // How far the reticle follows the lagging image. It is fixed to the
-    // weapon, so the physical answer is "not at all" and Reticle Parallax
-    // Strength defaults low; this exists because an authored reticle that
-    // detaches completely from the sight picture can read as a HUD overlay.
+    // The reticle never translates. It is the player's point of aim, and it is
+    // fixed to the weapon, so it stays exactly where the optic authored it no
+    // matter what the eye-box is doing.
     //
-    // It must be derived from the same raw aperture motion and the same Image
-    // Lag the scene replay pivots by, unscaled by Optical Lag Strength and
-    // unlimited by the soft limiter, or the reticle tracks a curve the image
-    // is not on. Reproducing the retired delta path's chain of gains here is
-    // what previously made these two disagree during fast inertia.
-    float2 opticalTranslation = float2(0.0f, 0.0f);
-    if (physicalEyeTravelValid) {
-        const float2 apertureMotionPixels =
-            float2(SCOPE_EYE_OFFSET_X, SCOPE_EYE_OFFSET_Y) *
-            saturate(SCOPE_PHYSICAL_EYEBOX_VALID) *
-            projectedRadius;
-        opticalTranslation =
-            apertureMotionPixels *
-            saturate(ScopeImageStillness) *
-            clamp(SCOPE_RETICLE_PARALLAX_STRENGTH, 0.0f, 4.0f);
-    }
+    // It used to follow the lagging image by a configurable fraction. That is
+    // wrong twice over: it moves the aiming mark out from under the shot while
+    // the player is trying to track a target, and it makes the sight picture
+    // read as settling rather than as an image with depth behind it. The scene
+    // is what lags; the crosshair holds. Its exit pupil still follows, because
+    // that is a real optical layer moving across a stationary reticle rather
+    // than the reticle itself moving.
+    const float2 opticalTranslation = float2(0.0f, 0.0f);
 
     // MagnaScope profiles express reticle offset as thousandths of the
     // optic-local X/Z basis. This preserves that convention while following

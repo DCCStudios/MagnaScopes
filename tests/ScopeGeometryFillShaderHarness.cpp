@@ -1463,15 +1463,12 @@ Output main(Input input)
 	}
 
 	// Prove the image-lag sign with a directional source rather than a uniform
-	// lens. Image Lag shifts the sample pivot, so eye travel must move the
-	// sampled point along source X, and setting Image Lag to zero must restore
-	// the neutral sample even when eye-motion telemetry is non-zero.
+	// lens. Image Lag translates the sampled region, so eye travel must move
+	// the sampled point along source X, and setting Image Lag to zero must
+	// restore the neutral sample even when eye-motion telemetry is non-zero.
 	//
-	// Magnification must be above 1 here. A pivot shift of d moves the sampled
-	// point by d * (1 - 1/M), which is identically zero at 1x -- correctly, as
-	// an unmagnified view has no parallax to show -- so testing this at 1x
-	// would assert nothing. That is exactly what happened when this test still
-	// drove the retired delta path, whose d/M term stayed alive at 1x.
+	// Run at 2x so the magnification division is actually exercised; the
+	// authored amount is apparent screen motion and must not vary with zoom.
 	submitLensPose(-kCenterNdcX, -kCenterNdcY);
 	resolution.magnification = 2.0F;
 	resolution.aimOffsetValid = 0.0F;
@@ -1541,22 +1538,25 @@ Output main(Input input)
 		channelDifference(
 			disabledOpticalSample[1], neutralOpticalSample[1]) <= 3;
 	// Published travel is the eye's displacement, the negation of the optic's
-	// screen motion, so adding it to the pivot samples further along source X
-	// and the image slides the other way beneath a housing that keeps moving.
-	const bool positiveTravelSamplesHigherX =
-		static_cast<int>(positiveOpticalSample[0]) >
-		static_cast<int>(neutralOpticalSample[0]) + 10;
-	const bool negativeTravelSamplesLowerX =
-		static_cast<int>(negativeOpticalSample[0]) + 10 <
+	// screen motion, so subtracting it samples further back along source X and
+	// shows the scene where it was a moment ago -- the picture trailing. The
+	// pivot form this replaced had the opposite sign, because it was cancelling
+	// the aperture's motion rather than delaying the image, and cancelling it
+	// dragged the point of aim along too.
+	const bool positiveTravelSamplesLowerX =
+		static_cast<int>(positiveOpticalSample[0]) + 10 <
 		static_cast<int>(neutralOpticalSample[0]);
+	const bool negativeTravelSamplesHigherX =
+		static_cast<int>(negativeOpticalSample[0]) >
+		static_cast<int>(neutralOpticalSample[0]) + 10;
 	const bool verticalChannelRemainsStable =
 		channelDifference(
 			positiveOpticalSample[1], neutralOpticalSample[1]) <= 3 &&
 		channelDifference(
 			negativeOpticalSample[1], neutralOpticalSample[1]) <= 3;
 	if (!zeroLagIsNeutral ||
-		!positiveTravelSamplesHigherX ||
-		!negativeTravelSamplesLowerX ||
+		!positiveTravelSamplesLowerX ||
+		!negativeTravelSamplesHigherX ||
 		!verticalChannelRemainsStable) {
 		std::cerr << std::format(
 			"Optical lag direction failed: neutral=({}, {}, {}), "
