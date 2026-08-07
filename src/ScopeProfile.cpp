@@ -156,8 +156,9 @@ namespace ScopeData
 		s.reticleParallaxStrength =
 			j.value("ReticleParallaxStrength", 1.0F);
 		ReadFloatArray(j, "LensOffset", s.lensOffset, { "x", "y" });
-		s.lensScale = j.value("LensScale", 1.0F);
+		s.lensScale = j.value("LensScale", 1.54F);
 		s.apertureSurface = j.value("ApertureSurface", std::string{});
+		s.reticleSurface = j.value("ReticleSurface", std::string{});
 		s.fovAdjust = j.value("fovAdjust", 0.0F);
 		s.parallax = j.value("Parallax", Parallax());
 		s.breathing = j.value("Breathing", Breathing());
@@ -274,6 +275,7 @@ namespace ScopeData
 			{ "LensOffset", { { "x", s.lensOffset[0] }, { "y", s.lensOffset[1] } } },
 			{ "LensScale", s.lensScale },
 			{ "ApertureSurface", s.apertureSurface },
+			{ "ReticleSurface", s.reticleSurface },
 			{ "fovAdjust", s.fovAdjust },
 			//
 			{ "Parallax", s.parallax },
@@ -794,65 +796,85 @@ namespace ScopeData
 		// at the eyepiece and only see black scope interior at unzoomed FOV.
 		// The overlay starts at the configured default magnification and the
 		// mouse wheel can push it up to magnification * spread while aiming.
+		// Every optical value below is taken from the hand-tuned SCAR-H
+		// reference profile, OMOD[SCAR-H.esp:0002BE95] in
+		// SCAR-H.esp_00002E1F.json, which is the look the project treats as
+		// its baseline. Two deliberate exceptions, both noted where they
+		// occur: the zoom data, and lensScale.
+		//
+		// Values that were previously guessed one at a time now come from one
+		// optic that was actually tuned as a whole, so a new scope starts
+		// coherent rather than as an assortment of independently plausible
+		// numbers.
+
+		// Magnification stays neutral at 1x regardless of the reference
+		// profile's own zoom. STS alignment is not silently replaced by a
+		// guessed FOV, and the mouse wheel can still push up to the spread
+		// while aiming.
 		(void)defaultMagnification;
 		profile->shaderData.minZoom = 1.0F;
 		profile->shaderData.maxZoom =
 			profile->shaderData.minZoom * std::max(1.0F, zoomSpread);
-		// Keep the center optically quiet and bend only subtly toward the rim.
-		// The earlier 0.35 default visibly warped the entire image.
-		profile->shaderData.fishEyeStrength = 0.05F;
-		profile->shaderData.fishEyePower = 2.0F;
-		profile->shaderData.edgeRefractionStrength = 0.05F;
-		profile->shaderData.edgeRefractionWidth = 0.235F;
+
+		profile->shaderData.fishEyeStrength = 0.03F;
+		profile->shaderData.fishEyePower = 0.5F;
+		profile->shaderData.edgeRefractionStrength = 0.08F;
+		profile->shaderData.edgeRefractionWidth = 0.265F;
 		profile->shaderData.edgeChromaticAberration = 2.0F;
-		profile->shaderData.sceneParallaxStrength = 1.0F;
-		profile->shaderData.opticalLagStrength = 0.2F;
-		// The tested baseline leaves edge-aware cleanup disabled; a large
-		// spatial kernel can turn stable object edges into shadow-like blobs.
+		profile->shaderData.sceneParallaxStrength = 2.0F;
+		profile->shaderData.opticalLagStrength = 1.0F;
 		profile->shaderData.imageDenoise = 0.0F;
 		profile->shaderData.imageSharpen = 0.5F;
 		profile->shaderData.ReticleSize = 4.0F;
 		profile->shaderData.reticle_Offset[0] = 0.0F;
 		profile->shaderData.reticle_Offset[1] = 0.0F;
+		// One, deliberately, unlike the rest of these values. The others come
+		// from the hand-tuned SCAR-H reference profile, but its 1.5 was tuned
+		// against that scope's own authored reticle. STS draws the reticle at
+		// the size the mesh author intended, so anything but 1.0 resizes every
+		// automatically detected scope's aiming mark away from its authored
+		// appearance before the user has touched a setting.
 		profile->shaderData.reticleMagnification = 1.0F;
-		profile->shaderData.reticleShadowStrength = 0.0F;
-		profile->shaderData.reticleParallaxStrength = 1.0F;
-		// Neutral placement: the sight picture starts exactly on the ScopeFade
-		// aperture STS authored, which is correct for most optics and is the
-		// only sane starting point for a per-scope adjustment.
+		profile->shaderData.reticleShadowStrength = 1.0F;
+		profile->shaderData.reticleParallaxStrength = 0.0F;
+		// Neutral placement: the sight picture starts exactly on the aperture
+		// STS authored.
 		profile->shaderData.lensOffset[0] = 0.0F;
 		profile->shaderData.lensOffset[1] = 0.0F;
-		profile->shaderData.lensScale = 1.0F;
-		// Breathing is off by default. The rate and shape are pre-set to a
-		// plausible hold so raising Breathing Sway alone gives something that
-		// already looks right, rather than a fast horizontal wobble.
-		profile->shaderData.breathing.rate = 0.25F;
-		profile->shaderData.breathing.sway = 0.0F;
-		profile->shaderData.breathing.drift = 0.0F;
+		// Close to the reference profile's 1.48, and no longer treated as an
+		// exception. lensScale corrects the mask to a particular scope's mesh,
+		// so it stays a per-scope adjustment -- but neutral was the wrong
+		// starting point in practice: across the STS corpus the mask lands
+		// consistently undersized at 1.0, and every scope needed the same
+		// direction of correction before it looked right.
+		//
+		// The old worry was that an oversized mask paints over the scope body,
+		// since a synthesized aperture has no authored silhouette to clip it.
+		// This value is under the 2.0 clamp and was picked against real optics
+		// rather than derived, so it errs on the safe side of that.
+		profile->shaderData.lensScale = 1.54F;
+		profile->shaderData.breathing.rate = 0.21F;
+		profile->shaderData.breathing.sway = 0.02F;
+		profile->shaderData.breathing.drift = 0.01F;
 		profile->shaderData.breathing.figure = 0.25F;
-		profile->shaderData.breathing.hold = 0.35F;
+		profile->shaderData.breathing.hold = 0.305F;
 		profile->shaderData.breathing.pupilFollow = 1.0F;
 		const float diameter = std::clamp(defaultDiameter, 64.0F, 2160.0F);
 		profile->shaderData.Size[0] = diameter;
 		profile->shaderData.Size[1] = diameter;
 		profile->shaderData.OriSize[0] = diameter;
 		profile->shaderData.OriSize[1] = diameter;
-		// Tested MagnaScope baseline: the fog reaches black slightly inside the
-		// mask edge, producing a dark eye-relief ring at the rim and a moving
-		// scope shadow as the eye drifts away from the optical axis.
-		profile->shaderData.parallax.radius = 1.55F;
-		profile->shaderData.parallax.relativeFogRadius = 7.0F;
-		profile->shaderData.parallax.scopeSwayAmount = 18.0F;
+		profile->shaderData.parallax.radius = 4.0F;
+		profile->shaderData.parallax.relativeFogRadius = 4.0F;
+		profile->shaderData.parallax.scopeSwayAmount = 20.0F;
 		profile->shaderData.parallax.maxTravel = 4.0F;
-		profile->shaderData.parallax.sceneDepth = 1.0F;
-		profile->shaderData.parallax.shadowDepth = 1.0F;
-		// A new optic reads as a tube by default: the image holds most of its
-		// position while the housing sways, and apparent size stays fixed.
-		profile->shaderData.parallax.imageStillness = 0.65F;
-		profile->shaderData.parallax.axialBreathing = 0.0F;
-		profile->shaderData.parallax.recenterSpeed = 1.0F;
-		profile->shaderData.parallax.strafeLag = 1.0F;
-		profile->shaderData.parallax.tubeDepth = 0.35F;
+		profile->shaderData.parallax.sceneDepth = 3.0F;
+		profile->shaderData.parallax.shadowDepth = 4.0F;
+		profile->shaderData.parallax.imageStillness = 0.25F;
+		profile->shaderData.parallax.axialBreathing = 2.0F;
+		profile->shaderData.parallax.recenterSpeed = 0.6F;
+		profile->shaderData.parallax.strafeLag = 0.5F;
+		profile->shaderData.parallax.tubeDepth = 0.93F;
 
 		// New automatic profiles begin from the weapon's authored sighted zoom
 		// and camera offsets. Lens magnification remains neutral at 1x until the

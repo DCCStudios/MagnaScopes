@@ -167,7 +167,7 @@ namespace ScopeData
 		// aperture radii along the optic's own X/Z axes so it rolls with the
 		// weapon.
 		float lensOffset[2] = { 0.0F, 0.0F };
-		float lensScale = 1.0F;
+		float lensScale = 1.54F;
 
 		// Which authored shape supplies the aperture, by name.
 		//
@@ -183,6 +183,14 @@ namespace ScopeData
 		// supplies the aperture's projection, eye box and mask, but the
 		// magnified image comes from the screen-space path instead.
 		std::string apertureSurface;
+
+		// Which authored shape is the aiming mark, when the editor pins one.
+		// Empty means automatic, which only recognises shapes whose name begins
+		// with "Reticle" or "Dot". Plenty of weapon-mod meshes name theirs
+		// something else entirely -- the MW2019 Grau's 4x optic has no Reticle
+		// node at all -- and those cannot be found by any naming rule that is
+		// also safe to apply automatically.
+		std::string reticleSurface;
 
 		Breathing breathing;
 

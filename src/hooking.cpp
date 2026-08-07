@@ -12,6 +12,7 @@
 #include <limits>
 #include <vector>
 
+#include "ImGuiImpl.h"
 #include "Settings.h"
 #include "ReticleVertexScaling.h"
 #include "WorldOnlyScopeRenderer.h"
@@ -815,9 +816,11 @@ std::string DescribeCodeAddress(const void* address)
 //
 // MinHook patches a function's prologue, not the vtable slot, so hooking the
 // address a slot happens to contain is only correct while it keeps pointing
-// there. It does not. Fallout's device context alternates between d3d11's own
-// DrawIndexed and a wrapper another mod installs -- d3d11+0x1545A0 against
-// ShaderEngineCL+0x67520 -- switching several times a second.
+// there. It does not. Fallout's device context moves DrawIndexed between
+// d3d11's own function and wrappers other integrations install -- one session
+// saw d3d11+0x1545A0, ShaderEngineCL+0x36580 and d3d11+0x154B70 on the same
+// slot -- switching several times a second, and the addresses differ run to
+// run.
 //
 // Rebinding to whichever address the slot currently holds cannot win that: it
 // is a race with no finish line. An earlier attempt burned its whole sixteen
@@ -825,63 +828,113 @@ std::string DescribeCodeAddress(const void* address)
 // last patched, which was the live one about half the time. That is exactly the
 // coin flip this bug always presented as.
 //
-// So hook both and never unhook. Each target gets its own detour and its own
-// trampoline, because a shared detour cannot tell which one it was entered
-// through. Whichever implementation the context calls, one of ours runs.
+// So hook every implementation the slot ever presents and never unhook. Each
+// target gets its own detour and its own trampoline, because a shared detour
+// cannot tell which one it was entered through. Whichever implementation the
+// context calls, one of ours runs.
+//
+// The arity is deliberately not fixed. A previous version of this code assumed
+// exactly two and logged an error the moment a third appeared, which is what
+// the 2026-08-04 session recorded.
 struct DrawHookBinding
 {
-	void* primaryTarget = nullptr;
-	void* alternateTarget = nullptr;
+	std::array<void*, Hook::D3D::kDrawHookSlots> targets{};
+	std::size_t boundCount = 0;
 	bool exhausted = false;
 };
 
 DrawHookBinding g_drawIndexedBinding{};
 DrawHookBinding g_drawIndexedInstancedBinding{};
 
+// Binding happens from two threads: the install thread walks the vtable once at
+// startup, and every Present re-checks it. MH_CreateHook can take over a
+// hundred milliseconds, so without serialization the install thread can still
+// be inside MinHook when the first Present arrives, and both would try to claim
+// a slot for the same address -- the second one landing on an address MinHook
+// has already hooked, which leaves its trampoline null and silently drops every
+// draw through it.
+//
+// A try-lock rather than a mutex, deliberately. MH_EnableHook suspends every
+// other thread to rewrite a prologue, and this is held across that call and
+// across DescribeCodeAddress, which takes the loader lock. Blocking a second
+// thread inside that window is a deadlock waiting to be discovered. Nothing
+// here needs to wait: binding is idempotent and the next Present retries in a
+// few milliseconds, so a contended attempt simply gives up.
+std::atomic_bool g_drawHookBindBusy{ false };
+
+struct DrawHookBindGuard
+{
+	bool acquired = false;
+	DrawHookBindGuard()
+	{
+		bool expected = false;
+		acquired = g_drawHookBindBusy.compare_exchange_strong(
+			expected,
+			true,
+			std::memory_order_acq_rel);
+	}
+	~DrawHookBindGuard()
+	{
+		if (acquired) {
+			g_drawHookBindBusy.store(false, std::memory_order_release);
+		}
+	}
+	DrawHookBindGuard(const DrawHookBindGuard&) = delete;
+	DrawHookBindGuard& operator=(const DrawHookBindGuard&) = delete;
+};
+
 bool BindDrawHookTarget(
 	DWORD_PTR* vtable,
 	std::size_t index,
-	void* primaryDetour,
-	void** primaryOriginal,
-	void* alternateDetour,
-	void** alternateOriginal,
+	void* const* detours,
+	void** originals,
 	DrawHookBinding& binding,
 	const char* hookName)
 {
 	auto* const current = reinterpret_cast<void*>(vtable[index]);
-	if (!current || current == binding.primaryTarget ||
-		current == binding.alternateTarget || current == primaryDetour ||
-		current == alternateDetour || !IsExecutableAddress(current)) {
+	if (!current || !IsExecutableAddress(current)) {
 		return false;
 	}
 
-	void* detour = nullptr;
-	void** original = nullptr;
-	void** slot = nullptr;
-	if (!binding.primaryTarget) {
-		detour = primaryDetour;
-		original = primaryOriginal;
-		slot = &binding.primaryTarget;
-	} else if (!binding.alternateTarget) {
-		detour = alternateDetour;
-		original = alternateOriginal;
-		slot = &binding.alternateTarget;
-	} else {
-		// Two implementations is what this game presents. A third would mean
-		// the assumption is wrong; say so once rather than thrash.
+	const DrawHookBindGuard guard;
+	if (!guard.acquired) {
+		return false;
+	}
+	for (std::size_t i = 0; i < binding.boundCount; ++i) {
+		if (binding.targets[i] == current) {
+			return false;
+		}
+	}
+	for (std::size_t i = 0; i < Hook::D3D::kDrawHookSlots; ++i) {
+		// Our own detour sitting in the slot means somebody copied the patched
+		// entry rather than the original; hooking it would detour a detour.
+		if (detours[i] == current) {
+			return false;
+		}
+	}
+	if (binding.boundCount >= Hook::D3D::kDrawHookSlots) {
+		// Say so once rather than thrash. Raising kDrawHookSlots is the fix.
 		if (!binding.exhausted) {
 			binding.exhausted = true;
 			logger::error(
-				"{} saw a third implementation at {:p} ({}); only two can be "
-				"hooked and draws through this one will be missed",
+				"{} saw implementation {} at {:p} ({}) with all {} slots "
+				"bound; draws through this one will be missed",
 				hookName,
+				binding.boundCount + 1U,
 				current,
-				DescribeCodeAddress(current));
+				DescribeCodeAddress(current),
+				Hook::D3D::kDrawHookSlots);
 		}
 		return false;
 	}
 
-	const auto created = MH_CreateHook(current, detour, original);
+	const std::size_t slot = binding.boundCount;
+	const auto created = MH_CreateHook(current, detours[slot], &originals[slot]);
+	// ALREADY_CREATED means this address is hooked but is not in our table --
+	// only reachable through the startup race described above, and only for a
+	// slot whose trampoline the other path has already filled in. Anything else
+	// would leave us calling through a null original, so check rather than
+	// assume.
 	if (created != MH_OK && created != MH_ERROR_ALREADY_CREATED) {
 		logger::error(
 			"Failed to hook {} implementation at {:p} ({})",
@@ -890,7 +943,8 @@ bool BindDrawHookTarget(
 			DescribeCodeAddress(current));
 		return false;
 	}
-	if (MH_EnableHook(current) != MH_OK) {
+	const auto enabled = MH_EnableHook(current);
+	if (enabled != MH_OK && enabled != MH_ERROR_ENABLED) {
 		logger::error(
 			"Failed to enable {} implementation at {:p} ({})",
 			hookName,
@@ -898,13 +952,47 @@ bool BindDrawHookTarget(
 			DescribeCodeAddress(current));
 		return false;
 	}
-	*slot = current;
+	if (!originals[slot]) {
+		logger::error(
+			"{} bound {:p} ({}) without a trampoline; leaving it unhooked "
+			"rather than dropping its draws",
+			hookName,
+			current,
+			DescribeCodeAddress(current));
+		return false;
+	}
+	binding.targets[slot] = current;
+	binding.boundCount = slot + 1U;
 	logger::info(
-		"Hooked {} implementation at {:p} ({})",
+		"Hooked {} implementation {} of {} at {:p} ({})",
 		hookName,
+		binding.boundCount,
+		Hook::D3D::kDrawHookSlots,
 		current,
 		DescribeCodeAddress(current));
 	return true;
+}
+
+// Every implementation currently bound, for the bypass diagnostic. Whether the
+// address the vtable holds now is in this list is the whole question that
+// diagnostic exists to answer.
+std::string DescribeDrawHookBinding(const DrawHookBinding& binding)
+{
+	// Unsynchronized on purpose. Entries are only ever appended and never
+	// rewritten, so the worst a concurrent bind can do is omit the newest one
+	// from a diagnostic line. Taking a lock here to tidy that up would put a
+	// loader-lock call behind a lock the binder holds across MinHook.
+	if (binding.boundCount == 0U) {
+		return "<none>";
+	}
+	std::string described;
+	for (std::size_t i = 0; i < binding.boundCount; ++i) {
+		if (i != 0U) {
+			described += ", ";
+		}
+		described += DescribeCodeAddress(binding.targets[i]);
+	}
+	return described;
 }
 
 bool isActive_TAA = false;
@@ -1123,6 +1211,380 @@ struct SavedState
 
 namespace Hook
 {
+	namespace HangDiag
+	{
+		std::atomic<std::uint64_t> presentTicks{ 0U };
+		std::atomic<std::uint64_t> updateTicks{ 0U };
+		std::atomic<std::uint64_t> dispatchTicks{ 0U };
+		std::atomic<int> presentPhase{ 0 };
+		std::atomic<int> updatePhase{ 0 };
+		std::atomic<int> geometryWaitSite{ 0 };
+		std::atomic<std::uint32_t> geometryWaitThread{ 0U };
+		std::atomic<int> geometryHoldSite{ 0 };
+		std::atomic<std::uint32_t> geometryHoldThread{ 0U };
+		std::atomic<int> ringWaitSite{ 0 };
+		std::atomic<std::uint32_t> ringWaitThread{ 0U };
+		std::atomic<int> ringHoldSite{ 0 };
+		std::atomic<std::uint32_t> ringHoldThread{ 0U };
+		std::atomic<int> lastRenderPhase{ 0 };
+		std::atomic<std::uint64_t> lastRenderPhaseEnterMs{ 0U };
+		std::atomic<std::uint64_t> lastRenderPhaseLeaveMs{ 0U };
+		std::atomic<std::uint32_t> lastRenderPhaseThread{ 0U };
+
+		const char* GeometrySiteName(int site)
+		{
+			switch (site) {
+			case 1:
+				return "classifier (draw dispatch)";
+			case 2:
+				return "ReplayAutomaticSTSScopeFade";
+			case 3:
+				return "DrawSynthesizedAperture";
+			case 4:
+				return "ClearAutomaticSTSScopeFadeReplay";
+			case 5:
+				return "placement capture (classifier)";
+			default:
+				return "none";
+			}
+		}
+
+		const char* RingSiteName(int site)
+		{
+			switch (site) {
+			case 1:
+				return "PublishSynthesizedApertureRing";
+			case 2:
+				return "AcquireSynthesizedApertureRing";
+			case 3:
+				return "InvalidateSynthesizedApertureRing";
+			default:
+				return "none";
+			}
+		}
+
+		const char* PresentPhaseName(int phase)
+		{
+			switch (phase) {
+			case 1:
+				return "entered PresentHook";
+			case 2:
+				return "hook binding done";
+			case 3:
+				return "composite gate";
+			case 9:
+				return "inside original Present";
+			case 10:
+				return "replay: preparing source";
+			case 11:
+				return "replay: state setup";
+			case 12:
+				return "replay: draw issued";
+			case 20:
+				return "synth: acquiring ring";
+			case 21:
+				return "synth: preparing source";
+			case 22:
+				return "synth: mapping vertex buffer";
+			case 23:
+				return "synth: state setup";
+			case 24:
+				return "synth: draw issued";
+			default:
+				return "idle / returned";
+			}
+		}
+
+		const char* UpdatePhaseName(int phase)
+		{
+			switch (phase) {
+			case 1:
+				return "FindSTSAperture";
+			case 2:
+				return "publish geometry / projection";
+			case 3:
+				return "publish synthesized ring";
+			case 4:
+				return "eye box / breathing";
+			default:
+				return "idle / outside auto block";
+			}
+		}
+
+		// Writes with a plain ofstream on purpose: if the hang is inside the
+		// logger (or the logger's thread is a casualty), a report through
+		// logger::info would never reach the disk.
+		void WriteReport(
+			std::uint64_t p,
+			std::uint64_t u,
+			std::uint64_t d,
+			int stalledSamples,
+			std::uint64_t nowMs,
+			std::uint64_t presentAliveMs,
+			std::uint64_t updateAliveMs,
+			std::uint64_t dispatchAliveMs)
+		{
+			char documents[MAX_PATH]{};
+			if (GetEnvironmentVariableA(
+					"USERPROFILE",
+					documents,
+					static_cast<DWORD>(std::size(documents))) == 0U) {
+				return;
+			}
+			std::string path{ documents };
+			path += "\\Documents\\My Games\\Fallout4\\F4SE\\MagnaScope.hang.txt";
+			std::ofstream out(path, std::ios::app);
+			if (!out) {
+				return;
+			}
+			SYSTEMTIME now{};
+			GetLocalTime(&now);
+			out << std::format(
+				"[{:02}:{:02}:{:02}] loops frozen for ~{}s: "
+				"presentTicks={} updateTicks={} dispatchTicks={}\n"
+				"  presentPhase={} ({})\n"
+				"  updatePhase={} ({})\n"
+				"  geometry mutex: held by site {} ({}) on thread {}; "
+				"waited on by site {} ({}) on thread {}\n"
+				"  ring mutex: held by site {} ({}) on thread {}; "
+				"waited on by site {} ({}) on thread {}\n",
+				now.wHour,
+				now.wMinute,
+				now.wSecond,
+				stalledSamples * 5,
+				p,
+				u,
+				d,
+				presentPhase.load(std::memory_order_relaxed),
+				PresentPhaseName(presentPhase.load(std::memory_order_relaxed)),
+				updatePhase.load(std::memory_order_relaxed),
+				UpdatePhaseName(updatePhase.load(std::memory_order_relaxed)),
+				geometryHoldSite.load(std::memory_order_relaxed),
+				GeometrySiteName(
+					geometryHoldSite.load(std::memory_order_relaxed)),
+				geometryHoldThread.load(std::memory_order_relaxed),
+				geometryWaitSite.load(std::memory_order_relaxed),
+				GeometrySiteName(
+					geometryWaitSite.load(std::memory_order_relaxed)),
+				geometryWaitThread.load(std::memory_order_relaxed),
+				ringHoldSite.load(std::memory_order_relaxed),
+				RingSiteName(ringHoldSite.load(std::memory_order_relaxed)),
+				ringHoldThread.load(std::memory_order_relaxed),
+				ringWaitSite.load(std::memory_order_relaxed),
+				RingSiteName(ringWaitSite.load(std::memory_order_relaxed)),
+				ringWaitThread.load(std::memory_order_relaxed));
+
+			// Which loop died first, and how long after MagnaScope last ran.
+			// A stall that begins while dispatch is still advancing is a
+			// different animal from one where every loop stops in the same
+			// sample, and neither is visible in the phase fields above.
+			const auto describeAge =
+				[nowMs](std::uint64_t aliveMs) -> std::string {
+				if (aliveMs == 0U || nowMs < aliveMs) {
+					return "never advanced";
+				}
+				return std::format("last advanced {}s ago", (nowMs - aliveMs) / 1000U);
+			};
+			const auto renderEnter =
+				lastRenderPhaseEnterMs.load(std::memory_order_relaxed);
+			const auto renderLeave =
+				lastRenderPhaseLeaveMs.load(std::memory_order_relaxed);
+			const auto renderPhase =
+				lastRenderPhase.load(std::memory_order_relaxed);
+			out << std::format(
+				"  present loop: {}\n"
+				"  update loop: {}\n"
+				"  dispatch loop: {}\n"
+				"  last MagnaScope render phase: {} ({}) on thread {}, "
+				"entered {}s ago, left {}\n",
+				describeAge(presentAliveMs),
+				describeAge(updateAliveMs),
+				describeAge(dispatchAliveMs),
+				renderPhase,
+				PresentPhaseName(renderPhase),
+				lastRenderPhaseThread.load(std::memory_order_relaxed),
+				(renderEnter == 0U || nowMs < renderEnter) ?
+					0U :
+					(nowMs - renderEnter) / 1000U,
+				renderLeave == 0U ?
+					std::string{ "never (still inside it)" } :
+					(renderLeave < renderEnter ?
+							std::string{ "never (still inside it)" } :
+							std::format(
+								"{}s ago",
+								nowMs < renderLeave ?
+									0U :
+									(nowMs - renderLeave) / 1000U)));
+			out.flush();
+		}
+
+		void ArmWatchdog()
+		{
+			static std::atomic_bool armed{ false };
+			bool expected = false;
+			if (!armed.compare_exchange_strong(expected, true)) {
+				return;
+			}
+			std::thread([] {
+				std::uint64_t lastPresent = 0U;
+				std::uint64_t lastUpdate = 0U;
+				std::uint64_t lastDispatch = 0U;
+				// Wall-clock of the last sample at which each counter was still
+				// moving. The order in which the three loops stop is the single
+				// most informative thing about a stall of this shape, and it
+				// costs nothing on the hot path: the counters are already being
+				// incremented, so only the watchdog has to remember when it last
+				// saw them change.
+				std::uint64_t presentAliveMs = 0U;
+				std::uint64_t updateAliveMs = 0U;
+				std::uint64_t dispatchAliveMs = 0U;
+				int stalledSamples = 0;
+				for (;;) {
+					std::this_thread::sleep_for(std::chrono::seconds(5));
+					const auto now = GetTickCount64();
+					const auto p = presentTicks.load(std::memory_order_relaxed);
+					const auto u = updateTicks.load(std::memory_order_relaxed);
+					const auto d =
+						dispatchTicks.load(std::memory_order_relaxed);
+					if (p != lastPresent || presentAliveMs == 0U) {
+						presentAliveMs = now;
+					}
+					if (u != lastUpdate || updateAliveMs == 0U) {
+						updateAliveMs = now;
+					}
+					if (d != lastDispatch || dispatchAliveMs == 0U) {
+						dispatchAliveMs = now;
+					}
+					// Present freezing is the hang; the update counter only
+					// stops mattering once ticks have started at all.
+					const bool frozen = p != 0U && p == lastPresent;
+					lastPresent = p;
+					lastUpdate = u;
+					lastDispatch = d;
+					stalledSamples = frozen ? stalledSamples + 1 : 0;
+					if (stalledSamples >= 2) {
+						WriteReport(
+							p,
+							u,
+							d,
+							stalledSamples,
+							now,
+							presentAliveMs,
+							updateAliveMs,
+							dispatchAliveMs);
+					}
+				}
+			}).detach();
+			logger::info(
+				"Hang watchdog armed; a frozen frame loop will be described "
+				"in MagnaScope.hang.txt next to the log");
+		}
+
+		// Marks waiting and holding around a mutex acquisition so the report
+		// can say who was stuck where. Only diagnostics; the lock itself is a
+		// plain unique_lock.
+		struct TrackedLock
+		{
+			TrackedLock(
+				std::mutex& mutex,
+				int site,
+				std::atomic<int>& waitSite,
+				std::atomic<std::uint32_t>& waitThread,
+				std::atomic<int>& holdSite,
+				std::atomic<std::uint32_t>& holdThread)
+				: holdSiteSlot(holdSite),
+				  holdThreadSlot(holdThread)
+			{
+				const auto thread = GetCurrentThreadId();
+				waitSite.store(site, std::memory_order_relaxed);
+				waitThread.store(thread, std::memory_order_relaxed);
+				lock = std::unique_lock<std::mutex>(mutex);
+				waitSite.store(0, std::memory_order_relaxed);
+				waitThread.store(0U, std::memory_order_relaxed);
+				holdSite.store(site, std::memory_order_relaxed);
+				holdThread.store(thread, std::memory_order_relaxed);
+			}
+			~TrackedLock()
+			{
+				holdSiteSlot.store(0, std::memory_order_relaxed);
+				holdThreadSlot.store(0U, std::memory_order_relaxed);
+			}
+			TrackedLock(const TrackedLock&) = delete;
+			TrackedLock& operator=(const TrackedLock&) = delete;
+
+			std::atomic<int>& holdSiteSlot;
+			std::atomic<std::uint32_t>& holdThreadSlot;
+			std::unique_lock<std::mutex> lock;
+		};
+
+		struct TrackedGeometryLock : TrackedLock
+		{
+			TrackedGeometryLock(std::mutex& mutex, int site)
+				: TrackedLock(
+					  mutex,
+					  site,
+					  geometryWaitSite,
+					  geometryWaitThread,
+					  geometryHoldSite,
+					  geometryHoldThread)
+			{}
+		};
+
+		struct TrackedRingLock : TrackedLock
+		{
+			TrackedRingLock(std::mutex& mutex, int site)
+				: TrackedLock(
+					  mutex,
+					  site,
+					  ringWaitSite,
+					  ringWaitThread,
+					  ringHoldSite,
+					  ringHoldThread)
+			{}
+		};
+
+		// RAII phase marker that restores the previous phase, so nested
+		// scopes (the composite gate calling into the replay) report the
+		// innermost location.
+		struct PhaseScope
+		{
+			PhaseScope(std::atomic<int>& slot, int phase)
+				: slotRef(slot),
+				  previous(slot.load(std::memory_order_relaxed))
+			{
+				slotRef.store(phase, std::memory_order_relaxed);
+				// Breadcrumb, not state. slotRef returns to zero the instant we
+				// leave, so a report taken during the hang says only "idle" --
+				// which cannot distinguish a freeze that started inside our
+				// code from one that started long after we were last involved.
+				// Two GetTickCount64 calls on a path that already does D3D work
+				// cost nothing measurable and answer that outright.
+				if (&slotRef == &presentPhase) {
+					lastRenderPhase.store(phase, std::memory_order_relaxed);
+					lastRenderPhaseEnterMs.store(
+						GetTickCount64(),
+						std::memory_order_relaxed);
+					lastRenderPhaseThread.store(
+						GetCurrentThreadId(),
+						std::memory_order_relaxed);
+				}
+			}
+			~PhaseScope()
+			{
+				slotRef.store(previous, std::memory_order_relaxed);
+				if (&slotRef == &presentPhase) {
+					lastRenderPhaseLeaveMs.store(
+						GetTickCount64(),
+						std::memory_order_relaxed);
+				}
+			}
+			PhaseScope(const PhaseScope&) = delete;
+			PhaseScope& operator=(const PhaseScope&) = delete;
+
+			std::atomic<int>& slotRef;
+			int previous;
+		};
+	}
 
 	RE::PlayerCharacter* player;
 	RE::PlayerCamera* pcam;
@@ -1440,6 +1902,324 @@ namespace Hook
 		return projected;
 	}
 
+	// Published once per game-thread update, consumed once per composite.
+	// A plain mutex rather than a seqlock: this is one small struct touched
+	// twice a frame, and a torn ring would be a visibly wrong lens rather than
+	// a slightly stale number.
+	std::mutex gSynthApertureRingMutex;
+	D3D::SynthesizedApertureRing gSynthApertureRing{};
+	// The model-space frame for the captured-placement path, guarded by the
+	// same mutex; it is published in the same game-thread breath.
+	D3D::SynthesizedApertureFrame gSynthApertureFrame{};
+
+	// The last aim-reference state handed to the pixel shader. The shader bails
+	// to the untouched source pixel when this is zero, so "the replay ran and
+	// nothing appeared" is otherwise indistinguishable from "the replay ran and
+	// the shader declined". Read back in the replay's own telemetry line.
+	std::atomic<float> gLastPublishedAimOffsetValid{ 0.0F };
+	std::atomic<float> gLastPublishedPhysicalEyeBoxValid{ 0.0F };
+
+	// Inverse of DecodeHalfFloat in main.cpp, for writing the game-format
+	// vertex stream. Truncating rather than round-to-nearest; the half a ULP
+	// this loses is far below vertex quantization in the authored meshes.
+	std::uint16_t EncodeHalfFloat(float value)
+	{
+		std::uint32_t bits = 0U;
+		std::memcpy(&bits, &value, sizeof(bits));
+		const auto sign = static_cast<std::uint16_t>((bits >> 16U) & 0x8000U);
+		std::uint32_t mantissa = bits & 0x007FFFFFU;
+		const std::int32_t exponent =
+			static_cast<std::int32_t>((bits >> 23U) & 0xFFU) - 127 + 15;
+		if (exponent >= 31) {
+			return static_cast<std::uint16_t>(sign | 0x7C00U);
+		}
+		if (exponent <= 0) {
+			if (exponent < -10) {
+				return sign;
+			}
+			mantissa |= 0x00800000U;
+			return static_cast<std::uint16_t>(
+				sign | (mantissa >> static_cast<std::uint32_t>(14 - exponent)));
+		}
+		return static_cast<std::uint16_t>(
+			sign | (static_cast<std::uint32_t>(exponent) << 10U) |
+			(mantissa >> 13U));
+	}
+
+	void D3D::InvalidateSynthesizedApertureRing() noexcept
+	{
+		const HangDiag::TrackedRingLock lock(gSynthApertureRingMutex, 3);
+		gSynthApertureRing.valid = false;
+	}
+
+	D3D::SynthesizedApertureRing
+	D3D::AcquireSynthesizedApertureRing() noexcept
+	{
+		const HangDiag::TrackedRingLock lock(gSynthApertureRingMutex, 2);
+		return gSynthApertureRing;
+	}
+
+	D3D::SynthesizedApertureFrame
+	D3D::AcquireSynthesizedApertureFrame() noexcept
+	{
+		const HangDiag::TrackedRingLock lock(gSynthApertureRingMutex, 2);
+		return gSynthApertureFrame;
+	}
+
+	void D3D::InvalidateSynthesisPlacement() noexcept
+	{
+		synthPlacementVertexBuffer.store(0U, std::memory_order_relaxed);
+		synthPlacementIndexBuffer.store(0U, std::memory_order_relaxed);
+		synthPlacementIndexCount.store(0U, std::memory_order_relaxed);
+		synthPlacementVertexStride.store(0U, std::memory_order_relaxed);
+		synthPlacementVertexDataOffset.store(0U, std::memory_order_relaxed);
+		synthPlacementIndexDataOffset.store(0U, std::memory_order_relaxed);
+		const HangDiag::TrackedRingLock lock(gSynthApertureRingMutex, 3);
+		gSynthApertureFrame.valid = false;
+	}
+
+	bool D3D::PublishSynthesisPlacement(
+		RE::NiAVObject* shape,
+		const RE::NiPoint3& localCenter,
+		float localRadius,
+		int opticalAxis)
+	{
+		// Same read the geometry publisher performs: BSGeometry::rendererData
+		// is a BSGraphics::TriShape, followed only on the game thread while
+		// the object is alive. The render thread gets opaque identities.
+		auto* const triShape = shape ? shape->IsTriShape() : nullptr;
+		auto* const rendererShape =
+			triShape && triShape->rendererData ?
+				static_cast<RE::BSGraphics::TriShape*>(triShape->rendererData) :
+				nullptr;
+		auto* const vertexBuffer =
+			rendererShape && rendererShape->vertexBuffer ?
+				reinterpret_cast<ID3D11Buffer*>(
+					rendererShape->vertexBuffer->buffer) :
+				nullptr;
+		auto* const indexBuffer =
+			rendererShape && rendererShape->indexBuffer ?
+				reinterpret_cast<ID3D11Buffer*>(
+					rendererShape->indexBuffer->buffer) :
+				nullptr;
+		if (!vertexBuffer || !indexBuffer || !triShape->numTriangles ||
+			!std::isfinite(localRadius) || localRadius <= 0.0001F ||
+			!std::isfinite(localCenter.x) || !std::isfinite(localCenter.y) ||
+			!std::isfinite(localCenter.z)) {
+			InvalidateSynthesisPlacement();
+			return false;
+		}
+		synthPlacementVertexBuffer.store(
+			reinterpret_cast<std::uintptr_t>(vertexBuffer),
+			std::memory_order_relaxed);
+		synthPlacementIndexBuffer.store(
+			reinterpret_cast<std::uintptr_t>(indexBuffer),
+			std::memory_order_relaxed);
+		synthPlacementIndexCount.store(
+			triShape->numTriangles * 3U,
+			std::memory_order_relaxed);
+		synthPlacementVertexStride.store(
+			triShape->vertexDesc.GetSize(),
+			std::memory_order_relaxed);
+		synthPlacementVertexDataOffset.store(
+			rendererShape->vertexBuffer->dataOffset,
+			std::memory_order_relaxed);
+		synthPlacementIndexDataOffset.store(
+			rendererShape->indexBuffer->dataOffset,
+			std::memory_order_relaxed);
+
+		SynthesizedApertureFrame frame{};
+		frame.valid = true;
+		frame.centerX = localCenter.x;
+		frame.centerY = localCenter.y;
+		frame.centerZ = localCenter.z;
+		frame.radius = localRadius;
+		frame.opticalAxis = opticalAxis;
+		{
+			const HangDiag::TrackedRingLock lock(gSynthApertureRingMutex, 1);
+			gSynthApertureFrame = frame;
+		}
+		return true;
+	}
+
+	bool D3D::PublishSynthesizedApertureRing(
+		RE::NiAVObject* camera,
+		RE::NiAVObject* aperture,
+		const RE::NiPoint3& worldCenter,
+		float worldRadius,
+		int opticalAxis,
+		float fov)
+	{
+		// Why this bails matters now: it is the fallback, and on at least one
+		// scope it fails while the captured-placement path succeeds. Silence
+		// here previously read as "activation is broken" when the truth was
+		// "this projection gave up and nothing said so". One line per distinct
+		// reason.
+		const auto bail = [](const char* reason) {
+			static const char* lastReason = nullptr;
+			if (lastReason != reason) {
+				lastReason = reason;
+				logger::info(
+					"Synthesized aperture ring not published: {}. The captured "
+					"placement path is unaffected by this",
+					reason);
+			}
+			InvalidateSynthesizedApertureRing();
+			return false;
+		};
+
+		if (!camera || !aperture) {
+			return bail("no camera or aperture node");
+		}
+		if (!std::isfinite(worldRadius) || worldRadius <= 0.001F ||
+			worldRadius >= 10000.0F) {
+			return bail("world radius out of range");
+		}
+		if (windowWidth <= 0 || windowHeight <= 0) {
+			return bail("viewport not resolved");
+		}
+
+		// The two axes that are not the optical axis span the lens plane. The
+		// measurement names the thinnest local axis; on every genuine aperture
+		// inspected so far that is local Y, which is the X/Z plane STS authors
+		// ScopeFade in and the plane the published lens basis already assumes.
+		// Deriving it rather than hardcoding X/Z is what makes this work on a
+		// lens element some other author laid out differently.
+		const int planeAxisA = opticalAxis == 0 ? 1 : 0;
+		const int planeAxisB = opticalAxis == 2 ? 1 : 2;
+		const auto localAxis = [](int axis) {
+			return RE::NiPoint3{
+				axis == 0 ? 1.0F : 0.0F,
+				axis == 1 ? 1.0F : 0.0F,
+				axis == 2 ? 1.0F : 0.0F
+			};
+		};
+		const auto normalizedWorldAxis =
+			[&](int axis, bool& ok) -> RE::NiPoint3 {
+			RE::NiPoint3 direction = aperture->world.rotate * localAxis(axis);
+			const float length = std::sqrt(
+				direction.x * direction.x + direction.y * direction.y +
+				direction.z * direction.z);
+			ok = std::isfinite(length) && length > 0.0001F;
+			if (!ok) {
+				return RE::NiPoint3{};
+			}
+			const float inverse = 1.0F / length;
+			return RE::NiPoint3{
+				direction.x * inverse,
+				direction.y * inverse,
+				direction.z * inverse
+			};
+		};
+		bool axisAValid = false;
+		bool axisBValid = false;
+		// Lens coordinate (1,0) lies along this one and (0,1) along the other,
+		// matching ScopeGeometryFill_GS's float2(sin(angle), cos(angle)).
+		const RE::NiPoint3 lensAxisX = normalizedWorldAxis(planeAxisA, axisAValid);
+		const RE::NiPoint3 lensAxisZ = normalizedWorldAxis(planeAxisB, axisBValid);
+		if (!axisAValid || !axisBValid) {
+			return bail("lens plane axes are degenerate");
+		}
+
+		SynthesizedApertureRing ring{};
+		const auto projectToNdc = [&](
+									  const RE::NiPoint3& point,
+									  float& ndcX,
+									  float& ndcY,
+									  float& w) {
+			const RE::NiPoint3 projected =
+				WorldPointToScreen(camera, point, fov);
+			if (!std::isfinite(projected.x) || !std::isfinite(projected.y) ||
+				!std::isfinite(projected.z) || projected.z <= 0.001F) {
+				return false;
+			}
+			// WorldPointToScreen returns pixels plus the view-space forward
+			// depth it divided by, which is exactly the perspective W.
+			ndcX = (projected.x / static_cast<float>(windowWidth)) * 2.0F - 1.0F;
+			ndcY = 1.0F - (projected.y / static_cast<float>(windowHeight)) * 2.0F;
+			w = projected.z;
+			return std::isfinite(ndcX) && std::isfinite(ndcY);
+		};
+
+		if (!projectToNdc(
+				worldCenter,
+				ring.centerNdcX,
+				ring.centerNdcY,
+				ring.centerW)) {
+			return bail("aperture centre failed to project (behind camera?)");
+		}
+
+		// Only the outer ring is projected. The inner ring is reconstructed on
+		// the render thread as the clip-space midpoint of centre and rim, which
+		// is exact because projection is linear in homogeneous coordinates
+		// before the perspective divide -- and it makes the fill shader's
+		// 2*inner - outer apex recover this centre exactly rather than
+		// approximately, which is better than the authored mesh manages after
+		// vertex quantization.
+		constexpr float kTwoPi = 6.28318530717958647692F;
+		for (std::size_t segment = 0U; segment < kSynthApertureSegments;
+			 ++segment) {
+			const float angle = static_cast<float>(segment) * kTwoPi /
+			                    static_cast<float>(kSynthApertureSegments);
+			const float alongX = std::sin(angle) * worldRadius;
+			const float alongZ = std::cos(angle) * worldRadius;
+			const RE::NiPoint3 rimWorld{
+				worldCenter.x + lensAxisX.x * alongX + lensAxisZ.x * alongZ,
+				worldCenter.y + lensAxisX.y * alongX + lensAxisZ.y * alongZ,
+				worldCenter.z + lensAxisX.z * alongX + lensAxisZ.z * alongZ
+			};
+			if (!projectToNdc(
+					rimWorld,
+					ring.rimNdcX[segment],
+					ring.rimNdcY[segment],
+					ring.rimW[segment])) {
+				return bail("a rim point failed to project");
+			}
+		}
+
+		ring.valid = true;
+		{
+			const HangDiag::TrackedRingLock lock(gSynthApertureRingMutex, 1);
+			gSynthApertureRing = ring;
+		}
+
+		// Once per distinct aperture size rather than once per process, so a
+		// weapon switch is visible in the log. Keyed on the radius rather than
+		// on the scene pointer so nothing here retains one.
+		static float lastLoggedSynthRadius = -1.0F;
+		if (std::abs(worldRadius - lastLoggedSynthRadius) > 0.0005F) {
+			lastLoggedSynthRadius = worldRadius;
+			// The projected radius in pixels is the number that can actually be
+			// compared against what is on screen. Averaged over the ring so a
+			// single foreshortened axis does not misreport it.
+			double pixelRadiusSum = 0.0;
+			for (std::size_t segment = 0U; segment < kSynthApertureSegments;
+				 ++segment) {
+				const float deltaX = (ring.rimNdcX[segment] - ring.centerNdcX) *
+				                     0.5F * static_cast<float>(windowWidth);
+				const float deltaY = (ring.rimNdcY[segment] - ring.centerNdcY) *
+				                     0.5F * static_cast<float>(windowHeight);
+				pixelRadiusSum += std::sqrt(
+					static_cast<double>(deltaX) * deltaX +
+					static_cast<double>(deltaY) * deltaY);
+			}
+			logger::info(
+				"Synthesized aperture ring built: worldRadius={:.4f}, "
+				"opticalAxis=local{}, centerNdc=({:.4f}, {:.4f}), centerW={:.4f}, "
+				"projectedPixelRadius={:.1f}, viewport={}x{}, fov={:.2f}",
+				worldRadius,
+				opticalAxis == 0 ? "X" : (opticalAxis == 1 ? "Y" : "Z"),
+				ring.centerNdcX,
+				ring.centerNdcY,
+				ring.centerW,
+				pixelRadiusSum / static_cast<double>(kSynthApertureSegments),
+				windowWidth,
+				windowHeight,
+				fov);
+		}
+		return true;
+	}
+
 	D3D::ScreenSphereProjection D3D::ProjectWorldSphereToScreen(
 		RE::NiAVObject* cam,
 		const RE::NiPoint3& worldCenter,
@@ -1525,6 +2305,7 @@ namespace Hook
 			result.radiusY > 1.0F &&
 			result.radiusX < static_cast<float>(windowWidth) &&
 			result.radiusY < static_cast<float>(windowHeight);
+
 		return result;
 	}
 
@@ -1628,6 +2409,23 @@ namespace Hook
 				"Stage 4d geometry fill shader could not be loaded; "
 				"the ScopeFade draw will remain untouched");
 			return false;
+		}
+
+		// The synthesized aperture's vertex stage. Loaded unconditionally but
+		// non-fatally: a scope with an authored ScopeFade never needs it, so
+		// failing to load it must not take the working path down with it.
+		if (FAILED(CreateShaderFromFile(
+				L"Data\\Shaders\\MagnaScope\\ScopeApertureSynth_VS.cso",
+				L"src\\HLSL\\ScopeApertureSynth_VS.hlsl",
+				"main",
+				"vs_5_0",
+				mScopeApertureSynthVertexBytecode.ReleaseAndGetAddressOf())) ||
+			!mScopeApertureSynthVertexBytecode.Get()) {
+			mScopeApertureSynthVertexBytecode.Reset();
+			logger::warn(
+				"Synthesized aperture vertex shader could not be loaded; "
+				"scopes without an authored ScopeFade keep the screen-space "
+				"fallback");
 		}
 
 		// Create an initial set on Fallout's advertised renderer device. The
@@ -1841,6 +2639,124 @@ namespace Hook
 				m_pGeometryShader_STSGeometryFill.Reset();
 				m_pPixelShader_STSGeometryProbe.Reset();
 				return false;
+			}
+		}
+
+		// The synthesized aperture, built on the same device as everything
+		// above. Every failure here is non-fatal and simply leaves the
+		// synthesized path unavailable: a scope with an authored ScopeFade must
+		// keep working even if this cannot be created.
+		m_pVertexShader_ApertureSynth.Reset();
+		mApertureSynthInputLayout.Reset();
+		mApertureSynthVertexBuffer.Reset();
+		mApertureSynthIndexBuffer.Reset();
+		if (mScopeApertureSynthVertexBytecode.Get()) {
+			const auto abandonSynth = [this](const char* what, HRESULT hr) {
+				logger::warn(
+					"Synthesized aperture {} creation failed: 0x{:08X}; scopes "
+					"without an authored ScopeFade keep the screen-space "
+					"fallback",
+					what,
+					static_cast<std::uint32_t>(hr));
+				m_pVertexShader_ApertureSynth.Reset();
+				mApertureSynthInputLayout.Reset();
+				mApertureSynthVertexBuffer.Reset();
+				mApertureSynthIndexBuffer.Reset();
+			};
+			HRESULT synthResult = device->CreateVertexShader(
+				mScopeApertureSynthVertexBytecode->GetBufferPointer(),
+				mScopeApertureSynthVertexBytecode->GetBufferSize(),
+				nullptr,
+				m_pVertexShader_ApertureSynth.ReleaseAndGetAddressOf());
+			if (FAILED(synthResult)) {
+				abandonSynth("vertex shader", synthResult);
+			} else {
+				const D3D11_INPUT_ELEMENT_DESC synthElements[]{
+					{ "POSITION",
+						0U,
+						DXGI_FORMAT_R32G32B32A32_FLOAT,
+						0U,
+						0U,
+						D3D11_INPUT_PER_VERTEX_DATA,
+						0U }
+				};
+				synthResult = device->CreateInputLayout(
+					synthElements,
+					static_cast<UINT>(std::size(synthElements)),
+					mScopeApertureSynthVertexBytecode->GetBufferPointer(),
+					mScopeApertureSynthVertexBytecode->GetBufferSize(),
+					mApertureSynthInputLayout.ReleaseAndGetAddressOf());
+				if (FAILED(synthResult)) {
+					abandonSynth("input layout", synthResult);
+				}
+			}
+			if (mApertureSynthInputLayout.Get()) {
+				D3D11_BUFFER_DESC synthVertexDescription{};
+				// Sized for the larger of the two vertex formats this buffer
+				// carries: float4 clip positions on the projected fallback
+				// (16 bytes) and the game's 20-byte layout on the
+				// captured-placement path.
+				synthVertexDescription.ByteWidth = static_cast<UINT>(
+					kSynthApertureVertexCount *
+					std::max<std::size_t>(
+						sizeof(float) * 4U,
+						kSynthApertureGameVertexStride));
+				synthVertexDescription.Usage = D3D11_USAGE_DYNAMIC;
+				synthVertexDescription.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+				synthVertexDescription.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+				synthResult = device->CreateBuffer(
+					&synthVertexDescription,
+					nullptr,
+					mApertureSynthVertexBuffer.ReleaseAndGetAddressOf());
+				if (FAILED(synthResult)) {
+					abandonSynth("vertex buffer", synthResult);
+				}
+			}
+			if (mApertureSynthVertexBuffer.Get()) {
+				// Immutable, because the topology never changes. Segment k
+				// occupies primitives 2k and 2k+1 in that order, which is what
+				// ScopeGeometryFill_GS's segment = primitiveID >> 1 and its
+				// even/odd winding assume. Getting this order wrong would not
+				// crash -- it would silently hand the fill shader the wrong
+				// lens coordinate for every wedge.
+				std::array<std::uint16_t, kSynthApertureIndexCount> indices{};
+				std::size_t cursor = 0U;
+				for (std::uint16_t segment = 0U;
+					 segment < static_cast<std::uint16_t>(kSynthApertureSegments);
+					 ++segment) {
+					const std::uint16_t nextSegment = static_cast<std::uint16_t>(
+						(segment + 1U) % kSynthApertureSegments);
+					const std::uint16_t outerCurrent = segment;
+					const std::uint16_t outerNext = nextSegment;
+					const std::uint16_t innerCurrent = static_cast<std::uint16_t>(
+						kSynthApertureSegments + segment);
+					const std::uint16_t innerNext = static_cast<std::uint16_t>(
+						kSynthApertureSegments + nextSegment);
+					// Even primitive: outerCurrent, innerNext, outerNext.
+					indices[cursor++] = outerCurrent;
+					indices[cursor++] = innerNext;
+					indices[cursor++] = outerNext;
+					// Odd primitive: outerCurrent, innerCurrent, innerNext.
+					// This is the one the fill shader expands into the centre
+					// fan, because it carries both inner-ring endpoints.
+					indices[cursor++] = outerCurrent;
+					indices[cursor++] = innerCurrent;
+					indices[cursor++] = innerNext;
+				}
+				D3D11_BUFFER_DESC synthIndexDescription{};
+				synthIndexDescription.ByteWidth =
+					static_cast<UINT>(indices.size() * sizeof(std::uint16_t));
+				synthIndexDescription.Usage = D3D11_USAGE_IMMUTABLE;
+				synthIndexDescription.BindFlags = D3D11_BIND_INDEX_BUFFER;
+				D3D11_SUBRESOURCE_DATA synthIndexData{};
+				synthIndexData.pSysMem = indices.data();
+				synthResult = device->CreateBuffer(
+					&synthIndexDescription,
+					&synthIndexData,
+					mApertureSynthIndexBuffer.ReleaseAndGetAddressOf());
+				if (FAILED(synthResult)) {
+					abandonSynth("index buffer", synthResult);
+				}
 			}
 		}
 
@@ -2208,37 +3124,53 @@ namespace Hook
 			resolution.lensBasisZY =
 				projection.lensBasisZY * projectionScaleY;
 
-			// Preserve the manually authored reticle-to-ScopeFade relation in
-			// lens-local units. Fixed screen pixels would become incorrect as
-			// the weapon rolls or an inertia mod moves the optic after this
-			// CPU snapshot. The exact DrawIndexed shader reconstructs pixels
-			// from these coordinates and its current transformed vertices.
-			const float aimDeltaX =
-				(projection.aimCenterX - projection.centerX) *
-				projectionScaleX;
-			const float aimDeltaY =
-				(projection.aimCenterY - projection.centerY) *
-				projectionScaleY;
-			const float basisDeterminant =
-				resolution.lensBasisXX * resolution.lensBasisZY -
-				resolution.lensBasisXY * resolution.lensBasisZX;
-			if (std::isfinite(basisDeterminant) &&
-				std::abs(basisDeterminant) > 0.0001F) {
-				resolution.aimOffsetX =
-					(aimDeltaX * resolution.lensBasisZY -
-					 aimDeltaY * resolution.lensBasisZX) /
-					basisDeterminant;
-				resolution.aimOffsetY =
-					(-aimDeltaX * resolution.lensBasisXY +
-					 aimDeltaY * resolution.lensBasisXX) /
-					basisDeterminant;
-				resolution.aimOffsetValid =
-					std::isfinite(resolution.aimOffsetX) &&
-							std::isfinite(resolution.aimOffsetY) ?
-						1.0F :
-						0.0F;
-			}
+			// The magnification pivot is the lens centre, and only the lens
+			// centre.
+			//
+			// It used to be the authored reticle's position in lens coordinates,
+			// so that a scope whose reticle sits off centre would zoom about the
+			// reticle rather than about the glass. Nothing could compute that
+			// value reliably. Three independent methods were each measured
+			// against a reticle sitting 38 pixels from the aperture centre on a
+			// 350-pixel projected radius -- a true offset near 0.11 radii:
+			//
+			//   inverting the projected lens basis      6.625 radii
+			//   aperture-local orthogonal drop          3.787 radii
+			//   aperture-local view-ray projection     58.081 radii
+			//
+			// All three also swung with camera heading. The clamp then pinned the
+			// pivot to the rim, which makes every pixel of the lens sample the
+			// narrow band of backbuffer at the rim -- tube wall, not sight picture
+			// -- and the sign changes swapped which rim, so the image mirrored as
+			// the player panned. That is the optic magnifying its own housing.
+			//
+			// Zero pivots on the centre that the replayed geometry already solves
+			// exactly and per pixel, with no CPU-published vector in the path. It
+			// also makes the invariant unconditional rather than clamped: with the
+			// pivot at the centre the sampled region is the central 1/m of the
+			// lens for every magnification above 1, so the optic can only ever
+			// magnify what is in front of it.
+			//
+			// Validity stays published. The shader reads a valid (0,0) as "the
+			// centre" and an invalid one as "the game thread had no coherent
+			// projection this frame", and that second meaning still gates
+			// drawFrameValid against transient garbage.
+			//
+			// The aperture-local solve still arrives on the projection snapshot as
+			// aimLensX/aimLensY. It is deliberately unconsumed; it is the value to
+			// repair if the off-centre pivot is ever wanted back, and the lens
+			// basis beside it remains live for the reticle composite.
+			resolution.aimOffsetX = 0.0F;
+			resolution.aimOffsetY = 0.0F;
+			resolution.aimOffsetValid = 1.0F;
 		}
+		gLastPublishedAimOffsetValid.store(
+			resolution.aimOffsetValid,
+			std::memory_order_relaxed);
+		gLastPublishedPhysicalEyeBoxValid.store(
+			resolution.physicalEyeBoxValid,
+			std::memory_order_relaxed);
+
 		resolution.eyeBoxRadius = std::clamp(
 			scopeEyeBoxRadius.load(std::memory_order_acquire),
 			0.01F,
@@ -2430,6 +3362,104 @@ namespace Hook
 		return true;
 	}
 
+	// Snapshot the placement state of the synthesis source mesh's own draw:
+	// vertex shader, input layout and the b1/b2/b12 transform constants. The
+	// synthesized ring drawn through this state lands exactly where the game
+	// would render that mesh -- right FOV, foreshortening and roll included --
+	// which is what every CPU-side projection attempt got wrong.
+	//
+	// Caller holds mScopeFadeGeometryMutex (the classifier). Same rules as
+	// the ScopeFade capture above: immediate context only, and constants are
+	// copied rather than retained because the engine overwrites them long
+	// before the composite runs.
+	bool D3D::CaptureSynthesisPlacementLocked(ID3D11DeviceContext* context)
+	{
+		if (!context ||
+			context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE ||
+			!g_Context.Get() ||
+			!HaveSameCOMIdentity(context, g_Context.Get())) {
+			return false;
+		}
+
+		auto& placement = mAutomaticSTSPlacementReplay;
+		placement.ready = false;
+
+		ComPtr<ID3D11VertexShader> vertexShader;
+		context->VSGetShader(vertexShader.GetAddressOf(), nullptr, nullptr);
+		ComPtr<ID3D11InputLayout> inputLayout;
+		context->IAGetInputLayout(inputLayout.GetAddressOf());
+		D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+		context->IAGetPrimitiveTopology(&topology);
+		if (!vertexShader.Get() || !inputLayout.Get() ||
+			topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST) {
+			return false;
+		}
+
+		ComPtr<ID3D11Device> device;
+		context->GetDevice(device.GetAddressOf());
+		if (!device.Get() || !g_Device.Get() ||
+			!HaveSameCOMIdentity(device.Get(), g_Device.Get())) {
+			return false;
+		}
+
+		const auto resourceGeneration =
+			mScopeFadeResourceGeneration.load(std::memory_order_acquire);
+		if (placement.resourceGeneration != resourceGeneration) {
+			for (auto& buffer : placement.vertexConstantBuffers) {
+				buffer.Reset();
+			}
+			placement.resourceGeneration = resourceGeneration;
+		}
+		constexpr std::array<UINT, 3> constantBufferSlots{ 1U, 2U, 12U };
+		for (std::size_t index = 0; index < constantBufferSlots.size();
+			 ++index) {
+			ComPtr<ID3D11Buffer> sourceBuffer;
+			context->VSGetConstantBuffers(
+				constantBufferSlots[index],
+				1,
+				sourceBuffer.GetAddressOf());
+			if (!sourceBuffer.Get()) {
+				return false;
+			}
+			D3D11_BUFFER_DESC sourceDescription{};
+			sourceBuffer->GetDesc(&sourceDescription);
+			bool recreate = !placement.vertexConstantBuffers[index].Get();
+			if (!recreate) {
+				D3D11_BUFFER_DESC destinationDescription{};
+				placement.vertexConstantBuffers[index]->GetDesc(
+					&destinationDescription);
+				recreate = destinationDescription.ByteWidth !=
+				           sourceDescription.ByteWidth;
+			}
+			if (recreate) {
+				placement.vertexConstantBuffers[index].Reset();
+				D3D11_BUFFER_DESC copyDescription = sourceDescription;
+				copyDescription.Usage = D3D11_USAGE_DEFAULT;
+				copyDescription.CPUAccessFlags = 0;
+				const HRESULT createResult = device->CreateBuffer(
+					&copyDescription,
+					nullptr,
+					placement.vertexConstantBuffers[index]
+						.ReleaseAndGetAddressOf());
+				if (FAILED(createResult) ||
+					!placement.vertexConstantBuffers[index].Get()) {
+					return false;
+				}
+			}
+			context->CopyResource(
+				placement.vertexConstantBuffers[index].Get(),
+				sourceBuffer.Get());
+		}
+
+		placement.vertexShader = vertexShader;
+		placement.inputLayout = inputLayout;
+		placement.topology = topology;
+		placement.generation = automaticSTSReplayFrameGeneration.load(
+			std::memory_order_acquire);
+		placement.ready = true;
+		return true;
+	}
+
 	bool D3D::ReplayAutomaticSTSScopeFade(
 		ID3D11ShaderResourceView* sceneSource,
 		ID3D11RenderTargetView* compositeTarget)
@@ -2438,7 +3468,17 @@ namespace Hook
 			return false;
 		}
 
-		std::scoped_lock lock(mScopeFadeGeometryMutex);
+		HangDiag::TrackedGeometryLock lock(mScopeFadeGeometryMutex, 2);
+		// Diagnostic only, and it belongs on this path as much as the
+		// synthesized one. When every published value is correct and the log
+		// says the replay drew, the remaining question is whether its pixels
+		// reach the target at all -- which a flat colour answers and the
+		// magnified image, being a near-copy of what is already there, cannot.
+		ID3D11PixelShader* const replayPixelShader =
+			(MagnaScope::GetSettings().AllowsSynthesizedApertureProbe() &&
+				m_pPixelShader_STSGeometryProbe.Get()) ?
+				m_pPixelShader_STSGeometryProbe.Get() :
+				m_pPixelShader_STSGeometryMagnify.Get();
 		auto& replay = mAutomaticSTSScopeFadeReplay;
 		if (!replay.ready || !replay.vertexShader.Get() ||
 			!replay.inputLayout.Get() || !replay.vertexBuffer.Get() ||
@@ -2461,12 +3501,15 @@ namespace Hook
 				nullptr);
 			compositeTarget = boundTarget.Get();
 		}
-		if (!compositeTarget ||
-			!PrepareScopeFadeSceneSource(
-				g_Context.Get(),
-				compositeTarget,
-				sceneSource)) {
-			return false;
+		{
+			const HangDiag::PhaseScope phase(HangDiag::presentPhase, 10);
+			if (!compositeTarget ||
+				!PrepareScopeFadeSceneSource(
+					g_Context.Get(),
+					compositeTarget,
+					sceneSource)) {
+				return false;
+			}
 		}
 		ID3D11ShaderResourceView* const effectiveSceneSource =
 			sceneSource ? sceneSource : mScopeFadeSceneSRV.Get();
@@ -2474,6 +3517,7 @@ namespace Hook
 			return false;
 		}
 
+		const HangDiag::PhaseScope replayPhase(HangDiag::presentPhase, 11);
 		std::vector<VSConstantBufferSlot> vertexConstantBufferSlots{
 			{ 1U, 1U, replay.vertexConstantBuffers[0].GetAddressOf() },
 			{ 2U, 1U, replay.vertexConstantBuffers[1].GetAddressOf() },
@@ -2486,7 +3530,7 @@ namespace Hook
 			replay.vertexShader.Get(),
 			nullptr,
 			0,
-			m_pPixelShader_STSGeometryMagnify.Get(),
+			replayPixelShader,
 			replay.inputLayout.Get(),
 			BSScopeFadeReplaceRGB.Get(),
 			vertexConstantBufferSlots,
@@ -2526,12 +3570,415 @@ namespace Hook
 		}
 
 		bSelfDraw = true;
-		g_Context->DrawIndexed(
-			replay.indexCount,
-			replay.startIndexLocation,
-			replay.baseVertexLocation);
+		{
+			const HangDiag::PhaseScope phase(HangDiag::presentPhase, 12);
+			g_Context->DrawIndexed(
+				replay.indexCount,
+				replay.startIndexLocation,
+				replay.baseVertexLocation);
+		}
 		bSelfDraw = false;
 		replay.ready = false;
+
+		// The same activation/magnification readout the synthesized path
+		// carries. Without it, "the replay ran but nothing appeared" was
+		// indistinguishable from "the replay ran and was told to do nothing",
+		// and a freshly created profile sits at 1x magnification by design --
+		// which makes the magnify shader an exact copy of its input.
+		static std::atomic_uint32_t replayDrawLogCountdown{ 0U };
+		if (replayDrawLogCountdown.fetch_add(1U, std::memory_order_relaxed) %
+				600U ==
+			0U) {
+			const float activation =
+				projectedActivationProgress.load(std::memory_order_acquire);
+			const float magnification =
+				scopeFadeMagnification.load(std::memory_order_acquire);
+			const float aimValid =
+				gLastPublishedAimOffsetValid.load(std::memory_order_relaxed);
+			logger::info(
+				"Exact ScopeFade replay drawn (activation={:.3f}, "
+				"magnification={:.2f}, aimReference={}, eyeBox={:.2f}){}",
+				activation,
+				magnification,
+				aimValid > 0.5F ? "published" : "MISSING (shader bails to the "
+				                                "source pixel)",
+				gLastPublishedPhysicalEyeBoxValid.load(
+					std::memory_order_relaxed),
+				magnification <= 1.001F ?
+					". Magnification is 1x, so the optical result is identical "
+					"to the source and no effect is visible" :
+					"");
+		}
+		return true;
+	}
+
+	// The synthesized aperture draw. Deliberately a near-copy of
+	// ReplayAutomaticSTSScopeFade above: same blend state, same source
+	// preparation, same b4/b5 binding, same geometry and pixel shaders. The
+	// only differences are that the geometry is ours rather than captured, and
+	// that there are therefore no game vertex-shader constant buffers to
+	// restore -- our vertex stage consumes finished clip-space positions.
+	//
+	// Keeping the two paths this close is the point. Anything the authored
+	// ScopeFade path does that this one does not is a way for the two to look
+	// different, which is exactly what this feature exists to prevent.
+	bool D3D::DrawSynthesizedAperture(
+		ID3D11ShaderResourceView* sceneSource,
+		ID3D11RenderTargetView* compositeTarget)
+	{
+		if (!g_Context.Get()) {
+			return false;
+		}
+
+		HangDiag::TrackedGeometryLock lock(mScopeFadeGeometryMutex, 3);
+		if (!m_pVertexShader_ApertureSynth.Get() ||
+			!mApertureSynthInputLayout.Get() ||
+			!mApertureSynthVertexBuffer.Get() ||
+			!mApertureSynthIndexBuffer.Get() ||
+			!m_pGeometryShader_STSGeometryFill.Get() ||
+			!m_pPixelShader_STSGeometryMagnify.Get() ||
+			!BSScopeFadeReplaceRGB.Get()) {
+			return false;
+		}
+
+		// Diagnostic only. Colouring the ring flat cyan answers the one question
+		// the in-game symptom cannot: whether "no effect appeared" means the ring
+		// never reached the screen, or reached it correctly and the magnify
+		// shader returned the source pixel.
+		ID3D11PixelShader* const opticalPixelShader =
+			(MagnaScope::GetSettings().AllowsSynthesizedApertureProbe() &&
+				m_pPixelShader_STSGeometryProbe.Get()) ?
+				m_pPixelShader_STSGeometryProbe.Get() :
+				m_pPixelShader_STSGeometryMagnify.Get();
+
+		// Two placement paths, tried in order of fidelity.
+		//
+		// Captured: the classifier saw the synthesis source mesh's own draw
+		// this frame and snapshotted its shader, layout and transform
+		// constants. The ring is built in that mesh's model space and the
+		// game's own vertex shader places it, so FOV, foreshortening and roll
+		// are right by construction -- the same reason the exact ScopeFade
+		// replay never had a sizing problem.
+		//
+		// Projected: the CPU-projected NDC ring, kept as the fallback for a
+		// frame where the source mesh was not drawn or not yet published.
+		const auto frameGeneration =
+			automaticSTSReplayFrameGeneration.load(std::memory_order_acquire);
+		auto& placement = mAutomaticSTSPlacementReplay;
+		const auto frame = [&] {
+			const HangDiag::PhaseScope phase(HangDiag::presentPhase, 20);
+			return AcquireSynthesizedApertureFrame();
+		}();
+		const bool capturedPlacementUsable =
+			placement.ready &&
+			placement.generation == frameGeneration &&
+			placement.vertexShader.Get() &&
+			placement.inputLayout.Get() &&
+			placement.vertexConstantBuffers[0].Get() &&
+			placement.vertexConstantBuffers[1].Get() &&
+			placement.vertexConstantBuffers[2].Get() &&
+			frame.valid && frame.radius > 0.0001F;
+
+		const auto ring = [&] {
+			const HangDiag::PhaseScope phase(HangDiag::presentPhase, 20);
+			return AcquireSynthesizedApertureRing();
+		}();
+		if (!capturedPlacementUsable && !ring.valid) {
+			return false;
+		}
+
+		ComPtr<ID3D11RenderTargetView> boundTarget;
+		if (!compositeTarget) {
+			g_Context->OMGetRenderTargets(1, boundTarget.GetAddressOf(), nullptr);
+			compositeTarget = boundTarget.Get();
+		}
+		{
+			const HangDiag::PhaseScope phase(HangDiag::presentPhase, 21);
+			if (!compositeTarget ||
+				!PrepareScopeFadeSceneSource(
+					g_Context.Get(),
+					compositeTarget,
+					sceneSource)) {
+				return false;
+			}
+		}
+		ID3D11ShaderResourceView* const effectiveSceneSource =
+			sceneSource ? sceneSource : mScopeFadeSceneSRV.Get();
+		if (!effectiveSceneSource) {
+			return false;
+		}
+
+		if (capturedPlacementUsable) {
+			// A ScopeFade-shaped mesh in the source's model space: 24 outer
+			// vertices at the measured radius, 24 inner at exactly half, in
+			// the measured lens plane around the measured centre -- encoded
+			// in the game's own 20-byte vertex format so the captured input
+			// layout reads it as it read the source mesh.
+			struct GameVertex
+			{
+				std::uint16_t position[4];
+				std::uint16_t uv[2];
+				std::uint32_t normal;
+				std::uint32_t tangent;
+			};
+			static_assert(
+				sizeof(GameVertex) == kSynthApertureGameVertexStride);
+			const int axisA = frame.opticalAxis == 0 ? 1 : 0;
+			const int axisB = frame.opticalAxis == 2 ? 1 : 2;
+			std::array<GameVertex, kSynthApertureVertexCount> gameVertices{};
+			constexpr float kTwoPi = 6.28318530717958647692F;
+			const float center[3]{
+				frame.centerX,
+				frame.centerY,
+				frame.centerZ
+			};
+			for (std::size_t segment = 0U;
+				 segment < kSynthApertureSegments;
+				 ++segment) {
+				const float angle = static_cast<float>(segment) * kTwoPi /
+				                    static_cast<float>(kSynthApertureSegments);
+				const float alongA = std::sin(angle) * frame.radius;
+				const float alongB = std::cos(angle) * frame.radius;
+				float outer[3]{ center[0], center[1], center[2] };
+				outer[axisA] += alongA;
+				outer[axisB] += alongB;
+				float inner[3]{ center[0], center[1], center[2] };
+				inner[axisA] += 0.5F * alongA;
+				inner[axisB] += 0.5F * alongB;
+				auto& outerVertex = gameVertices[segment];
+				auto& innerVertex =
+					gameVertices[kSynthApertureSegments + segment];
+				for (int component = 0; component < 3; ++component) {
+					outerVertex.position[component] =
+						EncodeHalfFloat(outer[component]);
+					innerVertex.position[component] =
+						EncodeHalfFloat(inner[component]);
+				}
+				outerVertex.position[3] = EncodeHalfFloat(1.0F);
+				innerVertex.position[3] = EncodeHalfFloat(1.0F);
+			}
+
+			{
+				const HangDiag::PhaseScope phase(HangDiag::presentPhase, 22);
+				D3D11_MAPPED_SUBRESOURCE mapped{};
+				if (FAILED(g_Context->Map(
+						mApertureSynthVertexBuffer.Get(),
+						0U,
+						D3D11_MAP_WRITE_DISCARD,
+						0U,
+						&mapped)) ||
+					!mapped.pData) {
+					return false;
+				}
+				std::memcpy(
+					mapped.pData,
+					gameVertices.data(),
+					sizeof(gameVertices));
+				g_Context->Unmap(mApertureSynthVertexBuffer.Get(), 0U);
+			}
+
+			const HangDiag::PhaseScope placementSetupPhase(
+				HangDiag::presentPhase,
+				23);
+			std::vector<VSConstantBufferSlot> placementConstantBuffers{
+				{ 1U, 1U, placement.vertexConstantBuffers[0].GetAddressOf() },
+				{ 2U, 1U, placement.vertexConstantBuffers[1].GetAddressOf() },
+				{ 12U, 1U, placement.vertexConstantBuffers[2].GetAddressOf() }
+			};
+			ID3D11Buffer* vertexBuffer = mApertureSynthVertexBuffer.Get();
+			const UINT vertexStride =
+				static_cast<UINT>(kSynthApertureGameVertexStride);
+			const UINT vertexOffset = 0U;
+			SetupCommonRenderState(
+				placement.vertexShader.Get(),
+				nullptr,
+				0,
+				opticalPixelShader,
+				placement.inputLayout.Get(),
+				BSScopeFadeReplaceRGB.Get(),
+				placementConstantBuffers,
+				mApertureSynthIndexBuffer.Get(),
+				DXGI_FORMAT_R16_UINT,
+				0U,
+				&vertexBuffer,
+				&vertexStride,
+				&vertexOffset,
+				1,
+				renderedAtTAAThisFrame ? nullptr : compositeTarget);
+
+			g_Context->IASetPrimitiveTopology(
+				D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			g_Context->GSSetShader(
+				m_pGeometryShader_STSGeometryFill.Get(),
+				nullptr,
+				0);
+			ID3D11ShaderResourceView* source = effectiveSceneSource;
+			ID3D11SamplerState* sampler = mScopeFadeSampler.Get();
+			ID3D11Buffer* resolutionBuffer = mScopeFadeResolutionBuffer.Get();
+			ID3D11Buffer* scopeEffectBuffer = m_pScopeEffectBuffer.Get();
+			g_Context->PSSetShaderResources(4, 1, &source);
+			g_Context->PSSetSamplers(0, 1, &sampler);
+			g_Context->PSSetConstantBuffers(4, 1, &resolutionBuffer);
+			if (scopeEffectBuffer) {
+				g_Context->PSSetConstantBuffers(5, 1, &scopeEffectBuffer);
+			}
+
+			bSelfDraw = true;
+			{
+				const HangDiag::PhaseScope phase(HangDiag::presentPhase, 24);
+				g_Context->DrawIndexed(
+					static_cast<UINT>(kSynthApertureIndexCount),
+					0U,
+					0);
+			}
+			bSelfDraw = false;
+			// One placement per source draw. The next frame's draw recaptures
+			// with that frame's transforms, so a stale placement can never
+			// replay yesterday's weapon position.
+			placement.ready = false;
+
+			static std::atomic_uint32_t placementDrawLogCountdown{ 0U };
+			if (placementDrawLogCountdown.fetch_add(
+					1U,
+					std::memory_order_relaxed) %
+					600U ==
+				0U) {
+				logger::info(
+					"Synthesized aperture drawn via captured placement: "
+					"localRadius={:.4f}, opticalAxis=local{} "
+					"(activation={:.3f}, magnification={:.2f})",
+					frame.radius,
+					frame.opticalAxis == 0 ?
+						"X" :
+						(frame.opticalAxis == 1 ? "Y" : "Z"),
+					projectedActivationProgress.load(
+						std::memory_order_acquire),
+					scopeFadeMagnification.load(std::memory_order_acquire));
+			}
+			return true;
+		}
+
+		// Rebuild clip space from the published NDC and W. Depth testing is
+		// off and no depth-stencil view is bound at either anchor, so Z only
+		// has to survive the rasterizer's 0 <= z <= w clip; half of W sits
+		// safely inside it and says nothing about occlusion, which this path
+		// has never participated in.
+		struct SynthVertex
+		{
+			float x;
+			float y;
+			float z;
+			float w;
+		};
+		const auto makeClip = [](float ndcX, float ndcY, float w) {
+			return SynthVertex{ ndcX * w, ndcY * w, 0.5F * w, w };
+		};
+		std::array<SynthVertex, kSynthApertureVertexCount> vertices{};
+		const SynthVertex centerClip =
+			makeClip(ring.centerNdcX, ring.centerNdcY, ring.centerW);
+		for (std::size_t segment = 0U; segment < kSynthApertureSegments;
+			 ++segment) {
+			const SynthVertex outerClip = makeClip(
+				ring.rimNdcX[segment],
+				ring.rimNdcY[segment],
+				ring.rimW[segment]);
+			vertices[segment] = outerClip;
+			// The inner ring is the clip-space midpoint of centre and rim.
+			// Projection is linear in homogeneous coordinates before the
+			// perspective divide, so this is exactly the projection of the
+			// world-space midpoint -- and it makes the fill shader's
+			// 2*inner - outer apex land on the true centre exactly, which the
+			// authored mesh only manages to about half a percent after vertex
+			// quantization.
+			vertices[kSynthApertureSegments + segment] = SynthVertex{
+				0.5F * (centerClip.x + outerClip.x),
+				0.5F * (centerClip.y + outerClip.y),
+				0.5F * (centerClip.z + outerClip.z),
+				0.5F * (centerClip.w + outerClip.w)
+			};
+		}
+
+		{
+			const HangDiag::PhaseScope phase(HangDiag::presentPhase, 22);
+			D3D11_MAPPED_SUBRESOURCE mapped{};
+			if (FAILED(g_Context->Map(
+					mApertureSynthVertexBuffer.Get(),
+					0U,
+					D3D11_MAP_WRITE_DISCARD,
+					0U,
+					&mapped)) ||
+				!mapped.pData) {
+				return false;
+			}
+			std::memcpy(mapped.pData, vertices.data(), sizeof(vertices));
+			g_Context->Unmap(mApertureSynthVertexBuffer.Get(), 0U);
+		}
+
+		const HangDiag::PhaseScope synthSetupPhase(
+			HangDiag::presentPhase,
+			23);
+		const std::vector<VSConstantBufferSlot> noVertexConstantBuffers{};
+		ID3D11Buffer* vertexBuffer = mApertureSynthVertexBuffer.Get();
+		const UINT vertexStride = static_cast<UINT>(sizeof(SynthVertex));
+		const UINT vertexOffset = 0U;
+		SetupCommonRenderState(
+			m_pVertexShader_ApertureSynth.Get(),
+			nullptr,
+			0,
+			opticalPixelShader,
+			mApertureSynthInputLayout.Get(),
+			BSScopeFadeReplaceRGB.Get(),
+			noVertexConstantBuffers,
+			mApertureSynthIndexBuffer.Get(),
+			DXGI_FORMAT_R16_UINT,
+			0U,
+			&vertexBuffer,
+			&vertexStride,
+			&vertexOffset,
+			1,
+			renderedAtTAAThisFrame ? nullptr : compositeTarget);
+
+		g_Context->IASetPrimitiveTopology(
+			D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		g_Context->GSSetShader(
+			m_pGeometryShader_STSGeometryFill.Get(),
+			nullptr,
+			0);
+		ID3D11ShaderResourceView* source = effectiveSceneSource;
+		ID3D11SamplerState* sampler = mScopeFadeSampler.Get();
+		ID3D11Buffer* resolutionBuffer = mScopeFadeResolutionBuffer.Get();
+		ID3D11Buffer* scopeEffectBuffer = m_pScopeEffectBuffer.Get();
+		g_Context->PSSetShaderResources(4, 1, &source);
+		g_Context->PSSetSamplers(0, 1, &sampler);
+		g_Context->PSSetConstantBuffers(4, 1, &resolutionBuffer);
+		if (scopeEffectBuffer) {
+			g_Context->PSSetConstantBuffers(5, 1, &scopeEffectBuffer);
+		}
+
+		bSelfDraw = true;
+		{
+			const HangDiag::PhaseScope phase(HangDiag::presentPhase, 24);
+			g_Context->DrawIndexed(
+				static_cast<UINT>(kSynthApertureIndexCount),
+				0U,
+				0);
+		}
+		bSelfDraw = false;
+
+		// Rate limited rather than once, so that "it drew on the first scope
+		// and never again" is distinguishable from "it is drawing every frame".
+		static std::atomic_uint32_t synthDrawLogCountdown{ 0U };
+		if (synthDrawLogCountdown.fetch_add(1U, std::memory_order_relaxed) %
+				600U ==
+			0U) {
+			logger::info(
+				"Synthesized aperture drawn through the ScopeFade fill and "
+				"magnify shaders; no authored ScopeFade was required "
+				"(activation={:.3f}, magnification={:.2f}). Activation at zero "
+				"means the optic is drawn but optically transparent",
+				projectedActivationProgress.load(std::memory_order_acquire),
+				scopeFadeMagnification.load(std::memory_order_acquire));
+		}
 		return true;
 	}
 
@@ -3352,7 +4799,7 @@ namespace Hook
 	void D3D::ClearAutomaticSTSScopeFadeReplay() noexcept
 	{
 		try {
-			std::scoped_lock lock(mScopeFadeGeometryMutex);
+			HangDiag::TrackedGeometryLock lock(mScopeFadeGeometryMutex, 4);
 			mAutomaticSTSScopeFadeReplay = {};
 		} catch (...) {
 			// A cleanup failure must not escape an equip, load, or resize
@@ -3907,14 +5354,49 @@ namespace Hook
 		// nothing even though the draw call itself succeeds. An explicit
 		// state with scissor off makes the pass anchor-independent.
 		// ScopedContextState restores the game's state afterwards.
-		D3D11_RASTERIZER_DESC rasterDesc{};
-		rasterDesc.FillMode = D3D11_FILL_SOLID;
-		rasterDesc.CullMode = D3D11_CULL_NONE;
-		rasterDesc.DepthClipEnable = TRUE;
-		rasterDesc.ScissorEnable = FALSE;
-		Microsoft::WRL::ComPtr<ID3D11RasterizerState> rasterState;
-		if (SUCCEEDED(g_Device->CreateRasterizerState(&rasterDesc, rasterState.GetAddressOf()))) {
-			g_Context->RSSetState(rasterState.Get());
+		//
+		// Created once and cached. This used to build a new rasterizer state
+		// on every composite draw, every frame. ID3D11Device::CreateRasterizerState
+		// takes an internal driver lock, and doing that from a Present-time
+		// hook in a process running a frame-generation interposer
+		// (sl.interposer, D3D12Core, amd_fidelityfx_dx12) is a needless way to
+		// contend with locks the driver is already holding on other threads.
+		// The description is a compile-time constant, so there was never a
+		// reason to rebuild it.
+		if (!mCompositeRasterizerState.Get() ||
+			mCompositeRasterizerDevice.Get() != g_Device.Get()) {
+			mCompositeRasterizerState.Reset();
+			mCompositeRasterizerDevice.Reset();
+			D3D11_RASTERIZER_DESC rasterDesc{};
+			rasterDesc.FillMode = D3D11_FILL_SOLID;
+			rasterDesc.CullMode = D3D11_CULL_NONE;
+			// Off, and it has to be off. Depth clipping discards anything
+			// outside 0 <= z <= w, and a first-person optic sits close enough
+			// to the camera that a high sighted FOV multiplier pushes the lens
+			// plane across the near plane. Fallout's own weapon pass survives
+			// that because first-person geometry is not rendered under the
+			// world's depth range; the composite replays the same vertices
+			// through the same vertex shader, so inheriting a stricter clip
+			// than the original draw threw the entire optic away.
+			//
+			// Symptom when this was TRUE: the replay reported drawing every
+			// frame with correct activation and magnification, and changed
+			// zero pixels anywhere in the lens -- at fovMult 2.5 but not at
+			// 1.0, which is what identified it. Nothing here needs the clip:
+			// depth testing is disabled and no depth-stencil view is bound at
+			// either anchor, so z carries no occlusion meaning at all.
+			rasterDesc.DepthClipEnable = FALSE;
+			rasterDesc.ScissorEnable = FALSE;
+			if (SUCCEEDED(g_Device->CreateRasterizerState(
+					&rasterDesc,
+					mCompositeRasterizerState.ReleaseAndGetAddressOf()))) {
+				mCompositeRasterizerDevice = g_Device;
+			} else {
+				mCompositeRasterizerState.Reset();
+			}
+		}
+		if (mCompositeRasterizerState.Get()) {
+			g_Context->RSSetState(mCompositeRasterizerState.Get());
 		}
 		// 复制资源（关键修复点）
 		// 设置着色器
@@ -3985,6 +5467,43 @@ namespace Hook
 							std::memory_order_acquire)) {
 						return false;
 					}
+
+					// Permanent, not transient: this scope ships no authored
+					// ScopeFade. Rather than hand over to the flat
+					// screen-space circle, generate a ScopeFade-equivalent
+					// ring at the selected mesh's measured vertex radius and
+					// run the identical fill and magnify shaders over it. The
+					// screen-space path remains behind it for the cases the
+					// synthesized ring cannot cover -- no readable CPU vertex
+					// copy, a degenerate transform, resources that failed to
+					// build -- each of which leaves the ring invalid rather
+					// than wrong.
+					if (MagnaScope::GetSettings().AllowsSynthesizedAperture()) {
+						ID3D11RenderTargetView* const synthesizedTarget =
+							renderedAtTAAThisFrame ?
+								nullptr :
+								m_pRenderTargetView.Get();
+						if (DrawSynthesizedAperture(
+								nullptr,
+								synthesizedTarget)) {
+							// Best effort. A scope with no ScopeFade has no
+							// suppressed authored reticle to restore either,
+							// so a missing layer here is not a failure the way
+							// it is on the exact path.
+							(void)CompositeAutomaticSTSReticleLayer(
+								synthesizedTarget);
+							static std::once_flag loggedSynthesizedAperture;
+							std::call_once(loggedSynthesizedAperture, [] {
+								logger::info(
+									"Selected aperture cannot drive the exact "
+									"replay; magnifying through a synthesized "
+									"ScopeFade-equivalent ring at the measured "
+									"radius instead");
+							});
+							return true;
+						}
+					}
+
 					static std::once_flag loggedScreenSpaceFallback;
 					std::call_once(loggedScreenSpaceFallback, [] {
 						logger::info(
@@ -4258,8 +5777,49 @@ namespace Hook
 		if (!original || !pContext) {
 			return;
 		}
+		HangDiag::dispatchTicks.fetch_add(1U, std::memory_order_relaxed);
 		if (bSelfDraw) {
 			return original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+		}
+		// Hooking every implementation of the draw entry means a wrapper that
+		// forwards into another hooked implementation runs two of our detours
+		// for one game draw. Telemetry confirmed a chain depth of two the
+		// moment the ShaderEngineCL wrapper was bound alongside d3d11's own
+		// function.
+		//
+		// Only the outermost entry may process the draw, and this is a
+		// correctness requirement rather than a tidiness one. The classifier
+		// takes mScopeFadeGeometryMutex around a matched aperture draw, that
+		// mutex is deliberately non-recursive -- see the comment above
+		// CaptureAutomaticSTSScopeFadeReplay -- and a nested detour reaching it
+		// a second time on the same thread deadlocks the render thread
+		// outright. Everything downstream stops, which is what a hang after a
+		// save-game load with a scope drawn looks like.
+		//
+		// The inner entry is the same draw with the same context state, so
+		// forwarding it untouched loses nothing. It also un-inflates every
+		// per-frame draw count, which had been reading roughly double.
+		thread_local unsigned int dispatchDepth = 0U;
+		struct DepthGuard
+		{
+			unsigned int& depth;
+			explicit DepthGuard(unsigned int& d) : depth(++d) {}
+			~DepthGuard() { --depth; }
+		} const depthGuard(dispatchDepth);
+		if (dispatchDepth > 1U) {
+			static std::once_flag loggedNestedDispatch;
+			std::call_once(loggedNestedDispatch, [&] {
+				logger::warn(
+					"One draw entered {} of our DrawIndexed detours in a chain; "
+					"only the outermost processes it and the inner ones forward "
+					"untouched",
+					dispatchDepth);
+			});
+			return original(
+				pContext,
+				IndexCount,
+				StartIndexLocation,
+				BaseVertexLocation);
 		}
 		if (MagnaScope::GetSettings().AllowsWorldColorCapture()) {
 			(void)MagnaScope::WorldOnlyScopeRenderer::GetSingleton()
@@ -4623,8 +6183,9 @@ namespace Hook
 					// transaction. This prevents a concurrent wrapped
 					// DrawIndexed call from replacing device children while
 					// this context still has them bound.
-					std::scoped_lock geometryLock(
-						D3DInstance->mScopeFadeGeometryMutex);
+					HangDiag::TrackedGeometryLock geometryLock(
+						D3DInstance->mScopeFadeGeometryMutex,
+						1);
 					automaticSTSScopeFadeDrawsThisFrame.fetch_add(
 						1U,
 						std::memory_order_relaxed);
@@ -4788,6 +6349,113 @@ namespace Hook
 				}
 			}
 
+			// The synthesis placement watch. This deliberately sits OUTSIDE
+			// the geometry-ready gate above: a scope without an authored
+			// ScopeFade publishes no draw identity, so that gate is closed on
+			// exactly the scopes the synthesized aperture exists for -- which
+			// is why the first in-gate version of this match never fired and
+			// every such scope fell back to the CPU-projected ring.
+			//
+			// The outcome differs from the ScopeFade match in kind: the draw
+			// is only observed, never suppressed and never replayed. Its
+			// pipeline state is what places the synthesized ring through the
+			// game's own vertex shader; the mesh itself keeps rendering
+			// normally below.
+			if (verification.AllowsGeometryMagnification() &&
+				MagnaScope::GetSettings().AllowsSynthesizedAperture() &&
+				D3DInstance->m_pGeometryShader_STSGeometryFill.Get() &&
+				D3DInstance->m_pPixelShader_STSGeometryMagnify.Get()) {
+				const auto placementVB = synthPlacementVertexBuffer.load(
+					std::memory_order_relaxed);
+				if (placementVB != 0U &&
+					IndexCount ==
+						synthPlacementIndexCount.load(
+							std::memory_order_relaxed)) {
+					ComPtr<ID3D11Buffer> placementVertexBuffer;
+					ComPtr<ID3D11Buffer> placementIndexBuffer;
+					UINT placementStride = 0;
+					UINT placementVertexOffset = 0;
+					DXGI_FORMAT placementIndexFormat = DXGI_FORMAT_UNKNOWN;
+					UINT placementIndexOffset = 0;
+					pContext->IAGetVertexBuffers(
+						0,
+						1,
+						placementVertexBuffer.GetAddressOf(),
+						&placementStride,
+						&placementVertexOffset);
+					pContext->IAGetIndexBuffer(
+						placementIndexBuffer.GetAddressOf(),
+						&placementIndexFormat,
+						&placementIndexOffset);
+					const bool placementIdentityMatch =
+						reinterpret_cast<std::uintptr_t>(
+							placementVertexBuffer.Get()) == placementVB &&
+						reinterpret_cast<std::uintptr_t>(
+							placementIndexBuffer.Get()) ==
+							synthPlacementIndexBuffer.load(
+								std::memory_order_relaxed) &&
+						placementStride ==
+							synthPlacementVertexStride.load(
+								std::memory_order_relaxed);
+					if (placementIdentityMatch) {
+						const auto expectedPlacementVertexOffset =
+							synthPlacementVertexDataOffset.load(
+								std::memory_order_relaxed);
+						const auto expectedPlacementIndexOffset =
+							synthPlacementIndexDataOffset.load(
+								std::memory_order_relaxed);
+						const std::int64_t effectivePlacementVertexOffset =
+							static_cast<std::int64_t>(placementVertexOffset) +
+							static_cast<std::int64_t>(BaseVertexLocation) *
+								static_cast<std::int64_t>(placementStride);
+						const bool placementKnownIndexFormat =
+							placementIndexFormat == DXGI_FORMAT_R16_UINT ||
+							placementIndexFormat == DXGI_FORMAT_R32_UINT;
+						const std::uint32_t placementIndexElementSize =
+							placementIndexFormat == DXGI_FORMAT_R32_UINT ? 4U :
+							                                               2U;
+						const std::uint64_t effectivePlacementIndexOffset =
+							static_cast<std::uint64_t>(placementIndexOffset) +
+							static_cast<std::uint64_t>(StartIndexLocation) *
+								placementIndexElementSize;
+						const bool placementSuballocationMatch =
+							placementKnownIndexFormat &&
+							(placementVertexOffset ==
+									expectedPlacementVertexOffset ||
+								effectivePlacementVertexOffset ==
+									static_cast<std::int64_t>(
+										expectedPlacementVertexOffset)) &&
+							(placementIndexOffset ==
+									expectedPlacementIndexOffset ||
+								effectivePlacementIndexOffset ==
+									expectedPlacementIndexOffset);
+						if (placementSuballocationMatch) {
+							HangDiag::TrackedGeometryLock placementLock(
+								D3DInstance->mScopeFadeGeometryMutex,
+								5);
+							const bool placementCaptured =
+								D3DInstance->CaptureSynthesisPlacementLocked(
+									pContext);
+							if (placementCaptured) {
+								automaticSTSPlacementDrawsThisFrame.fetch_add(
+									1U,
+									std::memory_order_relaxed);
+							}
+							static std::once_flag loggedPlacementCapture;
+							std::call_once(
+								loggedPlacementCapture,
+								[placementCaptured] {
+									logger::info(
+										"Synthesis placement draw matched; "
+										"capture {}",
+										placementCaptured ? "succeeded" :
+										                    "failed");
+								});
+						}
+					}
+				}
+			}
+
 			// STS owns its 3D reticle. Suppressing the inherited MagnaScope
 			// fingerprinted draw here would make the reticle disappear in
 			// automatic mode.
@@ -4818,7 +6486,9 @@ namespace Hook
 
 			pContext->PSGetShaderResources(0, 1, DrawIndexedSRV.ReleaseAndGetAddressOf());
 
-			if (!DrawIndexedSRV.Get() || !oldFuncs.phookD3D11DrawIndexed) {
+			// `original` is the trampoline for whichever implementation this
+			// detour was entered through and is already known non-null.
+			if (!DrawIndexedSRV.Get()) {
 				original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
 				return;
 			}
@@ -4865,35 +6535,46 @@ namespace Hook
 		return original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
 	}
 
-	// Two detours per draw entry, one per hooked target. MinHook hands each
-	// target its own trampoline and a shared detour has no way to tell which
-	// one it was entered through, so the pairing has to be static.
-	void __stdcall D3D::DrawIndexedHook(
+	// One detour per hooked target. MinHook hands each target its own
+	// trampoline and a shared detour has no way to tell which one it was
+	// entered through, so the pairing has to be static -- hence a template on
+	// the slot index rather than a runtime lookup.
+	template <std::size_t Slot>
+	void __stdcall D3D::DrawIndexedSlotHook(
 		ID3D11DeviceContext* pContext,
 		UINT IndexCount,
 		UINT StartIndexLocation,
 		INT BaseVertexLocation)
 	{
+		static_assert(Slot < kDrawHookSlots);
 		DrawIndexedDispatch(
 			pContext,
 			IndexCount,
 			StartIndexLocation,
 			BaseVertexLocation,
-			oldFuncs.phookD3D11DrawIndexed);
+			oldFuncs.drawIndexedSlots[Slot]);
 	}
 
-	void __stdcall D3D::DrawIndexedHookAlternate(
-		ID3D11DeviceContext* pContext,
-		UINT IndexCount,
-		UINT StartIndexLocation,
-		INT BaseVertexLocation)
+	void* const* D3D::DrawIndexedDetourSlots()
 	{
-		DrawIndexedDispatch(
-			pContext,
-			IndexCount,
-			StartIndexLocation,
-			BaseVertexLocation,
-			oldFuncs.phookD3D11DrawIndexedAlternate);
+		// Written out rather than generated so that the addresses taken here
+		// are exactly the ones the binder installs. The static_assert is what
+		// keeps this list honest if kDrawHookSlots changes.
+		static void* const detours[]{
+			reinterpret_cast<void*>(&D3D::DrawIndexedSlotHook<0>),
+			reinterpret_cast<void*>(&D3D::DrawIndexedSlotHook<1>),
+			reinterpret_cast<void*>(&D3D::DrawIndexedSlotHook<2>),
+			reinterpret_cast<void*>(&D3D::DrawIndexedSlotHook<3>),
+			reinterpret_cast<void*>(&D3D::DrawIndexedSlotHook<4>),
+			reinterpret_cast<void*>(&D3D::DrawIndexedSlotHook<5>),
+		};
+		static_assert(std::size(detours) == kDrawHookSlots);
+		return detours;
+	}
+
+	void** D3D::DrawIndexedOriginalSlots()
+	{
+		return reinterpret_cast<void**>(oldFuncs.drawIndexedSlots.data());
 	}
 
 	void D3D::DrawIndexedInstancedDispatch(
@@ -4921,6 +6602,21 @@ namespace Hook
 				StartInstanceLocation);
 		};
 		if (bSelfDraw) {
+			callOriginal();
+			return;
+		}
+		// Same chain rule as DrawIndexedDispatch, and for the same reason: this
+		// path reaches the classifier that takes the non-recursive
+		// mScopeFadeGeometryMutex, so a nested detour must never process the
+		// draw a second time on the same thread.
+		thread_local unsigned int instancedDispatchDepth = 0U;
+		struct InstancedDepthGuard
+		{
+			unsigned int& depth;
+			explicit InstancedDepthGuard(unsigned int& d) : depth(++d) {}
+			~InstancedDepthGuard() { --depth; }
+		} const instancedDepthGuard(instancedDispatchDepth);
+		if (instancedDispatchDepth > 1U) {
 			callOriginal();
 			return;
 		}
@@ -5165,7 +6861,8 @@ namespace Hook
 		callOriginal();
 	}
 
-	void __stdcall D3D::DrawIndexedInstancedHook(
+	template <std::size_t Slot>
+	void __stdcall D3D::DrawIndexedInstancedSlotHook(
 		ID3D11DeviceContext* pContext,
 		UINT IndexCountPerInstance,
 		UINT InstanceCount,
@@ -5173,6 +6870,7 @@ namespace Hook
 		INT BaseVertexLocation,
 		UINT StartInstanceLocation)
 	{
+		static_assert(Slot < kDrawHookSlots);
 		DrawIndexedInstancedDispatch(
 			pContext,
 			IndexCountPerInstance,
@@ -5180,25 +6878,26 @@ namespace Hook
 			StartIndexLocation,
 			BaseVertexLocation,
 			StartInstanceLocation,
-			oldFuncs.phookD3D11DrawIndexedInstanced);
+			oldFuncs.drawIndexedInstancedSlots[Slot]);
 	}
 
-	void __stdcall D3D::DrawIndexedInstancedHookAlternate(
-		ID3D11DeviceContext* pContext,
-		UINT IndexCountPerInstance,
-		UINT InstanceCount,
-		UINT StartIndexLocation,
-		INT BaseVertexLocation,
-		UINT StartInstanceLocation)
+	void* const* D3D::DrawIndexedInstancedDetourSlots()
 	{
-		DrawIndexedInstancedDispatch(
-			pContext,
-			IndexCountPerInstance,
-			InstanceCount,
-			StartIndexLocation,
-			BaseVertexLocation,
-			StartInstanceLocation,
-			oldFuncs.phookD3D11DrawIndexedInstancedAlternate);
+		static void* const detours[]{
+			reinterpret_cast<void*>(&D3D::DrawIndexedInstancedSlotHook<0>),
+			reinterpret_cast<void*>(&D3D::DrawIndexedInstancedSlotHook<1>),
+			reinterpret_cast<void*>(&D3D::DrawIndexedInstancedSlotHook<2>),
+			reinterpret_cast<void*>(&D3D::DrawIndexedInstancedSlotHook<3>),
+			reinterpret_cast<void*>(&D3D::DrawIndexedInstancedSlotHook<4>),
+			reinterpret_cast<void*>(&D3D::DrawIndexedInstancedSlotHook<5>),
+		};
+		static_assert(std::size(detours) == kDrawHookSlots);
+		return detours;
+	}
+
+	void** D3D::DrawIndexedInstancedOriginalSlots()
+	{
+		return reinterpret_cast<void**>(oldFuncs.drawIndexedInstancedSlots.data());
 	}
 
 	bool D3D::CaptureVerificationSource(
@@ -5924,6 +7623,15 @@ namespace Hook
 		projectedLensBasisZY.store(
 			physicalEyeBox.lensBasisZY,
 			std::memory_order_relaxed);
+		projectedAimLensX.store(
+			physicalEyeBox.aimLensX,
+			std::memory_order_relaxed);
+		projectedAimLensY.store(
+			physicalEyeBox.aimLensY,
+			std::memory_order_relaxed);
+		projectedAimLensValid.store(
+			physicalEyeBox.aimLensValid,
+			std::memory_order_relaxed);
 		projectedPhysicalEyeBoxBlend.store(
 			std::clamp(physicalEyeBox.blend, 0.0F, 1.0F),
 			std::memory_order_relaxed);
@@ -6002,6 +7710,12 @@ namespace Hook
 				projectedLensBasisZX.load(std::memory_order_relaxed);
 			result.lensBasisZY =
 				projectedLensBasisZY.load(std::memory_order_relaxed);
+			result.aimLensX =
+				projectedAimLensX.load(std::memory_order_relaxed);
+			result.aimLensY =
+				projectedAimLensY.load(std::memory_order_relaxed);
+			result.aimLensValid =
+				projectedAimLensValid.load(std::memory_order_relaxed);
 			result.physicalEyeBoxBlend =
 				projectedPhysicalEyeBoxBlend.load(
 					std::memory_order_relaxed);
@@ -6451,6 +8165,10 @@ namespace Hook
 		if (!oldFuncs.phookD3D11Present) {
 			return DXGI_ERROR_INVALID_CALL;
 		}
+		HangDiag::presentTicks.fetch_add(1U, std::memory_order_relaxed);
+		const HangDiag::PhaseScope presentPhaseScope(
+			HangDiag::presentPhase,
+			1);
 		bSelfDraw = false;
 		lastPresentedSwapChain.store(pSwapChain, std::memory_order_release);
 
@@ -6466,25 +8184,31 @@ namespace Hook
 				BindDrawHookTarget(
 					contextVTable,
 					12U,
-					reinterpret_cast<void*>(DrawIndexedHook),
-					reinterpret_cast<void**>(&oldFuncs.phookD3D11DrawIndexed),
-					reinterpret_cast<void*>(DrawIndexedHookAlternate),
-					reinterpret_cast<void**>(
-						&oldFuncs.phookD3D11DrawIndexedAlternate),
+					DrawIndexedDetourSlots(),
+					DrawIndexedOriginalSlots(),
 					g_drawIndexedBinding,
 					"DrawIndexedHook");
 				BindDrawHookTarget(
 					contextVTable,
 					20U,
-					reinterpret_cast<void*>(DrawIndexedInstancedHook),
-					reinterpret_cast<void**>(
-						&oldFuncs.phookD3D11DrawIndexedInstanced),
-					reinterpret_cast<void*>(DrawIndexedInstancedHookAlternate),
-					reinterpret_cast<void**>(
-						&oldFuncs.phookD3D11DrawIndexedInstancedAlternate),
+					DrawIndexedInstancedDetourSlots(),
+					DrawIndexedInstancedOriginalSlots(),
 					g_drawIndexedInstancedBinding,
 					"DrawIndexedInstancedHook");
 			}
+		}
+
+		// Outside the geometry-ready gate below, deliberately: a scope with no
+		// authored ScopeFade publishes no draw identity, so that gate is shut
+		// on exactly the scopes the synthesized aperture serves.
+		{
+			const auto placementDraws =
+				automaticSTSPlacementDrawsThisFrame.exchange(
+					0U,
+					std::memory_order_acq_rel);
+			automaticSTSPlacementVisibleLastFrame.store(
+				placementDraws > 0U,
+				std::memory_order_release);
 		}
 
 		const auto& verification = MagnaScope::GetSettings();
@@ -6515,10 +8239,10 @@ namespace Hook
 					std::memory_order_acq_rel);
 
 			// A frame with the weapon drawn issues thousands of indexed draws.
-			// Seeing a couple of dozen means neither of our detours is in the
+			// Seeing a couple of dozen means none of our detours is in the
 			// chain -- not that the gate closed, which the gated/observed pair
-			// already rules out. Report both hooked implementations against
-			// what the vtable holds now, with owning modules, so a third
+			// already rules out. Report every hooked implementation against
+			// what the vtable holds now, with owning modules, so an unhooked
 			// implementation or a failed bind is visible rather than inferred.
 			static std::atomic_uint32_t loggedBypassFrames{ 0U };
 			if (observedDraws + observedInstancedDraws < 64U &&
@@ -6531,17 +8255,13 @@ namespace Hook
 					reinterpret_cast<void*>(g_deviceContextVTable[20]);
 				logger::warn(
 					"Draw hook appears bypassed: observed DI:{} DII:{} this "
-					"frame. DrawIndexed hooked {} and {}, vtable now {}; "
-					"DrawIndexedInstanced hooked {} and {}, vtable now {}",
+					"frame. DrawIndexed hooked [{}], vtable now {}; "
+					"DrawIndexedInstanced hooked [{}], vtable now {}",
 					observedDraws,
 					observedInstancedDraws,
-					DescribeCodeAddress(g_drawIndexedBinding.primaryTarget),
-					DescribeCodeAddress(g_drawIndexedBinding.alternateTarget),
+					DescribeDrawHookBinding(g_drawIndexedBinding),
 					DescribeCodeAddress(currentDrawIndexed),
-					DescribeCodeAddress(
-						g_drawIndexedInstancedBinding.primaryTarget),
-					DescribeCodeAddress(
-						g_drawIndexedInstancedBinding.alternateTarget),
+					DescribeDrawHookBinding(g_drawIndexedInstancedBinding),
 					DescribeCodeAddress(currentDrawIndexedInstanced));
 			}
 			const auto reticleDraws =
@@ -6696,12 +8416,19 @@ namespace Hook
 		// composite now. The shared guard also prevents a double draw no
 		// matter which Present hook is outermost.
 		if (D3D::isEnableRender && !renderPassHandledThisFrame) {
+			const HangDiag::PhaseScope compositePhase(
+				HangDiag::presentPhase,
+				3);
 			D3DInstance->Render();
 			compositedThisFrame = lastRenderProducedComposite;
 		}
 
-		const auto result =
-			oldFuncs.phookD3D11Present(pSwapChain, SyncInterval, Flags);
+		const auto result = [&] {
+			const HangDiag::PhaseScope originalPresentPhase(
+				HangDiag::presentPhase,
+				9);
+			return oldFuncs.phookD3D11Present(pSwapChain, SyncInterval, Flags);
+		}();
 		// The next game frame must earn exact-geometry authority again. Do not
 		// let a successful ScopeFade replacement suppress a later frame whose
 		// draw is absent or arrives through DrawIndexedInstanced.
@@ -6977,6 +8704,8 @@ namespace Hook
 		// reference count or forcing it to initialize out of order.
 		upscalerMod = DetectUpscalerOrFrameGeneration();
 
+		HangDiag::ArmWatchdog();
+
 		logger::info("HookDX11_Init");
 
 		const auto* rendererData = RE::BSGraphics::GetRendererData();
@@ -7019,15 +8748,15 @@ namespace Hook
 		}
 
 		// 批量创建钩子
+		//
+		// The swap-chain entries have exactly one implementation each and can be
+		// hooked outright. The device-context draw entries cannot -- see
+		// BindDrawHookTarget -- so they go through the same slot table the
+		// per-frame check uses, which is also what serialises this thread
+		// against the Present that is already running by the time we get here.
 		const std::pair<DWORD_PTR*, HookInfo> hooks[] = {
 			{ pSwapChainVTable, HookInfo{ 8, reinterpret_cast<void*>(PresentHook), reinterpret_cast<void**>(&oldFuncs.phookD3D11Present), "PresentHook" } },
 			{ pSwapChainVTable, HookInfo{ 13, reinterpret_cast<void*>(ResizeBuffersHook), reinterpret_cast<void**>(&oldFuncs.resizeBuffers), "ResizeBuffersHook" } },
-			{ pDeviceContextVTable, HookInfo{ 12, reinterpret_cast<void*>(DrawIndexedHook), reinterpret_cast<void**>(&oldFuncs.phookD3D11DrawIndexed), "DrawIndexedHook" } },
-			// Windows SDK d3d11.h declares DrawIndexedInstanced at
-			// ID3D11DeviceContext vtable slot 20. This diagnostic hook only
-			// counts exact published STS identities and always forwards the
-			// original draw unchanged.
-			{ pDeviceContextVTable, HookInfo{ 20, reinterpret_cast<void*>(DrawIndexedInstancedHook), reinterpret_cast<void**>(&oldFuncs.phookD3D11DrawIndexedInstanced), "DrawIndexedInstancedHook" } },
 		};
 
 		// Which vtable we read matters as much as which slot. A wrapped device
@@ -7041,30 +8770,29 @@ namespace Hook
 			reinterpret_cast<void*>(pDeviceContextVTable[12]),
 			reinterpret_cast<void*>(pDeviceContextVTable[20]));
 
-		// Record the address each hook actually took, not a re-read afterwards.
-		// The slot can move while MinHook is working -- MH_CreateHook takes
-		// over a hundred milliseconds -- and re-reading would store the value
-		// it moved to as though we had hooked it, leaving the per-frame check
-		// satisfied by a hook that is never called. The other implementation is
-		// picked up by the first Present that sees it.
 		for (const auto& [vtable, info] : hooks) {
 			void* const target = reinterpret_cast<void*>(vtable[info.index]);
-			if (!CreateAndEnableHook(
-					target,
-					info.hook,
-					info.original,
-					info.name)) {
-				continue;
-			}
-			if (vtable != pDeviceContextVTable) {
-				continue;
-			}
-			if (info.index == 12) {
-				g_drawIndexedBinding.primaryTarget = target;
-			} else if (info.index == 20) {
-				g_drawIndexedInstancedBinding.primaryTarget = target;
-			}
+			(void)CreateAndEnableHook(target, info.hook, info.original, info.name);
 		}
+
+		BindDrawHookTarget(
+			pDeviceContextVTable,
+			12U,
+			DrawIndexedDetourSlots(),
+			DrawIndexedOriginalSlots(),
+			g_drawIndexedBinding,
+			"DrawIndexedHook");
+		// Windows SDK d3d11.h declares DrawIndexedInstanced at
+		// ID3D11DeviceContext vtable slot 20. This diagnostic hook only counts
+		// exact published STS identities and always forwards the original draw
+		// unchanged.
+		BindDrawHookTarget(
+			pDeviceContextVTable,
+			20U,
+			DrawIndexedInstancedDetourSlots(),
+			DrawIndexedInstancedOriginalSlots(),
+			g_drawIndexedInstancedBinding,
+			"DrawIndexedInstancedHook");
 
 		if (MagnaScope::GetSettings().AllowsTAACapture() &&
 			!InstallGuardedTAAHook()) {
@@ -7145,10 +8873,19 @@ namespace Hook
 	std::atomic<float> D3D::projectedLensBasisXY = 0.0F;
 	std::atomic<float> D3D::projectedLensBasisZX = 0.0F;
 	std::atomic<float> D3D::projectedLensBasisZY = 0.0F;
+	std::atomic<float> D3D::projectedAimLensX = 0.0F;
+	std::atomic<float> D3D::projectedAimLensY = 0.0F;
+	std::atomic_bool D3D::projectedAimLensValid = false;
 	std::atomic<float> D3D::projectedPhysicalEyeBoxBlend = 0.0F;
 	std::atomic_bool D3D::projectedPhysicalEyeBoxReady = false;
 	std::atomic_bool D3D::projectedTrackingReady = false;
 	std::atomic_uint64_t D3D::projectedLensSequence = 0U;
+	std::atomic<std::uintptr_t> D3D::synthPlacementVertexBuffer = 0;
+	std::atomic<std::uintptr_t> D3D::synthPlacementIndexBuffer = 0;
+	std::atomic_uint32_t D3D::synthPlacementIndexCount = 0;
+	std::atomic_uint32_t D3D::synthPlacementVertexStride = 0;
+	std::atomic_uint32_t D3D::synthPlacementVertexDataOffset = 0;
+	std::atomic_uint32_t D3D::synthPlacementIndexDataOffset = 0;
 	std::atomic<std::uintptr_t> D3D::automaticSTSVertexBuffer = 0;
 	std::atomic<std::uintptr_t> D3D::automaticSTSIndexBuffer = 0;
 	std::atomic_uint32_t D3D::automaticSTSIndexCount = 0;
@@ -7182,6 +8919,8 @@ namespace Hook
 	std::atomic_bool D3D::automaticSTSHousingGeometryReady = false;
 	std::atomic_uint32_t D3D::automaticSTSScopeFadeDrawsThisFrame = 0;
 	std::atomic_bool D3D::automaticSTSScopeFadeVisibleLastFrame = false;
+	std::atomic_uint32_t D3D::automaticSTSPlacementDrawsThisFrame = 0;
+	std::atomic_bool D3D::automaticSTSPlacementVisibleLastFrame = false;
 	std::atomic_uint32_t D3D::automaticSTSReticleDrawsThisFrame = 0;
 	std::atomic_uint32_t D3D::automaticSTSHousingDrawsThisFrame = 0;
 	std::atomic_uint32_t

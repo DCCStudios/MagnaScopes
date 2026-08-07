@@ -45,6 +45,43 @@ namespace Hook
 		LPCSTR shaderModel,
 		ID3DBlob** ppBlobOut);
 
+	// Breadcrumbs for the save-load hang. The log ends mid-frame with no
+	// error on every occurrence, which identifies nothing; these atomics are
+	// written at the suspect points and a watchdog thread reports where
+	// everything stopped, through a raw file handle so a wedged logger cannot
+	// swallow the report. Diagnostic only -- nothing reads these for logic.
+	namespace HangDiag
+	{
+		extern std::atomic<std::uint64_t> presentTicks;
+		extern std::atomic<std::uint64_t> updateTicks;
+		extern std::atomic<std::uint64_t> dispatchTicks;
+		// See kPresentPhaseNames / kUpdatePhaseNames in hooking.cpp.
+		extern std::atomic<int> presentPhase;
+		extern std::atomic<int> updatePhase;
+		// Which call site is waiting on / holding mScopeFadeGeometryMutex,
+		// and from which thread. 0 means none.
+		extern std::atomic<int> geometryWaitSite;
+		extern std::atomic<std::uint32_t> geometryWaitThread;
+		extern std::atomic<int> geometryHoldSite;
+		extern std::atomic<std::uint32_t> geometryHoldThread;
+		extern std::atomic<int> ringWaitSite;
+		extern std::atomic<std::uint32_t> ringWaitThread;
+		extern std::atomic<int> ringHoldSite;
+		extern std::atomic<std::uint32_t> ringHoldThread;
+		// The last render-side phase MagnaScope entered, when it entered and
+		// left, and on which thread. presentPhase alone reports "idle", which
+		// is true of a hang that began in our code a millisecond after we
+		// returned and equally true of one that began a minute later with no
+		// involvement from us. Only the timestamps separate those, and that
+		// distinction is the whole question in a hang where MagnaScope appears
+		// on no thread's call stack.
+		extern std::atomic<int> lastRenderPhase;
+		extern std::atomic<std::uint64_t> lastRenderPhaseEnterMs;
+		extern std::atomic<std::uint64_t> lastRenderPhaseLeaveMs;
+		extern std::atomic<std::uint32_t> lastRenderPhaseThread;
+		void ArmWatchdog();
+	}
+
 	using namespace DirectX;
 
 	class D3D
@@ -279,6 +316,23 @@ namespace Hook
 			float lensBasisXY = 0.0F;
 			float lensBasisZX = 0.0F;
 			float lensBasisZY = 0.0F;
+			// The authored aim point in ScopeFade lens coordinates, where 1.0
+			// is the outer rim -- the same unit ScopeGeometryFill_GS assigns to
+			// the annulus, and the unit the magnify shader's pivot expects.
+			//
+			// Solved on the game thread in the aperture's own local frame. It
+			// used to be recovered here instead, by inverting the basis above,
+			// and that basis is not conditioned for inversion: its two columns
+			// foreshorten by different amounts as the optic turns and its
+			// determinant passes through zero. A measured 39-pixel
+			// reticle-to-centre delta came out as 1.2 aperture radii on one
+			// frame and 6.6 on another, which pinned the magnification pivot at
+			// the rim and flipped it side to side as the player panned. The
+			// aperture's local frame is orthonormal up to scale whatever the
+			// camera is doing, so it has no such degeneracy.
+			float aimLensX = 0.0F;
+			float aimLensY = 0.0F;
+			bool aimLensValid = false;
 			// Continuous [0,1] weight used to form the physical shadow without
 			// a one-frame pop when ADS calibration becomes usable.
 			float physicalEyeBoxBlend = 0.0F;
@@ -295,6 +349,11 @@ namespace Hook
 			float lensBasisXY = 0.0F;
 			float lensBasisZX = 0.0F;
 			float lensBasisZY = 0.0F;
+			// The authored aim point in lens coordinates, rim == 1.0. See
+			// LensProjectionSnapshot::aimLensX.
+			float aimLensX = 0.0F;
+			float aimLensY = 0.0F;
+			bool aimLensValid = false;
 			float blend = 0.0F;
 			// Diagnostic only: magnitude of this frame's aperture screen
 			// excursion, so a log line shows how much of the published travel
@@ -315,7 +374,101 @@ namespace Hook
 			bool valid = false;
 		};
 
+		// A ScopeFade-equivalent aperture generated for a scope that ships no
+		// authored ScopeFade, sized from the selected mesh's measured vertex
+		// radius and placed on its transform.
+		//
+		// It is deliberately generated in ScopeFade's own topology -- 24
+		// segments, an outer ring and an inner ring at exactly half radius --
+		// so that ScopeGeometryFill_GS and ScopeGeometryMagnify_PS consume it
+		// completely unchanged. A synthesized aperture then looks the same as
+		// an authored one by construction rather than by matching two separate
+		// implementations against each other.
+		//
+		// Stored as NDC plus the perspective W each point was divided by. The
+		// render thread rebuilds true clip-space positions from that, which is
+		// what gives the magnify shader a genuine per-vertex 1/w for its
+		// projective centre solve. NDC rather than pixels because the
+		// composite may run at a different resolution than the projection.
+		static constexpr std::size_t kSynthApertureSegments = 24U;
+		// 24 outer then 24 inner, and 48 triangles of three indices -- the
+		// exact counts of an authored ScopeFade, because it is the same mesh.
+		static constexpr std::size_t kSynthApertureVertexCount =
+			kSynthApertureSegments * 2U;
+		static constexpr std::size_t kSynthApertureIndexCount =
+			kSynthApertureSegments * 6U;
+		// The game-format vertex the captured placement path feeds to the
+		// game's own vertex shader: half4 position, half2 UV, 4-byte normal,
+		// 4-byte tangent. Every candidate mesh measured so far shares this
+		// exact 20-byte layout (vertexDesc 0x0001B00000430205).
+		static constexpr std::size_t kSynthApertureGameVertexStride = 20U;
+		struct SynthesizedApertureRing
+		{
+			bool valid = false;
+			float centerNdcX = 0.0F;
+			float centerNdcY = 0.0F;
+			float centerW = 0.0F;
+			float rimNdcX[kSynthApertureSegments]{};
+			float rimNdcY[kSynthApertureSegments]{};
+			float rimW[kSynthApertureSegments]{};
+		};
+
+		// The synthesized aperture in the source mesh's own model space. The
+		// render thread turns this into a ScopeFade-shaped ring and pushes it
+		// through the pipeline state captured from that mesh's real draw, so
+		// the game's own vertex shader places it -- correct FOV,
+		// foreshortening and roll included, with nothing projected CPU-side.
+		struct SynthesizedApertureFrame
+		{
+			bool valid = false;
+			// Model space, pre-scale: the captured transform constants carry
+			// the node's world transform including scale, exactly as they did
+			// for the mesh's own vertices.
+			float centerX = 0.0F;
+			float centerY = 0.0F;
+			float centerZ = 0.0F;
+			float radius = 0.0F;
+			// 0, 1 or 2: which local axis is the optical axis.
+			int opticalAxis = 1;
+		};
+
 	public:
+		// Game thread only: reads the aperture's transform. Publishes the ring
+		// for the render thread, which never follows a scene pointer.
+		bool PublishSynthesizedApertureRing(
+			RE::NiAVObject* camera,
+			RE::NiAVObject* aperture,
+			const RE::NiPoint3& worldCenter,
+			float worldRadius,
+			int opticalAxis,
+			float fov);
+		static void InvalidateSynthesizedApertureRing() noexcept;
+		static SynthesizedApertureRing AcquireSynthesizedApertureRing() noexcept;
+		// Game thread: publish the synthesis source mesh's draw identity for
+		// the classifier plus the model-space ring frame. The mesh is never
+		// suppressed -- it is real geometry that should keep drawing; its draw
+		// is only borrowed for one frame's worth of placement state.
+		bool PublishSynthesisPlacement(
+			RE::NiAVObject* shape,
+			const RE::NiPoint3& localCenter,
+			float localRadius,
+			int opticalAxis);
+		static void InvalidateSynthesisPlacement() noexcept;
+		static SynthesizedApertureFrame AcquireSynthesizedApertureFrame() noexcept;
+		// Render thread, called by the draw classifier with
+		// mScopeFadeGeometryMutex already held: snapshot the vertex shader,
+		// input layout and transform constants of the matched placement draw.
+		bool CaptureSynthesisPlacementLocked(ID3D11DeviceContext* context);
+
+		// Published placement identity, matched the same way as the ScopeFade
+		// identity: opaque buffer pointers plus suballocation offsets.
+		static std::atomic<std::uintptr_t> synthPlacementVertexBuffer;
+		static std::atomic<std::uintptr_t> synthPlacementIndexBuffer;
+		static std::atomic_uint32_t synthPlacementIndexCount;
+		static std::atomic_uint32_t synthPlacementVertexStride;
+		static std::atomic_uint32_t synthPlacementVertexDataOffset;
+		static std::atomic_uint32_t synthPlacementIndexDataOffset;
+
 		D3D11_HOOK_API void ImplHookDX11_Init(HMODULE hModule, void* hwnd);
 		bool InstallVerificationTAAHook();
 		void EnableRender(bool flag)
@@ -384,6 +537,14 @@ namespace Hook
 			float worldRadius,
 			float fov);
 
+	public:
+		// How many distinct implementations of a single draw entry we are
+		// prepared to hook at once. This is headroom, not a measurement: one
+		// 2026-08-04 session presented three implementations of DrawIndexed
+		// and three of DrawIndexedInstanced, and the addresses differ between
+		// runs, so the arity cannot be assumed.
+		static constexpr std::size_t kDrawHookSlots = 6;
+
 	private:
 		D3D() {}
 		~D3D() {}
@@ -404,22 +565,32 @@ namespace Hook
 			UINT flags);
 		// One detour per hooked target, because MinHook gives each target its
 		// own trampoline and a shared detour cannot tell which one it was
-		// entered through. Both forward into the same dispatch.
-		static void __stdcall DrawIndexedHook(ID3D11DeviceContext* pContext, UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation);
-		static void __stdcall DrawIndexedHookAlternate(ID3D11DeviceContext* pContext, UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation);
-		static void DrawIndexedDispatch(
-			ID3D11DeviceContext* pContext,
-			UINT IndexCount,
-			UINT StartIndexLocation,
-			INT BaseVertexLocation,
-			D3D11DrawIndexedHook original);
-		static void __stdcall DrawIndexedInstancedHookAlternate(
+		// entered through. The slot index is a template parameter so the
+		// detour/trampoline pairing is fixed at compile time; every
+		// instantiation forwards into the same dispatch.
+		template <std::size_t Slot>
+		static void __stdcall DrawIndexedSlotHook(ID3D11DeviceContext* pContext, UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation);
+		template <std::size_t Slot>
+		static void __stdcall DrawIndexedInstancedSlotHook(
 			ID3D11DeviceContext* pContext,
 			UINT IndexCountPerInstance,
 			UINT InstanceCount,
 			UINT StartIndexLocation,
 			INT BaseVertexLocation,
 			UINT StartInstanceLocation);
+		// Detour addresses and trampoline storage, one entry per slot and in
+		// the same order. Handing the binder both as plain pointers keeps it a
+		// free function rather than something that has to reach into OldFuncs.
+		static void* const* DrawIndexedDetourSlots();
+		static void** DrawIndexedOriginalSlots();
+		static void* const* DrawIndexedInstancedDetourSlots();
+		static void** DrawIndexedInstancedOriginalSlots();
+		static void DrawIndexedDispatch(
+			ID3D11DeviceContext* pContext,
+			UINT IndexCount,
+			UINT StartIndexLocation,
+			INT BaseVertexLocation,
+			D3D11DrawIndexedHook original);
 		static void DrawIndexedInstancedDispatch(
 			ID3D11DeviceContext* pContext,
 			UINT IndexCountPerInstance,
@@ -428,13 +599,6 @@ namespace Hook
 			INT BaseVertexLocation,
 			UINT StartInstanceLocation,
 			D3D11DrawIndexedInstancedHook original);
-		static void __stdcall DrawIndexedInstancedHook(
-			ID3D11DeviceContext* pContext,
-			UINT IndexCountPerInstance,
-			UINT InstanceCount,
-			UINT StartIndexLocation,
-			INT BaseVertexLocation,
-			UINT StartInstanceLocation);
 		static bool CreateAndEnableHook(void* target, void* hook, void** original, const char* hookName);
 
 		DWORD __stdcall HookDX11_Init();
@@ -470,6 +634,13 @@ namespace Hook
 		// so increasing magnification cannot expose a depth-only weapon
 		// silhouette or unresolved deferred-lighting pixels.
 		bool ReplayAutomaticSTSScopeFade(
+			ID3D11ShaderResourceView* sceneSource,
+			ID3D11RenderTargetView* compositeTarget);
+		// The same optical draw for a scope that ships no authored ScopeFade,
+		// using a ring generated at the selected mesh's measured radius. It
+		// runs the identical fill and magnify shaders, so the result is the
+		// same optic rather than a second approximation of one.
+		bool DrawSynthesizedAperture(
 			ID3D11ShaderResourceView* sceneSource,
 			ID3D11RenderTargetView* compositeTarget);
 		// Records the exact authored STS reticle pipeline without drawing it
@@ -535,16 +706,14 @@ namespace Hook
 		{
 			D3D11PresentHook phookD3D11Present = nullptr;
 			ResizeBuffers resizeBuffers = nullptr;
-			D3D11DrawIndexedHook phookD3D11DrawIndexed = nullptr;
-			D3D11DrawIndexedInstancedHook phookD3D11DrawIndexedInstanced =
-				nullptr;
-			// Fallout's draw entry alternates between d3d11's own function and
-			// a wrapper installed by another mod, so both must stay hooked at
-			// once and each needs its own trampoline. Rebinding to whichever
-			// the vtable held cannot win a race that never stops.
-			D3D11DrawIndexedHook phookD3D11DrawIndexedAlternate = nullptr;
-			D3D11DrawIndexedInstancedHook
-				phookD3D11DrawIndexedInstancedAlternate = nullptr;
+			// Fallout's draw entries move between d3d11's own functions and
+			// wrappers other integrations install, so every implementation the
+			// slot presents stays hooked at once and each needs its own
+			// trampoline. Rebinding to whichever the vtable held cannot win a
+			// race that never stops. Index here is the detour's slot index.
+			std::array<D3D11DrawIndexedHook, kDrawHookSlots> drawIndexedSlots{};
+			std::array<D3D11DrawIndexedInstancedHook, kDrawHookSlots>
+				drawIndexedInstancedSlots{};
 		};
 
 	public:
@@ -644,6 +813,13 @@ namespace Hook
 		static std::atomic<float> projectedLensBasisXY;
 		static std::atomic<float> projectedLensBasisZX;
 		static std::atomic<float> projectedLensBasisZY;
+		// The authored aim point already expressed in ScopeFade lens
+		// coordinates, solved in the aperture's own local frame. See
+		// LensProjectionSnapshot::aimLensValid for why the basis above cannot
+		// be inverted to recover it.
+		static std::atomic<float> projectedAimLensX;
+		static std::atomic<float> projectedAimLensY;
+		static std::atomic_bool projectedAimLensValid;
 		static std::atomic<float> projectedPhysicalEyeBoxBlend;
 		static std::atomic_bool projectedPhysicalEyeBoxReady;
 		static std::atomic_bool projectedTrackingReady;
@@ -727,6 +903,12 @@ namespace Hook
 		// thread uses this previous-frame fact to begin optical blending only
 		// after the ScopeAiming branch is genuinely visible.
 		static std::atomic_bool automaticSTSScopeFadeVisibleLastFrame;
+		// The synthesized aperture's equivalent of the signal above. A matched
+		// placement draw is proof the optic rendered this frame, exactly as a
+		// matched ScopeFade draw is -- and unlike the CPU-projected ring, it
+		// does not depend on a projection that can quietly fail.
+		static std::atomic_uint32_t automaticSTSPlacementDrawsThisFrame;
+		static std::atomic_bool automaticSTSPlacementVisibleLastFrame;
 		static std::atomic_uint32_t automaticSTSReticleDrawsThisFrame;
 		static std::atomic_uint32_t automaticSTSHousingDrawsThisFrame;
 		static std::atomic_uint32_t
@@ -788,6 +970,21 @@ namespace Hook
 		ComPtr<ID3DBlob> mScopeFadeMagnifyPixelBytecode;
 		ComPtr<ID3DBlob> mScopeFadeFillGeometryBytecode;
 		ComPtr<ID3DBlob> mReticleLayerPixelBytecode;
+		// The synthesized aperture's own device children. Its vertex buffer is
+		// rewritten every composite because the ring is reprojected every
+		// frame; the index buffer never changes, because the topology it
+		// describes is ScopeFade's and that is the whole point.
+		ComPtr<ID3DBlob> mScopeApertureSynthVertexBytecode;
+		ComPtr<ID3D11VertexShader> m_pVertexShader_ApertureSynth;
+		ComPtr<ID3D11InputLayout> mApertureSynthInputLayout;
+		ComPtr<ID3D11Buffer> mApertureSynthVertexBuffer;
+		ComPtr<ID3D11Buffer> mApertureSynthIndexBuffer;
+		// The composite pass's rasterizer state, built once instead of per
+		// draw. The device it was created on is retained alongside it so an
+		// upscaler or frame-generation proxy swapping the device rebuilds it
+		// rather than binding a state that belongs to a dead device.
+		ComPtr<ID3D11RasterizerState> mCompositeRasterizerState;
+		ComPtr<ID3D11Device> mCompositeRasterizerDevice;
 		ComPtr<ID3D11Device> mScopeFadeResourceDevice;
 		std::atomic_uint64_t mScopeFadeResourceGeneration{ 1U };
 		ComPtr<ID3D11Buffer> mScopeFadeResolutionBuffer;
@@ -819,6 +1016,11 @@ namespace Hook
 			bool ready = false;
 		};
 		AutomaticSTSScopeFadeReplay mAutomaticSTSScopeFadeReplay;
+		// Placement state captured from the synthesis source mesh's own draw.
+		// Same packet shape as the ScopeFade replay, but its vertex/index
+		// buffers are unused: the synthesized ring supplies its own geometry
+		// and only borrows the shader, layout and transform constants.
+		AutomaticSTSScopeFadeReplay mAutomaticSTSPlacementReplay;
 
 		struct AutomaticSTSReticleReplay
 		{

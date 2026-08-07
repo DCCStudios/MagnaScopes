@@ -88,6 +88,11 @@ namespace ImGuiImpl
 		EditorPreviewSnapshot editorPreview{};
 		std::mutex authoredZoomMutex;
 		AuthoredZoomSnapshot authoredZoomSnapshot{};
+		// Written on the game thread while aiming, read by the editor when the
+		// user converts. Its own mutex: it updates every frame, and the
+		// authored snapshot only changes on weapon selection.
+		std::mutex apertureGeometryMutex;
+		ApertureGeometrySnapshot apertureGeometry{};
 		std::atomic<ProfileRequest> pendingProfileAction{
 			ProfileRequest::kNone
 		};
@@ -119,6 +124,18 @@ namespace ImGuiImpl
 	{
 		std::scoped_lock lock(authoredZoomMutex);
 		return authoredZoomSnapshot;
+	}
+
+	void PublishApertureGeometry(const ApertureGeometrySnapshot& geometry)
+	{
+		std::scoped_lock lock(apertureGeometryMutex);
+		apertureGeometry = geometry;
+	}
+
+	ApertureGeometrySnapshot GetApertureGeometry()
+	{
+		std::scoped_lock lock(apertureGeometryMutex);
+		return apertureGeometry;
 	}
 
 	std::mutex apertureCandidateMutex;
@@ -171,10 +188,12 @@ namespace ImGuiImpl
 		float lensOffsetY,
 		float lensScale,
 		const ScopeData::Breathing& breathing,
-		const std::string& apertureSurface)
+		const std::string& apertureSurface,
+		const std::string& reticleSurface)
 	{
 		std::scoped_lock lock(editorPreviewMutex);
 		editorPreview.apertureSurface = apertureSurface;
+		editorPreview.reticleSurface = reticleSurface;
 		editorPreview.zoomOverride = zoomOverride;
 		editorPreview.selectionRevision = selectionRevision;
 		editorPreview.magnification =
@@ -493,6 +512,7 @@ namespace ImGuiImpl
 					std::clamp(data->shaderData.parallax.tubeDepth, 0.0F, 1.0F) :
 					0.0F;
 			ins->apertureSurface_UI = data->shaderData.apertureSurface;
+			ins->reticleSurface_UI = data->shaderData.reticleSurface;
 			ins->strafeLag_UI =
 				std::isfinite(data->shaderData.parallax.strafeLag) ?
 					std::clamp(data->shaderData.parallax.strafeLag, 0.0F, 4.0F) :
@@ -654,6 +674,7 @@ namespace ImGuiImpl
 			editedProfile.shaderData.parallax.recenterSpeed =
 				std::clamp(recenterSpeed_UI, 0.1F, 10.0F);
 			editedProfile.shaderData.apertureSurface = apertureSurface_UI;
+			editedProfile.shaderData.reticleSurface = reticleSurface_UI;
 			editedProfile.shaderData.parallax.strafeLag =
 				std::clamp(strafeLag_UI, 0.0F, 4.0F);
 			editedProfile.shaderData.parallax.tubeDepth =
@@ -852,6 +873,165 @@ namespace ImGuiImpl
 			Tip("Copies the selected scope's pre-MagnaScope FOV multiplier and\n"
 				"camera X/Y/Z offset as an editable starting point. Fallout's\n"
 				"BGSZoomData has no camera rotation fields, so none are copied.");
+
+			ImGui::SameLine();
+			// The conversion repositions the eye from a measurement taken
+			// while aiming, and that measurement is specific to this weapon
+			// and attachment. Offering the button before one exists would
+			// either do half the job or reuse the previous scope's geometry,
+			// so it stays disabled until this selection has been aimed once.
+			const auto convertGeometry = GetApertureGeometry();
+			const bool convertGeometryReady =
+				convertGeometry.available &&
+				convertGeometry.selectionRevision == selectionRevision_UI;
+			if (!convertGeometryReady) {
+				ImGui::BeginDisabled();
+			}
+			if (ImGui::Button("Convert Zoom Data")) {
+				// See Through Scopes drives its apparent zoom with the sighted
+				// FOV multiplier, so the authored multiplier is already the
+				// scope's magnification expressed in the only term Fallout
+				// offered. Moving it onto the lens is a change of mechanism
+				// rather than of value: the multiplier goes to 1, leaving the
+				// surrounding view at its normal width, and the same number
+				// becomes optical magnification inside the aperture.
+				const float authoredFovMul = authoredZoom.values.fovMul;
+				Imgui_ZDO.fovMul = 1.0F;
+				Imgui_ZDO.enableZoomDateOverwrite = true;
+				// The magnification slider's own range. An authored multiplier
+				// below 1 would convert to a magnification the lens cannot
+				// express, and snapping beats writing a value the slider will
+				// not show.
+				minZoom_UI = std::clamp(authoredFovMul, 1.0F, 15.0F);
+
+				const auto& lens = convertGeometry;
+				if (lens.distance > 0.01F) {
+					// Assigned, not accumulated, and forward zeroed. cameraOffset
+					// is the camera-space vector from the first-person Camera node
+					// to the point that belongs on the view axis, so the correct
+					// value does not depend on what the authored offsets were --
+					// adding to them was the mistake behind every misaligned
+					// result so far.
+					//
+					Imgui_ZDO.x = lens.offsetFrameX;
+					Imgui_ZDO.z = lens.offsetFrameZ;
+
+					// Forward compensates for the apparent size the FOV
+					// multiplier used to supply. Dropping it to 1 renders the
+					// optic m times smaller, and closing the eye to 1/m of its
+					// distance from the glass restores it.
+					//
+					// Sized against the lens, not the reticle. That is the whole
+					// difference between this and the version that put the eye
+					// inside the scope: L(1 - 1/m) < L for every m, so travel
+					// measured to the glass can never reach it, whereas the
+					// reticle sits well beyond the glass on a long optic and its
+					// distance divided by m can land in front of the objective.
+					//
+					// L comes from the weapon's Camera node, which does not move
+					// with cameraOffset -- the same property that lets the
+					// lateral terms be assigned absolutely. So with forward at
+					// zero the eye-to-lens distance is exactly L, and the offset
+					// is simply the negated travel with no dependence on the
+					// authored value.
+					float forwardTravel = 0.0F;
+					float idealTravel = 0.0F;
+					const float lensDistance = lens.apertureForwardDistance;
+					if (authoredFovMul > 1.0001F && lensDistance > 0.01F) {
+						idealTravel =
+							lensDistance * (1.0F - 1.0F / authoredFovMul);
+						// A floor anyway: the formula approaches the glass as m
+						// grows, and eye relief that collapses to nothing is its
+						// own broken sight picture before the near plane starts
+						// cutting the lens.
+						constexpr float kMinimumEyeRelief = 3.0F;
+						forwardTravel = std::min(
+							idealTravel,
+							std::max(0.0F, lensDistance - kMinimumEyeRelief));
+					}
+					// Positive is forward, toward the eyepiece.
+					//
+					// This was negated, derived from the projection's forward
+					// being -Z. The authored data says otherwise and it is the
+					// authority: See Through Scopes ships Y at +3.0 and +4.0 on
+					// the scopes measured here, and STS exists to pull the eye
+					// up to the eyepiece, not to shove it back. Negating turned
+					// an 11-unit approach into a 14-unit retreat and rendered
+					// the aperture roughly four times too small, which is the
+					// "not usable" this is fixing.
+					Imgui_ZDO.y = forwardTravel;
+					logger::info(
+						"Convert Zoom Data: fovMul {:.3f} -> 1.000, magnification "
+						"-> {:.2f}x, cameraOffset ({:.3f}, {:.3f}, {:.3f}) -> "
+						"({:.3f}, {:.3f}, {:.3f}); aim reference on the view "
+						"axis, eye-to-lens {:.2f} -> {:.2f}{}, aperture radius "
+						"{:.1f} px -> predicted {:.1f} px",
+						authoredFovMul,
+						minZoom_UI,
+						authoredZoom.values.x,
+						authoredZoom.values.y,
+						authoredZoom.values.z,
+						lens.offsetFrameX,
+						forwardTravel,
+						lens.offsetFrameZ,
+						lensDistance,
+						lensDistance - forwardTravel,
+						forwardTravel < idealTravel - 0.001F ?
+							std::format(
+								" (travel held at {:.2f} by the eye-relief floor; "
+								"matching apparent size wanted {:.2f})",
+								forwardTravel,
+								idealTravel) :
+							std::string{},
+						lens.projectedRadiusPixels,
+						lensDistance - forwardTravel > 0.01F ?
+							lens.projectedRadiusPixels *
+								(lensDistance / (lensDistance - forwardTravel)) /
+								std::max(authoredFovMul, 0.0001F) :
+							lens.projectedRadiusPixels);
+				} else {
+					Imgui_ZDO.x = authoredZoom.values.x;
+					Imgui_ZDO.y = authoredZoom.values.y;
+					Imgui_ZDO.z = authoredZoom.values.z;
+					logger::info(
+						"Convert Zoom Data: fovMul {:.3f} -> 1.000, magnification "
+						"-> {:.2f}x, camera offsets left authored (degenerate "
+						"eye-to-aim measurement)",
+						authoredFovMul,
+						minZoom_UI);
+				}
+			}
+			Tip("Moves the authored zoom onto the lens.\n"
+				"\n"
+				"Sets the FOV multiplier to 1.0x so the view around the scope\n"
+				"keeps its normal width, and transfers the authored multiplier\n"
+				"to Scope Magnification, which zooms only inside the aperture.\n"
+				"\n"
+				"The camera offsets are then set so the aim reference sits on\n"
+				"the view axis, putting the reticle at screen centre and\n"
+				"centred in the lens, and the eye is drawn forward to 1/m of\n"
+				"its distance from the lens so the optic keeps the apparent\n"
+				"size the FOV multiplier used to give it.\n"
+				"\n"
+				"Eye relief is floored, so a very high multiplier gives up some\n"
+				"apparent size rather than pressing the eye against the glass.\n"
+				"The log reports it when that happens.\n"
+				"\n"
+				"Only the reticle plane matches exactly. Widening the FOV and\n"
+				"moving the eye in is a dolly zoom, so the tube around it shows\n"
+				"more perspective than the authored view did.\n"
+				"\n"
+				"Multipliers below 1.0x clamp, since the lens cannot magnify\n"
+				"by less than one.\n"
+				"\n"
+				"Unavailable until you have aimed through this scope once.\n"
+				"Repositioning the eye needs the measured distance to the\n"
+				"aiming mark, which only exists while sighted, and a\n"
+				"measurement from a different weapon or attachment would give\n"
+				"a confidently wrong answer.");
+			if (!convertGeometryReady) {
+				ImGui::EndDisabled();
+			}
 			if (!authoredZoomMatchesSelection) {
 				ImGui::EndDisabled();
 			}
@@ -974,6 +1154,46 @@ namespace ImGuiImpl
 					"\n"
 					"A pinned shape that a weapon does not have falls back to\n"
 					"Automatic rather than disabling the scope.");
+				ImGui::Spacing();
+
+				// Same candidate list: it already enumerates every renderable
+				// shape under ScopeAiming, which is exactly the set an aiming
+				// mark can come from. The annulus/screen-space suffix is
+				// meaningless here, so it is left off.
+				std::string reticlePreview = reticleSurface_UI.empty() ?
+					std::string{ "Automatic" } :
+					reticleSurface_UI;
+				if (ImGui::BeginCombo(
+						"Reticle Surface",
+						reticlePreview.c_str())) {
+					if (ImGui::Selectable(
+							"Automatic",
+							reticleSurface_UI.empty())) {
+						reticleSurface_UI.clear();
+					}
+					for (const auto& candidate : candidates) {
+						if (ImGui::Selectable(
+								candidate.name.c_str(),
+								reticleSurface_UI == candidate.name)) {
+							reticleSurface_UI = candidate.name;
+						}
+					}
+					ImGui::EndCombo();
+				}
+				Tip("Which authored shape is the scope's aiming mark.\n"
+					"\n"
+					"The reticle is kept out of the magnified image and drawn\n"
+					"over it afterwards, so it stays sharp and does not zoom\n"
+					"with the sight picture.\n"
+					"\n"
+					"Automatic only recognises shapes whose name begins with\n"
+					"Reticle or Dot. That rule is deliberately narrow, because\n"
+					"a housing part mistaken for the reticle renders\n"
+					"unmagnified over the whole sight picture. Meshes that name\n"
+					"their aiming mark anything else need it pinned here.\n"
+					"\n"
+					"A pinned shape that a weapon does not have falls back to\n"
+					"Automatic.");
 				ImGui::Spacing();
 			}
 			if (!geometryReplayOwnsLens) {
@@ -1530,7 +1750,8 @@ namespace ImGuiImpl
 				instance->breathFigure_UI,
 				instance->breathHold_UI,
 				instance->breathPupilFollow_UI },
-			instance->apertureSurface_UI);
+			instance->apertureSurface_UI,
+			instance->reticleSurface_UI);
 
 		ImGui::PopItemWidth();
 	}

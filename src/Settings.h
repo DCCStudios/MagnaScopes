@@ -60,6 +60,22 @@ namespace MagnaScope
 		// enabled so a production INI cannot accidentally activate this
 		// isolated rollout path.
 		bool verificationGeometryMagnification = false;
+		// Generate a ScopeFade-equivalent aperture, sized from the selected
+		// mesh's measured vertex radius, for scopes that ship no authored
+		// ScopeFade. Defaults on because those scopes otherwise fall back to
+		// the flat screen-space circle; turning it off is how a scope that does
+		// have a ScopeFade gets A/B'd against the synthesized ring, since both
+		// run the identical fill and magnify shaders.
+		bool synthesizedAperture = true;
+		// Draw the synthesized ring with the flat cyan probe shader instead of
+		// the magnify shader. This separates two failures that look identical
+		// in game -- the ring landing in the wrong place or at the wrong size,
+		// and the ring landing correctly while the magnify shader declines to
+		// produce a pixel -- which is otherwise only distinguishable with a
+		// frame capture. Unlike Diagnostics/GeometryProbe it does not disable
+		// geometry magnification, because the synthesized path only exists
+		// underneath it.
+		bool synthesizedApertureProbe = false;
 		bool autoSTS = true;
 		float defaultMaskDiameter = 700.0F;
 		// Starting lens-only magnification for newly detected automatic scopes.
@@ -116,6 +132,16 @@ namespace MagnaScope
 			        verificationGeometryProbe &&
 			        verificationGeometryMagnification) ||
 			       AllowsAuxiliaryWorldPass();
+		}
+		[[nodiscard]] bool AllowsSynthesizedAperture() const noexcept
+		{
+			// It runs the magnification shaders, so it cannot be reachable
+			// anywhere those are not already permitted.
+			return synthesizedAperture && AllowsGeometryMagnification();
+		}
+		[[nodiscard]] bool AllowsSynthesizedApertureProbe() const noexcept
+		{
+			return synthesizedApertureProbe && AllowsSynthesizedAperture();
 		}
 		[[nodiscard]] bool AllowsWorldColorCapture() const noexcept
 		{

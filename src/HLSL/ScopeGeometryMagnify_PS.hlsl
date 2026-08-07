@@ -147,10 +147,38 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
         lensUserOffset * reciprocalClipW - projectiveNumerator,
         lensOffsetSolveValid);
 
+    // The aim pivot is a refinement, not a precondition. It used to sit inside
+    // drawFrameValid, which meant a degenerate aim solve returned the untouched
+    // source pixel for every pixel of the lens: the whole optic vanished and
+    // the geometry, the placement and the magnification were all still correct.
+    //
+    // authoredAimOffset is the reticle's position in lens coordinates, and it
+    // is only small when the aperture and the reticle were authored against
+    // each other -- which is true of ScopeFade and of nothing else in an STS
+    // mesh. Choosing any other surface as the aperture measures the same
+    // reticle against a different centre, radius and plane, so the offset grows
+    // and aimColumn's determinant can pass through zero. The lens centre is
+    // already solved exactly at that point and is the right pivot to fall back
+    // on, so an unusable aim reference costs the sight picture its authored
+    // off-centre pivot and nothing else.
+    //
+    // That relaxation only holds when an aim reference was published at all.
+    // SCOPE_AIM_OFFSET_VALID is zero on frames where the game thread could not
+    // produce a coherent first-person projection -- the ADS transition and fast
+    // camera movement, mostly -- and on those frames nothing else the CPU
+    // published can be trusted either. The old gate suppressed them as a side
+    // effect of requiring the aim solve; dropping that requirement outright let
+    // them through and painted a flat disc over the optic while the scope was
+    // moving. Bail on those exactly as before, and relax only the case this is
+    // actually about: a published aim reference whose per-wedge solve is
+    // degenerate.
+    const bool aimReferencePublished = SCOPE_AIM_OFFSET_VALID > 0.5f;
     const bool drawFrameValid =
-        reciprocalClipWValid && centerSolveValid && aimSolveValid;
+        reciprocalClipWValid && centerSolveValid &&
+        (aimReferencePublished || aimSolveValid);
     const float2 centerPixels = input.position.xy + pixelsToCenter;
-    const float2 currentAimPixels = input.position.xy + pixelsToAim;
+    const float2 currentAimPixels =
+        aimSolveValid ? input.position.xy + pixelsToAim : centerPixels;
 
     // Recover the two projected unit-radius endpoints through the same exact
     // homogeneous solve. Their mean distance from the center is the local

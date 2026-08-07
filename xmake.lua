@@ -24,6 +24,7 @@ add_requires("minhook")
 
 local shader_profiles = {
     AutoSTS_PS = "ps_5_0",
+    ScopeApertureSynth_VS = "vs_5_0",
     ScopeGeometryFill_GS = "gs_5_0",
     ScopeGeometryMagnify_PS = "ps_5_0",
     ScopeGeometryProbe_PS = "ps_5_0",
@@ -131,7 +132,12 @@ target("MagnaScope")
             path.join(os.projectdir(), "Compile", "F4SE", "Plugins", "MagnaScopeConfig.json")
         )
 
-        local function stage_runtime(root)
+        -- stage_ini is for the end-user package only. The live install's INI is
+        -- hand-tuned between test runs, and copying the repository default over
+        -- it silently resets diagnostic gates -- which then reads as a code
+        -- regression rather than a lost setting. Change live settings by
+        -- editing that file directly instead.
+        local function stage_runtime(root, stage_ini)
             local plugin_dir = path.join(root, "F4SE", "Plugins")
             local staged_shader_dir = path.join(root, "Shaders", "MagnaScope")
             os.mkdir(plugin_dir)
@@ -140,10 +146,12 @@ target("MagnaScope")
                 target:targetfile(),
                 path.join(plugin_dir, "MagnaScope.dll")
             )
-            os.cp(
-                path.join(os.projectdir(), "MagnaScope.ini"),
-                path.join(plugin_dir, "MagnaScope.ini")
-            )
+            if stage_ini then
+                os.cp(
+                    path.join(os.projectdir(), "MagnaScope.ini"),
+                    path.join(plugin_dir, "MagnaScope.ini")
+                )
+            end
             os.cp(
                 path.join(os.projectdir(), "MagnaScopeConfig.json"),
                 path.join(plugin_dir, "MagnaScopeConfig.json")
@@ -158,13 +166,14 @@ target("MagnaScope")
 
         -- Clean end-user tree: no PDB, import library, or build metadata.
         stage_runtime(
-            path.join(os.projectdir(), "Package", "MagnaScope")
+            path.join(os.projectdir(), "Package", "MagnaScope"),
+            true
         )
 
         local mo2_mods_path = os.getenv("MAGNASCOPE_MO2_MODS_PATH")
         if mo2_mods_path then
             local deploy_dir = path.join(mo2_mods_path, "MagnaScope")
-            stage_runtime(deploy_dir)
+            stage_runtime(deploy_dir, false)
             cprint("${bright green}deployed MagnaScope to %s", deploy_dir)
         end
     end)

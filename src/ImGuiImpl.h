@@ -222,13 +222,15 @@ namespace ImGuiImpl
 		float tubeDepth = 0.0F;
 		float lensOffsetX = 0.0F;
 		float lensOffsetY = 0.0F;
-		float lensScale = 1.0F;
+		float lensScale = 1.54F;
 		// Six related values, carried as a struct rather than six more
 		// positional parameters on an already long publish call.
 		ScopeData::Breathing breathing;
 		// Pinned aperture shape name, empty for automatic. A string rather
 		// than an index because the candidate list changes with the weapon.
 		std::string apertureSurface;
+		// Pinned aiming-mark shape name, empty for automatic. Same reasoning.
+		std::string reticleSurface;
 		bool active = false;
 	};
 
@@ -250,6 +252,52 @@ namespace ImGuiImpl
 	struct AuthoredZoomSnapshot
 	{
 		ScopeData::ZoomDataOverwrite values{};
+		std::uint64_t selectionRevision = 0;
+		bool available = false;
+	};
+
+	// The live eye-to-lens geometry, measured while aiming. Converting authored
+	// zoom onto the lens is a homothety of the camera about the aperture, so it
+	// needs the actual vector from the eye to the optic -- there is no way to
+	// derive that from BGSZoomData, whose offsets are relative to a default eye
+	// position the engine never exposes.
+	struct ApertureGeometrySnapshot
+	{
+		// The values BGSZoomData::cameraOffset should be *set* to in order to
+		// put the aim reference on the view axis. Not a delta -- cameraOffset
+		// is the camera-space vector from the first-person Camera node to the
+		// point that should sit on the axis, which is why these are assigned
+		// rather than accumulated.
+		//
+		// Derived the way SightHelper does it, that plugin being a working
+		// implementation of exactly this alignment:
+		//   diff = (aim->world.translate - camera->world.translate) / scale
+		//   diff = camera->world.rotate * diff
+		//   cameraOffset.x = diff.x;  cameraOffset.z = diff.y;
+		// Camera-space X maps to offset X and camera-space Y maps to offset Z,
+		// both positive. Deriving the signs from the projection's own
+		// ndcX = -cameraPoint.x convention gives the opposite answer and
+		// mis-aligns the sight; the reference wins over the inference.
+		float offsetFrameX = 0.0F;
+		float offsetFrameZ = 0.0F;
+		// Forward depth to the aim reference. Reported only -- forward offset
+		// plays no part in alignment.
+		float offsetFrameY = 0.0F;
+		// Straight-line eye-to-aim distance, for reporting.
+		float distance = 0.0F;
+		// Forward distance from the eye to the aperture plane. The binding
+		// constraint on travel is the eye versus the glass, not versus the
+		// reticle: on a long optic the reticle sits well beyond the lens, so a
+		// target distance that looks reasonable measured to the reticle can put
+		// the eye through the objective.
+		float apertureForwardDistance = 0.0F;
+		// Projected aperture radius in pixels, the quantity the conversion is
+		// supposed to preserve and the one worth reporting afterwards.
+		float projectedRadiusPixels = 0.0F;
+		// Which weapon/attachment selection this was measured against. A
+		// measurement from the previously equipped scope is worse than none:
+		// it would let the conversion run against another optic's geometry and
+		// silently produce a plausible-looking wrong answer.
 		std::uint64_t selectionRevision = 0;
 		bool available = false;
 	};
@@ -277,6 +325,8 @@ namespace ImGuiImpl
 		const ScopeData::ZoomDataOverwrite* authoredValues,
 		std::uint64_t selectionRevision);
 	[[nodiscard]] AuthoredZoomSnapshot GetAuthoredZoomSnapshot();
+	void PublishApertureGeometry(const ApertureGeometrySnapshot& geometry);
+	[[nodiscard]] ApertureGeometrySnapshot GetApertureGeometry();
 	void PublishEditorPreview(
 		const ScopeData::ZoomDataOverwrite& zoomOverride,
 		std::uint64_t selectionRevision,
@@ -311,7 +361,8 @@ namespace ImGuiImpl
 		float lensOffsetY,
 		float lensScale,
 		const ScopeData::Breathing& breathing,
-		const std::string& apertureSurface);
+		const std::string& apertureSurface,
+		const std::string& reticleSurface);
 	[[nodiscard]] EditorPreviewSnapshot GetEditorPreviewSnapshot();
 	void ClearEditorPreview();
 	void RequestProfileAction(ProfileRequest request);
@@ -370,9 +421,10 @@ namespace ImGuiImpl
 		float recenterSpeed_UI = 1.0F;
 		float strafeLag_UI = 1.0F;
 		std::string apertureSurface_UI;
+		std::string reticleSurface_UI;
 		float tubeDepth_UI = 0.0F;
 		float lensOffset_UI[2] = { 0.0F, 0.0F };
-		float lensScale_UI = 1.0F;
+		float lensScale_UI = 1.54F;
 		float breathRate_UI = 0.25F;
 		float breathSway_UI = 0.0F;
 		float breathDrift_UI = 0.0F;

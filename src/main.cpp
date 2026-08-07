@@ -117,6 +117,18 @@ namespace MagnaScope
 				L"GeometryMagnification",
 				0,
 				path.c_str()) != 0;
+		synthesizedAperture =
+			GetPrivateProfileIntW(
+				L"AutoSTS",
+				L"SynthesizedAperture",
+				1,
+				path.c_str()) != 0;
+		synthesizedApertureProbe =
+			GetPrivateProfileIntW(
+				L"AutoSTS",
+				L"SynthesizedApertureProbe",
+				0,
+				path.c_str()) != 0;
 		autoSTS = GetPrivateProfileIntW(L"AutoSTS", L"Enabled", 1, path.c_str()) != 0;
 		defaultMaskDiameter = ReadIniFloat(path, L"DefaultMaskDiameter", 700.0F);
 		defaultMagnification = ReadIniFloat(path, L"DefaultMagnification", 1.0F);
@@ -188,6 +200,16 @@ namespace MagnaScope
 			verificationGeometryMagnification ? L"1" : L"0",
 			path.c_str());
 		WritePrivateProfileStringW(L"AutoSTS", L"Enabled", autoSTS ? L"1" : L"0", path.c_str());
+		WritePrivateProfileStringW(
+			L"AutoSTS",
+			L"SynthesizedAperture",
+			synthesizedAperture ? L"1" : L"0",
+			path.c_str());
+		WritePrivateProfileStringW(
+			L"AutoSTS",
+			L"SynthesizedApertureProbe",
+			synthesizedApertureProbe ? L"1" : L"0",
+			path.c_str());
 		WritePrivateProfileStringW(
 			L"AutoSTS", L"DefaultMaskDiameter", std::to_wstring(defaultMaskDiameter).c_str(), path.c_str());
 		WritePrivateProfileStringW(
@@ -293,6 +315,57 @@ struct STSApertureSelection
 	RE::NiPoint3 previousWorldCenter{};
 	RE::NiPoint3 aimWorldCenter{};
 	float worldRadius{ 0.0F };
+
+	// Measured from the shape's own vertices rather than inferred from names
+	// and bounding spheres. `worldRadius` above is the heuristic
+	// (`planeRadius * 3.0` and friends) and stays as it is: the magnify shader
+	// solves its own projected radius from the replayed geometry, so nothing
+	// downstream is broken by that number being three times the physical rim,
+	// and the eye box that normalizes against it reads correctly today.
+	//
+	// These fields exist for the synthesized aperture path, which has no
+	// authored mesh to solve against and therefore needs the true size.
+	bool measurementValid{ false };
+	// Outer rim in world units, already multiplied by the object's world
+	// scale. On every ScopeFade measured so far this equals worldBound.fRadius
+	// exactly, and unlike that field it does not transiently collapse to 1.0
+	// because model-space extents are static data.
+	float measuredWorldRadius{ 0.0F };
+	// Inner rim over outer rim. ScopeFade reads ~0.497; a solid lens reads
+	// ~0.000; a wire ring such as specter_reticle reads ~0.994. An aperture is
+	// the middle band, which is why this is a ratio and not a bool.
+	float measuredInnerRatio{ 0.0F };
+	// 0, 1 or 2 for local X, Y or Z. Every genuine aperture measured so far is
+	// local Y, matching the X/Z plane the projection code already assumes.
+	int measuredOpticalAxis{ 1 };
+	// The vertex centroid in the shape's local space, before its own scale.
+	// Transforming this through the shape's live `world` gives the optical
+	// centre without consulting worldBound.center -- the same bound whose
+	// fRadius is observed collapsing to exactly 1.0 for every shape at once
+	// while the scene graph updates. Model-space extents are static data and
+	// have no such failure mode.
+	RE::NiPoint3 measuredLocalCentroid{};
+	// The shape whose measurement produced the fields above and whose live
+	// draw supplies placement for the synthesized aperture. Usually the
+	// selected plane; when the selection is not disc-shaped -- the user
+	// picked the scope body, or ranking landed on a housing -- this is the
+	// most lens-like candidate instead, so the optic stays correct no matter
+	// what drives everything else.
+	RE::NiAVObject* synthesisSource{ nullptr };
+	// Outer rim in the synthesis source's model space, pre-scale. This is
+	// the radius the captured-placement path builds the ring at, because the
+	// captured transform constants apply the node's scale exactly as they
+	// did to the mesh's own vertices.
+	float measuredLocalRadius{ 0.0F };
+	// The OPTICAL PLANE's own model-space outer rim, from its vertices. Zero
+	// when that shape did not measure.
+	//
+	// Distinct from measuredLocalRadius above, which belongs to the synthesis
+	// source and is a different shape whenever the plane is not disc-like.
+	// This one is the radius ScopeGeometryFill_GS calls lens coordinate 1.0,
+	// so it is the unit anything the magnify shader consumes as a lens
+	// coordinate has to be expressed in -- notably the authored aim offset.
+	float lensLocalRadius{ 0.0F };
 };
 
 struct AutomaticSTSTrackingState
@@ -385,6 +458,12 @@ void InvalidateAutomaticSTSSelection()
 	if (hookIns) {
 		hookIns->InvalidateAutomaticSTSGeometry();
 	}
+	// A stale placement identity is a set of dead buffer pointers compared as
+	// integers. Never dereferenced, but a reused allocation could match a
+	// foreign draw and capture the wrong transforms, so clear it whenever the
+	// selection itself is torn down.
+	Hook::D3D::InvalidateSynthesisPlacement();
+	Hook::D3D::InvalidateSynthesizedApertureRing();
 }
 
 float UpdateAutomaticSTSTracking(
@@ -507,7 +586,9 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 	float firstPersonFov,
 	float activationProgress,
 	float deltaSeconds,
-	const RE::NiPoint3& apertureScreenCenter)
+	const RE::NiPoint3& apertureScreenCenter,
+	const RE::NiPoint3& aimWorldCenter,
+	float apertureLensLocalRadius)
 {
 	Hook::D3D::PhysicalEyeBoxSample result{};
 	auto& state = automaticSTSEyeBoxTracking;
@@ -667,6 +748,43 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 		currentEyeReliefDistance <= 0.001F) {
 		return lastValidOrCentered(7);
 	}
+
+	// The authored aim point in ScopeFade lens coordinates, solved here in the
+	// aperture's own local frame.
+	//
+	// The render thread used to recover this by inverting the projected lens
+	// basis assembled above -- the aperture's local X and Z axes projected to
+	// screen. That basis is not conditioned for inversion: its columns
+	// foreshorten by different amounts as the optic turns (the note on
+	// apertureProjectedRadius above records |basisX| falling from 452 to 141
+	// pixels and changing sign while |basisZ| held at 460), so its determinant
+	// passes through zero, and around that zero the recovered offset explodes
+	// and flips sign. Two consecutive frames measuring (1.6, -38.6) and
+	// (0.7, -39.3) pixels reported 1.246 and 6.625 aperture radii for a true
+	// value near 0.11.
+	//
+	// The radius is the authored ScopeFade rim from the mesh's own vertices,
+	// not `apertureWorldRadius`. Those differ by a deliberate factor of three
+	// (see STSApertureSelection::worldRadius), and lens coordinate 1.0 is the
+	// rim: ScopeGeometryFill_GS places the annulus's outer ring there.
+	float aimLensX = 0.0F;
+	float aimLensY = 0.0F;
+	bool aimLensValid = false;
+	if (apertureLensLocalRadius > 0.0001F && IsFinitePoint(aimWorldCenter)) {
+		const RE::NiPoint3 aimLocal = inverseAperture * aimWorldCenter;
+		if (IsFinitePoint(aimLocal)) {
+			const float solvedX =
+				(aimLocal.x - apertureLocalCenter.x) / apertureLensLocalRadius;
+			const float solvedY =
+				(aimLocal.z - apertureLocalCenter.z) / apertureLensLocalRadius;
+			if (std::isfinite(solvedX) && std::isfinite(solvedY)) {
+				aimLensX = solvedX;
+				aimLensY = solvedY;
+				aimLensValid = true;
+			}
+		}
+	}
+
 	if (!state.baselineReady || activationProgress <= 0.001F) {
 		// Start exactly centered. A stationary optic must never inherit a
 		// heading-dependent calibration error from a previous pose.
@@ -1077,6 +1195,9 @@ Hook::D3D::PhysicalEyeBoxSample UpdateAutomaticSTSEyeBoxTracking(
 	result.lensBasisXY = basisXY;
 	result.lensBasisZX = basisZX;
 	result.lensBasisZY = basisZY;
+	result.aimLensX = aimLensX;
+	result.aimLensY = aimLensY;
+	result.aimLensValid = aimLensValid;
 	result.blend = std::clamp(activationProgress, 0.0F, 1.0F);
 	result.valid = true;
 	g_eyeBoxBailReason.store(0, std::memory_order_relaxed);
@@ -1235,6 +1356,21 @@ RE::NiAVObject* FindObjectByPrefixNoCase(
 	return selected;
 }
 
+// Same contract for the aiming mark.
+[[nodiscard]] const std::string& GetSelectedReticleSurfaceName()
+{
+	static std::string selected;
+	const auto preview = ImGuiImpl::GetEditorPreviewSnapshot();
+	if (preview.active) {
+		selected = preview.reticleSurface;
+		return selected;
+	}
+	const auto* current =
+		ScopeData::ScopeDataHandler::GetSingleton()->GetCurrentScopeProfile();
+	selected = current ? current->shaderData.reticleSurface : std::string{};
+	return selected;
+}
+
 // Every usable aperture shape under the given root, best first.
 //
 // Only BSTriShapes qualify. An NiNode carries a transform and a bound but no
@@ -1354,6 +1490,391 @@ std::vector<STSApertureCandidate> FindSTSApertureCandidates(
 	return candidates;
 }
 
+// Half-precision decode for packed vertex positions.
+//
+// Fallout stores positions as four 16-bit floats unless the shape carries
+// VF_FULLPREC. Written out rather than pulled from DirectXMath so the same
+// routine can be replayed by a host-side test with no D3D dependency.
+float DecodeHalfFloat(std::uint16_t encoded)
+{
+	const std::uint32_t sign = static_cast<std::uint32_t>(encoded & 0x8000U)
+	                           << 16U;
+	std::int32_t exponent = static_cast<std::int32_t>((encoded >> 10) & 0x1FU);
+	std::uint32_t mantissa = static_cast<std::uint32_t>(encoded & 0x3FFU);
+	std::uint32_t bits = 0U;
+	if (exponent == 0) {
+		if (mantissa == 0U) {
+			bits = sign;
+		} else {
+			// Subnormal. Shift the implied bit into place and pay for it in
+			// the exponent, which is what makes the result a normal float.
+			exponent = 1;
+			while ((mantissa & 0x400U) == 0U) {
+				mantissa <<= 1U;
+				--exponent;
+			}
+			mantissa &= 0x3FFU;
+			bits = sign |
+			       (static_cast<std::uint32_t>(exponent + 112) << 23U) |
+			       (mantissa << 13U);
+		}
+	} else if (exponent == 31) {
+		bits = sign | 0x7F800000U | (mantissa << 13U);
+	} else {
+		bits = sign |
+		       (static_cast<std::uint32_t>(exponent + 112) << 23U) |
+		       (mantissa << 13U);
+	}
+	float result = 0.0F;
+	std::memcpy(&result, &bits, sizeof(result));
+	return result;
+}
+
+// What the aperture's own vertices say about its size, shape and orientation.
+//
+// Everything the optical path currently knows about aperture size is inferred
+// from names and bounding spheres: a shape called Glass wins if it is 1.35x
+// wider than the fade plane, the aiming housing is taken at 0.82 of its sphere,
+// and the whole result is clamped between 1.5x and 4x. Those constants were
+// fitted to ScopeFade and have no meaning on an arbitrary lens element.
+//
+// The vertices are the measurement those constants approximate. This reads
+// them and reports; nothing consumes the result yet. The open question is
+// whether Fallout keeps the CPU shadow copy alive for first-person weapon
+// meshes at all -- BSGraphics::Buffer carries invalidCpuData precisely because
+// it does not always -- and that is what this probe exists to answer.
+struct ApertureVertexMeasurement
+{
+	bool measured{ false };
+	// Why the measurement was not taken. Empty on success.
+	const char* bailReason{ "" };
+
+	bool dataPointerPresent{ false };
+	bool cpuDataInvalid{ false };
+	bool fullPrecision{ false };
+	std::uint32_t vertexCount{ 0U };
+	std::uint32_t stride{ 0U };
+	std::uint32_t dataOffset{ 0U };
+	std::uint32_t dataSize{ 0U };
+	std::uint32_t maxDataSize{ 0U };
+	std::uint64_t vertexDescriptor{ 0U };
+
+	// Local-space, before the object's own scale. The mean of the vertex
+	// positions, so it is weighted by tessellation density: a mesh with a
+	// dense hub or asymmetric detail pulls it away from the geometric centre.
+	// On specter_lever the pull is about 0.87 units, which is why this is
+	// reported but not used to place anything.
+	RE::NiPoint3 centroid{};
+	// Midpoint of the vertex extents. For a circular opening this is the
+	// centre regardless of how the ring is tessellated, which the mean is not,
+	// so this is what the optical radii are measured from and what the
+	// synthesized aperture is drawn around.
+	RE::NiPoint3 opticalCenter{};
+	// Half-extent about the centroid on each local axis. The smallest names
+	// the optical axis, and the other two give the lens radius directly.
+	RE::NiPoint3 halfExtents{};
+	// In the plane normal to the thinnest axis.
+	float outerRadius{ 0.0F };
+	// Nonzero means a hole, which is the annulus question answered by
+	// measurement instead of by a vertex count.
+	float innerRadius{ 0.0F };
+	// 0, 1 or 2 for local X, Y or Z.
+	int thinnestAxis{ 1 };
+	float worldScale{ 1.0F };
+	// For comparison against the sphere the heuristics use today.
+	float boundRadius{ 0.0F };
+};
+
+ApertureVertexMeasurement MeasureApertureVertices(RE::NiAVObject* object)
+{
+	ApertureVertexMeasurement measurement;
+	auto* const shape = object ? object->IsTriShape() : nullptr;
+	if (!shape) {
+		measurement.bailReason = "not a BSTriShape";
+		return measurement;
+	}
+	measurement.worldScale = object->world.scale;
+	measurement.boundRadius = object->worldBound.fRadius;
+	measurement.vertexCount = shape->numVertices;
+	measurement.vertexDescriptor = shape->vertexDesc.desc;
+	measurement.stride = shape->vertexDesc.GetSize();
+	measurement.fullPrecision =
+		shape->vertexDesc.HasFlag(RE::BSGraphics::Vertex::Flags::VF_FULLPREC);
+
+	auto* const rendererShape = shape->rendererData ?
+		static_cast<RE::BSGraphics::TriShape*>(shape->rendererData) :
+		nullptr;
+	auto* const vertexBuffer =
+		rendererShape ? rendererShape->vertexBuffer : nullptr;
+	if (!vertexBuffer) {
+		measurement.bailReason = "no renderer vertex buffer";
+		return measurement;
+	}
+	measurement.dataPointerPresent = vertexBuffer->data != nullptr;
+	measurement.cpuDataInvalid = vertexBuffer->invalidCpuData;
+	measurement.dataOffset = vertexBuffer->dataOffset;
+	measurement.dataSize = vertexBuffer->dataSize;
+	measurement.maxDataSize = vertexBuffer->maxDataSize;
+
+	if (!measurement.dataPointerPresent) {
+		measurement.bailReason = "CPU shadow copy absent";
+		return measurement;
+	}
+	if (measurement.cpuDataInvalid) {
+		measurement.bailReason = "CPU shadow copy marked invalid";
+		return measurement;
+	}
+	if (measurement.vertexCount == 0U || measurement.stride < 8U) {
+		measurement.bailReason = "degenerate vertex count or stride";
+		return measurement;
+	}
+
+	// Never walk past the allocation.
+	//
+	// dataOffset is a byte offset into the pooled *GPU* buffer -- it is what
+	// the draw classifier matches against IASetVertexBuffers -- and must not
+	// be applied to the CPU pointer. data addresses this shape's own copy,
+	// which the first probe run confirmed across every candidate on four
+	// weapons: dataSize equalled numVertices * stride exactly every time,
+	// with maxDataSize the padded allocation. Folding dataOffset in here
+	// compared tens of millions against about a kilobyte and rejected every
+	// shape, which is the only reason this check reported anything at all.
+	const std::uint64_t span =
+		static_cast<std::uint64_t>(measurement.vertexCount) *
+		static_cast<std::uint64_t>(measurement.stride);
+	const std::uint64_t limit = std::max(
+		static_cast<std::uint64_t>(measurement.maxDataSize),
+		static_cast<std::uint64_t>(measurement.dataSize));
+	if (limit == 0U || span > limit) {
+		measurement.bailReason = "vertex span exceeds reported buffer size";
+		return measurement;
+	}
+
+	const auto* const base =
+		static_cast<const std::uint8_t*>(vertexBuffer->data);
+
+	const auto readPosition = [&](std::uint32_t index) {
+		const auto* const vertex = base +
+			static_cast<std::size_t>(index) *
+				static_cast<std::size_t>(measurement.stride);
+		RE::NiPoint3 position{};
+		if (measurement.fullPrecision) {
+			float components[3]{};
+			std::memcpy(components, vertex, sizeof(components));
+			position = { components[0], components[1], components[2] };
+		} else {
+			std::uint16_t components[3]{};
+			std::memcpy(components, vertex, sizeof(components));
+			position = {
+				DecodeHalfFloat(components[0]),
+				DecodeHalfFloat(components[1]),
+				DecodeHalfFloat(components[2])
+			};
+		}
+		return position;
+	};
+
+	RE::NiPoint3 minimum{
+		std::numeric_limits<float>::max(),
+		std::numeric_limits<float>::max(),
+		std::numeric_limits<float>::max()
+	};
+	RE::NiPoint3 maximum{
+		std::numeric_limits<float>::lowest(),
+		std::numeric_limits<float>::lowest(),
+		std::numeric_limits<float>::lowest()
+	};
+	RE::NiPoint3 sum{};
+	std::uint32_t finiteCount = 0U;
+	for (std::uint32_t index = 0U; index < measurement.vertexCount; ++index) {
+		const RE::NiPoint3 position = readPosition(index);
+		if (!IsFinitePoint(position)) {
+			continue;
+		}
+		minimum.x = std::min(minimum.x, position.x);
+		minimum.y = std::min(minimum.y, position.y);
+		minimum.z = std::min(minimum.z, position.z);
+		maximum.x = std::max(maximum.x, position.x);
+		maximum.y = std::max(maximum.y, position.y);
+		maximum.z = std::max(maximum.z, position.z);
+		sum += position;
+		++finiteCount;
+	}
+	if (finiteCount == 0U) {
+		measurement.bailReason = "no finite positions decoded";
+		return measurement;
+	}
+
+	const float inverseCount = 1.0F / static_cast<float>(finiteCount);
+	measurement.centroid = {
+		sum.x * inverseCount,
+		sum.y * inverseCount,
+		sum.z * inverseCount
+	};
+	measurement.halfExtents = {
+		0.5F * (maximum.x - minimum.x),
+		0.5F * (maximum.y - minimum.y),
+		0.5F * (maximum.z - minimum.z)
+	};
+	measurement.opticalCenter = {
+		0.5F * (minimum.x + maximum.x),
+		0.5F * (minimum.y + maximum.y),
+		0.5F * (minimum.z + maximum.z)
+	};
+
+	// The thinnest axis is the optical axis. A lens is a disc, so two extents
+	// agree and the third collapses; picking the smallest identifies it
+	// without assuming the local X/Z convention ScopeFade happens to use.
+	const float extents[3]{
+		measurement.halfExtents.x,
+		measurement.halfExtents.y,
+		measurement.halfExtents.z
+	};
+	measurement.thinnestAxis = 0;
+	for (int axis = 1; axis < 3; ++axis) {
+		if (extents[axis] < extents[measurement.thinnestAxis]) {
+			measurement.thinnestAxis = axis;
+		}
+	}
+
+	float outerRadius = 0.0F;
+	float innerRadius = std::numeric_limits<float>::max();
+	for (std::uint32_t index = 0U; index < measurement.vertexCount; ++index) {
+		const RE::NiPoint3 position = readPosition(index);
+		if (!IsFinitePoint(position)) {
+			continue;
+		}
+		// Measured from the extent midpoint, not the mean, so the radius and
+		// the centre the aperture is drawn at describe the same circle. Using
+		// the mean here is what let outerRadius exceed the largest distance
+		// the bounding box permits -- 3.5936 against 2.724 on specter_lever.
+		const RE::NiPoint3 offset = position - measurement.opticalCenter;
+		const float components[3]{ offset.x, offset.y, offset.z };
+		float squared = 0.0F;
+		for (int axis = 0; axis < 3; ++axis) {
+			if (axis == measurement.thinnestAxis) {
+				continue;
+			}
+			squared += components[axis] * components[axis];
+		}
+		const float radius = std::sqrt(squared);
+		outerRadius = std::max(outerRadius, radius);
+		innerRadius = std::min(innerRadius, radius);
+	}
+	measurement.outerRadius = outerRadius;
+	measurement.innerRadius =
+		innerRadius == std::numeric_limits<float>::max() ? 0.0F : innerRadius;
+	measurement.measured = true;
+	return measurement;
+}
+
+// Decoding a shape's whole vertex buffer is not free: acogSTS:1 is 3,924
+// vertices, the candidate sweep touches eight shapes at once, and both callers
+// run every frame the optic is live.
+//
+// That became a game-thread stall rather than a cost, because the candidate
+// list reorders whenever worldBound.fRadius transiently collapses to exactly
+// 1.0 for every shape simultaneously. The reorder reads as "the list changed",
+// which re-probes all of it and writes a line per shape. During a save-game
+// load, where bounds are rebuilt continuously, that repeats every frame and
+// the game appears to hang with an STS scope drawn.
+//
+// Model-space vertex extents are static for a given shape, so measure once.
+// The key carries the vertex identity as well as the address: a freed shape's
+// pointer can be reused, and any mismatch re-measures rather than trusting a
+// stale entry. Failed measurements are not cached -- they bail before the
+// vertex loop, so retrying them is cheap, and a transient failure during a
+// load must not be remembered as permanent.
+struct ApertureMeasurementCacheEntry
+{
+	const void* shape{ nullptr };
+	const void* rendererData{ nullptr };
+	std::uint32_t vertexCount{ 0U };
+	std::uint64_t vertexDescriptor{ 0U };
+	ApertureVertexMeasurement measurement;
+};
+
+std::vector<ApertureMeasurementCacheEntry> g_apertureMeasurementCache;
+
+ApertureVertexMeasurement MeasureApertureVerticesCached(RE::NiAVObject* object)
+{
+	auto* const shape = object ? object->IsTriShape() : nullptr;
+	if (!shape) {
+		return MeasureApertureVertices(object);
+	}
+	const void* const rendererData = shape->rendererData;
+	const std::uint32_t vertexCount = shape->numVertices;
+	const std::uint64_t descriptor = shape->vertexDesc.desc;
+	for (const auto& entry : g_apertureMeasurementCache) {
+		if (entry.shape == shape &&
+			entry.rendererData == rendererData &&
+			entry.vertexCount == vertexCount &&
+			entry.vertexDescriptor == descriptor) {
+			return entry.measurement;
+		}
+	}
+	auto measurement = MeasureApertureVertices(object);
+	if (!measurement.measured) {
+		return measurement;
+	}
+	// A session switches weapons and attachments many times and each one would
+	// otherwise leave an entry behind for good.
+	if (g_apertureMeasurementCache.size() >= 64U) {
+		g_apertureMeasurementCache.clear();
+	}
+	g_apertureMeasurementCache.push_back(
+		{ shape, rendererData, vertexCount, descriptor, measurement });
+	return measurement;
+}
+
+// Whether a measured shape is plausibly a lens or aperture disc: flat along
+// one axis, roughly circular in the other two, not a wire ring, and not a
+// tiny decoration. The thresholds are generous on purpose -- this only
+// decides which mesh sizes and places the synthesized optic, and the log
+// shows real lenses passing comfortably (specter_lens_rear thinness 0.06)
+// while bodies and levers fail by an order of magnitude.
+bool IsDiscLikeMeasurement(const ApertureVertexMeasurement& measurement)
+{
+	if (!measurement.measured) {
+		return false;
+	}
+	const float extents[3]{
+		measurement.halfExtents.x,
+		measurement.halfExtents.y,
+		measurement.halfExtents.z
+	};
+	const float thin = extents[measurement.thinnestAxis];
+	float planeA = 0.0F;
+	float planeB = 0.0F;
+	int seen = 0;
+	for (int axis = 0; axis < 3; ++axis) {
+		if (axis == measurement.thinnestAxis) {
+			continue;
+		}
+		(seen++ == 0 ? planeA : planeB) = extents[axis];
+	}
+	const float minPlane = std::min(planeA, planeB);
+	const float maxPlane = std::max(planeA, planeB);
+	if (minPlane <= 0.001F || thin > 0.4F * minPlane) {
+		return false;
+	}
+	if (minPlane < 0.7F * maxPlane) {
+		return false;
+	}
+	if (measurement.outerRadius < 0.4F) {
+		// Red-dot markers and similar decorations are perfect little discs.
+		// A usable optical opening on the inspected corpus is never under
+		// 0.4 model units (the smallest genuine one is acogPiece at 0.66).
+		return false;
+	}
+	const float innerRatio =
+		measurement.outerRadius > 0.0001F ?
+			measurement.innerRadius / measurement.outerRadius :
+			0.0F;
+	// A wire ring is a hole with no glass -- specter_reticle reads 0.994.
+	return innerRatio < 0.92F;
+}
+
 // Copy the discovered names to the editor so its dropdown lists what this
 // weapon actually has. Republished only on change: this runs every frame the
 // optic is live, and the list is stable for a given scope.
@@ -1366,10 +1887,18 @@ void PublishApertureCandidates(
 	for (const auto& candidate : candidates) {
 		names.push_back(candidate.name);
 	}
-	if (names == lastPublished) {
+	// Compare as a set, not a sequence. The ranking's last tie-break is the
+	// bounding-sphere radius, and that field collapses to exactly 1.0 for
+	// every shape at once in bursts, which ties the comparison and lets
+	// stable_sort fall back to tree-walk order. The membership is identical
+	// either way, so treating a reorder as a new scope re-probed every mesh
+	// and logged the whole list, every frame, for as long as the burst lasted.
+	std::vector<std::string> sortedNames = names;
+	std::sort(sortedNames.begin(), sortedNames.end());
+	if (sortedNames == lastPublished) {
 		return;
 	}
-	lastPublished = names;
+	lastPublished = std::move(sortedNames);
 
 	// The list changed, so this is a different scope. Record what it offers:
 	// when a weapon shows nothing, the difference between "no candidates" and
@@ -1384,6 +1913,66 @@ void PublishApertureCandidates(
 	}
 	logger::info("Aperture candidates: {}", summary);
 
+	// Read-only probe. Whether the CPU vertex shadow survives for first-person
+	// weapon meshes decides whether the aperture can be measured directly or
+	// has to be read back from the GPU, so report every candidate rather than
+	// only the one that won -- a scope where the chosen shape has no shadow
+	// copy but a sibling does is a different problem than none of them having
+	// it. Bounded by kMaximumCandidates and fires only on a scope change.
+	for (const auto& candidate : candidates) {
+		const auto measurement = MeasureApertureVerticesCached(candidate.shape);
+		if (!measurement.measured) {
+			logger::info(
+				"Aperture vertex probe '{}': UNAVAILABLE ({}); "
+				"dataPointer={}, invalidCpuData={}, vertices={}, stride={}, "
+				"fullPrecision={}, dataOffset={}, dataSize={}, maxDataSize={}, "
+				"vertexDesc=0x{:016X}, boundRadius={:.4f}",
+				candidate.name,
+				measurement.bailReason,
+				measurement.dataPointerPresent,
+				measurement.cpuDataInvalid,
+				measurement.vertexCount,
+				measurement.stride,
+				measurement.fullPrecision,
+				measurement.dataOffset,
+				measurement.dataSize,
+				measurement.maxDataSize,
+				measurement.vertexDescriptor,
+				measurement.boundRadius);
+			continue;
+		}
+		constexpr const char* kAxisNames[3]{ "X", "Y", "Z" };
+		logger::info(
+			"Aperture vertex probe '{}': vertices={}, stride={}, "
+			"fullPrecision={}, centroid=({:.4f}, {:.4f}, {:.4f}), "
+			"halfExtents=({:.4f}, {:.4f}, {:.4f}), opticalAxis=local{}, "
+			"outerRadius={:.4f}, innerRadius={:.4f}, hole={}, "
+			"worldScale={:.4f}, scaledOuterRadius={:.4f}, "
+			"boundRadius={:.4f}, boundOverMeasured={:.3f}",
+			candidate.name,
+			measurement.vertexCount,
+			measurement.stride,
+			measurement.fullPrecision,
+			measurement.centroid.x,
+			measurement.centroid.y,
+			measurement.centroid.z,
+			measurement.halfExtents.x,
+			measurement.halfExtents.y,
+			measurement.halfExtents.z,
+			kAxisNames[measurement.thinnestAxis],
+			measurement.outerRadius,
+			measurement.innerRadius,
+			measurement.outerRadius > 0.0F &&
+				measurement.innerRadius > 0.25F * measurement.outerRadius,
+			measurement.worldScale,
+			measurement.outerRadius * measurement.worldScale,
+			measurement.boundRadius,
+			measurement.outerRadius > 0.0001F ?
+				measurement.boundRadius /
+					(measurement.outerRadius * measurement.worldScale) :
+				0.0F);
+	}
+
 	std::vector<ImGuiImpl::ApertureCandidateInfo> published;
 	published.reserve(candidates.size());
 	for (const auto& candidate : candidates) {
@@ -1392,12 +1981,70 @@ void PublishApertureCandidates(
 	ImGuiImpl::PublishApertureCandidates(published);
 }
 
+// The single renderable shape with this exact name, or null. Exact rather than
+// prefix or token matching: the name came from the candidate dropdown, which is
+// populated from these same objects, so anything less than an exact match would
+// resolve to a shape the user never picked.
+[[nodiscard]] RE::NiAVObject* FindShapeByExactName(
+	RE::NiAVObject* root,
+	std::string_view target)
+{
+	if (!root || target.empty()) {
+		return nullptr;
+	}
+	std::vector<RE::NiAVObject*> pending{ root };
+	constexpr std::size_t kMaximumVisitedObjects = 512U;
+	for (std::size_t cursor = 0;
+		 cursor < pending.size() && cursor < kMaximumVisitedObjects;
+		 ++cursor) {
+		auto* object = pending[cursor];
+		if (!object) {
+			continue;
+		}
+		if (std::string_view{ object->name.c_str() } == target) {
+			if (auto* shape = object->IsTriShape();
+				shape && shape->rendererData) {
+				return object;
+			}
+		}
+		if (auto* node = object->IsNode()) {
+			for (auto& childPointer : node->children) {
+				if (auto* child = childPointer.get()) {
+					pending.push_back(child);
+				}
+			}
+		}
+	}
+	return nullptr;
+}
+
 std::vector<RE::NiAVObject*> FindSTSReticleSurfaces(
 	RE::NiAVObject* scopeViewParts)
 {
 	std::vector<RE::NiAVObject*> result;
 	if (!scopeViewParts) {
 		return result;
+	}
+
+	// A pinned name replaces the naming rules outright rather than adding to
+	// them. Pinning exists precisely because the automatic rules found the
+	// wrong shape or no shape, so letting them keep contributing would leave
+	// the mistake in place alongside the correction. An unmatched name falls
+	// through to automatic below instead of leaving the scope with no reticle.
+	const auto& pinnedReticle = GetSelectedReticleSurfaceName();
+	if (!pinnedReticle.empty()) {
+		if (auto* pinned = FindShapeByExactName(scopeViewParts, pinnedReticle)) {
+			result.push_back(pinned);
+			return result;
+		}
+		static std::string lastMissingReticlePin;
+		if (lastMissingReticlePin != pinnedReticle) {
+			lastMissingReticlePin = pinnedReticle;
+			logger::warn(
+				"Pinned reticle surface '{}' is not present on this scope; "
+				"falling back to automatic detection",
+				pinnedReticle);
+		}
 	}
 
 	struct PendingObject
@@ -1418,12 +2065,19 @@ std::vector<RE::NiAVObject*> FindSTSReticleSurfaces(
 			continue;
 		}
 		const std::string_view name{ object->name.c_str() };
+		// Prefix, not substring. "Dot" and "Reticle" appear inside plenty of
+		// incidental names in weapon-mod meshes, and a housing part swept into
+		// the reticle set renders unmagnified over the sight picture. Automatic
+		// detection is deliberately narrow now that the surface can also be
+		// chosen by hand; a mesh that names its aiming mark something else is a
+		// case for the dropdown, not for a looser rule that mis-fires on
+		// everything else.
 		const bool insideReticleSubtree =
 			pending[cursor].insideReticleSubtree ||
-			NameContainsTokenNoCase(name, kReticleSubtreeToken);
+			NameHasPrefixNoCase(name, kReticleSubtreeToken);
 		bool namedAimingMark = false;
 		for (const auto token : kReticleShapeTokens) {
-			if (NameContainsTokenNoCase(name, token)) {
+			if (NameHasPrefixNoCase(name, token)) {
 				namedAimingMark = true;
 				break;
 			}
@@ -1553,12 +2207,133 @@ STSApertureSelection FindSTSAperture(RE::NiAVObject* firstPersonRoot)
 	const auto& planeBound = opticalPlane->worldBound;
 	const float planeRadius = planeBound.fRadius;
 
-	auto reticleSurfaces = FindSTSReticleSurfaces(partsRoot);
-	RE::NiAVObject* aimReference =
-		FindObjectByPrefixNoCase(partsRoot, "ReticleNode");
+	// Measure the chosen shape itself. This is the size the synthesized
+	// aperture path will draw at, so it is taken from the vertices rather than
+	// from the bounding sphere -- which is both a heuristic and, in bursts,
+	// exactly 1.0 for every shape at once while the scene graph updates.
+	// Cached: this runs every frame the optic is live, and re-decoding the
+	// selected mesh's whole vertex buffer per frame was a stall of its own on
+	// top of the candidate-sweep thrash above.
+	const auto planeMeasurement = MeasureApertureVerticesCached(opticalPlane);
+
+	// The synthesized optic is sized and placed by a disc, not by whatever
+	// happens to be selected. Selecting the scope body drew a body-radius
+	// black circle over half the screen; the selection keeps driving
+	// projection and eye box, but the optic itself comes from the most
+	// lens-like shape available.
+	RE::NiAVObject* synthesisSource = opticalPlane;
+	ApertureVertexMeasurement synthesisMeasurement = planeMeasurement;
+	if (!IsDiscLikeMeasurement(planeMeasurement)) {
+		int bestScore = std::numeric_limits<int>::min();
+		for (const auto& candidate : apertureCandidates) {
+			if (!candidate.shape || candidate.shape == opticalPlane) {
+				continue;
+			}
+			const auto measurement =
+				MeasureApertureVerticesCached(candidate.shape);
+			if (!IsDiscLikeMeasurement(measurement)) {
+				continue;
+			}
+			const std::string_view name{ candidate.name };
+			int score = 0;
+			const auto containsNoCase = [&name](std::string_view needle) {
+				return std::search(
+						   name.begin(),
+						   name.end(),
+						   needle.begin(),
+						   needle.end(),
+						   [](char a, char b) {
+							   return std::tolower(
+										  static_cast<unsigned char>(a)) ==
+							          std::tolower(
+										  static_cast<unsigned char>(b));
+						   }) != name.end();
+			};
+			if (containsNoCase("lens") || containsNoCase("glass")) {
+				score += 4;
+			}
+			if (containsNoCase("fade")) {
+				score += 3;
+			}
+			const float innerRatio =
+				measurement.outerRadius > 0.0001F ?
+					measurement.innerRadius / measurement.outerRadius :
+					0.0F;
+			if (innerRatio < 0.2F || (innerRatio > 0.3F && innerRatio < 0.7F)) {
+				// A solid glass disc or a ScopeFade-proportioned annulus.
+				score += 2;
+			}
+			if (score > bestScore ||
+				(score == bestScore &&
+					measurement.outerRadius <
+						synthesisMeasurement.outerRadius)) {
+				bestScore = score;
+				synthesisSource = candidate.shape;
+				synthesisMeasurement = measurement;
+			}
+		}
+		if (synthesisSource != opticalPlane) {
+			static const void* lastSubstitutionLogged = nullptr;
+			if (lastSubstitutionLogged != synthesisSource) {
+				lastSubstitutionLogged = synthesisSource;
+				logger::info(
+					"Selected aperture '{}' is not disc-shaped; the "
+					"synthesized optic will be sized and placed by '{}' "
+					"(radius={:.4f})",
+					chosen->name,
+					synthesisSource->name.c_str(),
+					synthesisMeasurement.outerRadius);
+			}
+		}
+	}
+
+	const float measuredWorldRadius =
+		synthesisMeasurement.outerRadius *
+		std::abs(synthesisMeasurement.worldScale);
+	const bool measurementValid =
+		synthesisMeasurement.measured && std::isfinite(measuredWorldRadius) &&
+		measuredWorldRadius > 0.001F && measuredWorldRadius < 10000.0F;
+	const float measuredInnerRatio =
+		synthesisMeasurement.outerRadius > 0.0001F ?
+			synthesisMeasurement.innerRadius /
+				synthesisMeasurement.outerRadius :
+			0.0F;
+
+	// Search from the same root the aperture candidates are enumerated from.
+	// ScopeViewParts is a child of ScopeAiming, and an authored Reticle:0 is
+	// commonly a sibling of it rather than inside it -- so the narrower root
+	// offered Reticle:0 in the dropdown and then could not resolve it, and
+	// automatic detection never saw it either. The prefix rule is what keeps
+	// the wider root from sweeping anything in.
+	auto reticleSurfaces =
+		FindSTSReticleSurfaces(scopeAiming ? scopeAiming : partsRoot);
+	// Same root as the reticle surfaces, and for the same reason: an authored
+	// Reticle:0 is commonly a sibling of ScopeViewParts rather than a child of
+	// it, so searching the narrower root silently fell through to opticalPlane
+	// and made the aim reference the aperture itself. Everything downstream
+	// then treats the lens plane as the point of aim -- including the zoom
+	// conversion, which centred the optic instead of the reticle. The
+	// IsDescendantOf guard below still keeps the result inside ScopeAiming.
+	RE::NiAVObject* const aimSearchRoot =
+		scopeAiming ? scopeAiming : partsRoot;
+	// A pinned reticle is the point of aim by definition. Without this the
+	// dropdown would correct which shape is drawn as the reticle while the
+	// conversion and eye box kept aiming at whatever the naming rules found.
+	RE::NiAVObject* aimReference = nullptr;
+	if (const auto& pinnedAim = GetSelectedReticleSurfaceName();
+		!pinnedAim.empty()) {
+		aimReference = FindShapeByExactName(aimSearchRoot, pinnedAim);
+	}
+	if (!aimReference) {
+		aimReference = FindObjectByPrefixNoCase(aimSearchRoot, "ReticleNode");
+	}
 	if (!aimReference || !IsDescendantOf(aimReference, scopeAiming) ||
 		!validBound(aimReference)) {
-		aimReference = FindObjectByPrefixNoCase(partsRoot, "Reticle");
+		aimReference = FindObjectByPrefixNoCase(aimSearchRoot, "Reticle");
+	}
+	if (!aimReference || !IsDescendantOf(aimReference, scopeAiming) ||
+		!validBound(aimReference)) {
+		aimReference = FindObjectByPrefixNoCase(aimSearchRoot, "Dot");
 	}
 	if (!aimReference ||
 		!IsDescendantOf(aimReference, scopeAiming) ||
@@ -1636,6 +2411,44 @@ STSApertureSelection FindSTSAperture(RE::NiAVObject* firstPersonRoot)
 		previousWorldCenter = planeBound.center;
 	}
 
+	// Both numbers side by side. The ratio between them is what the synthesized
+	// path has to justify: the heuristic is what the eye box normalizes
+	// against, the measurement is the physical rim, and on ScopeFade they
+	// differ by the hardcoded 3.0.
+	//
+	// Once per selected shape, not once per process. This was std::call_once,
+	// which reported only the session's first scope and made a later scope
+	// producing no optic impossible to diagnose from the log.
+	static const void* lastSizedAperture = nullptr;
+	if (measurementValid && lastSizedAperture != opticalPlane) {
+		lastSizedAperture = opticalPlane;
+		{
+			const RE::NiPoint3 centreShift =
+				synthesisMeasurement.opticalCenter -
+				synthesisMeasurement.centroid;
+			logger::info(
+				"Aperture sizing for '{}' (optic from '{}'): "
+				"heuristic={:.4f}, measured={:.4f}, "
+				"heuristicOverMeasured={:.3f}, innerRatio={:.3f}, "
+				"opticalAxis=local{}, meanToExtentShift={:.4f}",
+				chosen->name,
+				synthesisSource ? synthesisSource->name.c_str() : "<none>",
+				apertureRadius,
+				measuredWorldRadius,
+				measuredWorldRadius > 0.0001F ?
+					apertureRadius / measuredWorldRadius :
+					0.0F,
+				measuredInnerRatio,
+				synthesisMeasurement.thinnestAxis == 0 ?
+					"X" :
+					(synthesisMeasurement.thinnestAxis == 1 ? "Y" : "Z"),
+				std::sqrt(
+					centreShift.x * centreShift.x +
+					centreShift.y * centreShift.y +
+					centreShift.z * centreShift.z));
+		}
+	}
+
 	return {
 		opticalPlane,
 		renderSurface,
@@ -1646,7 +2459,15 @@ STSApertureSelection FindSTSAperture(RE::NiAVObject* firstPersonRoot)
 		planeBound.center,
 		previousWorldCenter,
 		aimReference->worldBound.center,
-		apertureRadius
+		apertureRadius,
+		measurementValid,
+		measuredWorldRadius,
+		measuredInnerRatio,
+		synthesisMeasurement.thinnestAxis,
+		synthesisMeasurement.opticalCenter,
+		synthesisSource,
+		synthesisMeasurement.outerRadius,
+		planeMeasurement.measured ? planeMeasurement.outerRadius : 0.0F
 	};
 }
 
@@ -2561,6 +3382,31 @@ void HookedUpdate()
 				hookIns->bEnableEditMode.load(std::memory_order_acquire);
 			const auto editorPreview =
 				ImGuiImpl::GetEditorPreviewSnapshot();
+			// Live editor values reach the shader only through this preview,
+			// and it is gated on a revision match. A stale revision silently
+			// drops every unsaved edit and falls back to the profile's saved
+			// values -- 1x magnification on a profile that was never saved,
+			// which looks exactly like the optical path doing nothing. Say so
+			// rather than leaving it to be inferred from a missing effect.
+			if (editing && editorPreview.active &&
+				editorPreview.selectionRevision != zoomSelectionRevision) {
+				static std::uint64_t lastReportedRevisionPair = 0U;
+				const std::uint64_t pair =
+					(static_cast<std::uint64_t>(
+						 editorPreview.selectionRevision)
+						<< 32U) |
+					static_cast<std::uint32_t>(zoomSelectionRevision);
+				if (lastReportedRevisionPair != pair) {
+					lastReportedRevisionPair = pair;
+					logger::warn(
+						"Editor preview ignored: snapshot revision {} does not "
+						"match selection revision {}. Unsaved edits including "
+						"magnification are not being applied; the saved "
+						"profile values are in use instead",
+						editorPreview.selectionRevision,
+						zoomSelectionRevision);
+				}
+			}
 			if (editing &&
 				editorPreview.active &&
 				editorPreview.selectionRevision == zoomSelectionRevision) {
@@ -2928,8 +3774,34 @@ void HookedUpdate()
 			RE::NiPoint3 previousScopeProjectionPoint{};
 			RE::NiPoint3 aimProjectionPoint{};
 			float scopeWorldRadius = 0.0F;
+			// The vertex-measured radius of the selected mesh, which is what
+			// the synthesized aperture is drawn at. Zero means the shape had no
+			// readable CPU vertex copy, and the synthesized path stays off.
+			float scopeMeasuredRadius = 0.0F;
+			int scopeOpticalAxis = 1;
+			// The optical centre from the mesh's own vertices, used to place
+			// the synthesized ring. Everything else still uses the published
+			// bound centre, so this cannot move the existing paths.
+			RE::NiPoint3 scopeMeasuredCenter{};
+			// The disc-like mesh that sizes and places the synthesized optic.
+			RE::NiAVObject* scopeSynthSource = nullptr;
+			// The optical plane's own model-space rim, which is the unit the
+			// magnify shader's lens coordinates are in.
+			float scopeLensLocalRadius = 0.0F;
+			// Whether this aperture can drive the authored-geometry replay.
+			// It decides which signal proves the optic rendered this frame.
+			bool scopeSupportsExactReplay = true;
 			if (currentData->autoProfile) {
+				Hook::HangDiag::updateTicks.fetch_add(
+					1U,
+					std::memory_order_relaxed);
+				Hook::HangDiag::updatePhase.store(
+					1,
+					std::memory_order_relaxed);
 				const auto aperture = FindSTSAperture(firstPersonRoot);
+				Hook::HangDiag::updatePhase.store(
+					2,
+					std::memory_order_relaxed);
 				scopeNode = aperture.opticalPlane;
 				// Withhold the draw identity when the aperture is not the
 				// standardized annulus. Publishing it would let the replay
@@ -2954,6 +3826,62 @@ void HookedUpdate()
 					aperture.previousWorldCenter;
 				aimProjectionPoint = aperture.aimWorldCenter;
 				scopeWorldRadius = aperture.worldRadius;
+				// Lens Size is applied to the generated geometry rather than
+				// only to the shader mask, because the mask cannot grow the
+				// optic past the silhouette that is drawn -- which is exactly
+				// why raising it did nothing when it lived on the mask alone.
+				const float lensSize = std::clamp(
+					currentData->shaderData.lensScale,
+					0.05F,
+					8.0F);
+				// The x3 that used to sit here was a mistake founded on a
+				// circular measurement: heuristicOverMeasured reads 3.0 on
+				// every scope because the heuristic IS planeRadius * 3.0 and
+				// the measurement approximately equals planeRadius. The
+				// captured-placement path needs no compensation at all -- the
+				// game's own vertex shader places the ring -- and the NDC
+				// fallback keeps whatever error the CPU projection has rather
+				// than an invented constant on top of it.
+				scopeMeasuredRadius = aperture.measurementValid ?
+					aperture.measuredWorldRadius * lensSize :
+					0.0F;
+				scopeOpticalAxis = aperture.measuredOpticalAxis;
+				scopeSupportsExactReplay = aperture.supportsExactReplay;
+				scopeSynthSource = aperture.synthesisSource;
+				scopeLensLocalRadius = aperture.lensLocalRadius;
+
+				// Feed the classifier the synthesis source's draw identity
+				// and the model-space ring frame. The captured-placement
+				// path draws at the mesh's own local radius; the game's
+				// transform constants apply world scale exactly as they did
+				// to the mesh's vertices.
+				if (!aperture.supportsExactReplay &&
+					aperture.measurementValid && scopeSynthSource &&
+					MagnaScope::GetSettings().AllowsSynthesizedAperture()) {
+					hookIns->PublishSynthesisPlacement(
+						scopeSynthSource,
+						aperture.measuredLocalCentroid,
+						aperture.measuredLocalRadius * lensSize,
+						aperture.measuredOpticalAxis);
+				} else {
+					Hook::D3D::InvalidateSynthesisPlacement();
+				}
+
+				// Place the NDC fallback ring on the measured optical centre
+				// of the synthesis source rather than on worldBound.center.
+				// On specter_lens_rear the two disagree by roughly 570 screen
+				// pixels vertically, which put the whole optic below the
+				// scope it belongs to.
+				if (aperture.measurementValid && scopeSynthSource) {
+					scopeMeasuredCenter =
+						scopeSynthSource->world *
+						aperture.measuredLocalCentroid;
+					if (!IsFinitePoint(scopeMeasuredCenter)) {
+						scopeMeasuredCenter = aperture.worldCenter;
+					}
+				} else {
+					scopeMeasuredCenter = aperture.worldCenter;
+				}
 
 				if (scopeNode && IsInADS(player)) {
 					static RE::NiAVObject* lastLoggedAperture = nullptr;
@@ -2996,6 +3924,51 @@ void HookedUpdate()
 							scopeWorldRadius,
 							firstPersonFov);
 					tempOut = apertureProjection.center;
+
+					// Everything Convert Zoom Data needs, measured where the
+					// camera, the aim reference, the scope node and the
+					// projected radius are all in hand at once. The editor
+					// cannot derive any of it: BGSZoomData's offsets are
+					// relative to a default eye position the engine never
+					// exposes.
+					ImGuiImpl::ApertureGeometrySnapshot geometry{};
+					// SightHelper's formula, unchanged. cameraOffset is the
+					// camera-space vector from this Camera node to the point
+					// that should sit on the view axis, so camera-space X and Y
+					// map straight onto offset X and Z with no negation. The
+					// signs I previously inferred from the projection's
+					// ndcX = -cameraPoint.x convention were both wrong.
+					const RE::NiPoint3 aimCameraSpace =
+						camNode->world.rotate *
+						(aimProjectionPoint - camNode->world.translate);
+					geometry.offsetFrameX = aimCameraSpace.x;
+					geometry.offsetFrameZ = aimCameraSpace.y;
+					geometry.offsetFrameY = -aimCameraSpace.z;
+					geometry.distance = std::sqrt(
+						aimCameraSpace.x * aimCameraSpace.x +
+						aimCameraSpace.y * aimCameraSpace.y +
+						aimCameraSpace.z * aimCameraSpace.z);
+					geometry.projectedRadiusPixels = 0.5F *
+						(apertureProjection.radiusX +
+							apertureProjection.radiusY);
+
+					// The forward depth of the glass itself. A bounding sphere
+					// around the whole sighted assembly was the wrong measure:
+					// its near face is not the eyepiece, and trusting it let
+					// the eye travel to within 3.9 units of a lens 18.75 units
+					// away -- i.e. inside the optic.
+					const RE::NiPoint3 apertureCameraSpace =
+						camNode->world.rotate *
+						(scopeProjectionPoint - camNode->world.translate);
+					geometry.apertureForwardDistance = -apertureCameraSpace.z;
+					geometry.selectionRevision = zoomSelectionRevision;
+					geometry.available =
+						std::isfinite(geometry.distance) &&
+						geometry.distance > 0.01F &&
+						apertureProjection.valid;
+					if (geometry.available) {
+						ImGuiImpl::PublishApertureGeometry(geometry);
+					}
 				} else {
 					tempOut = hookIns->WorldPointToScreen(
 						camNode,
@@ -3061,14 +4034,79 @@ void HookedUpdate()
 						// transition and the eye-box filters.
 						const float opticalFrameDelta =
 							AcquireOpticalFrameDelta();
+						// Reproject the synthesized aperture ring for this
+						// frame. It is generated from the selected mesh's
+						// transform and measured radius, so it tracks recoil,
+						// sway and weapon movement the same way the authored
+						// ScopeFade does -- there is no smoothing or carried
+						// state to go stale.
+						//
+						// This runs before the activation update because the
+						// ring's validity is what stands in for the observed
+						// ScopeFade draw below.
+						bool synthesizedRingValid = false;
+						Hook::HangDiag::updatePhase.store(
+							3,
+							std::memory_order_relaxed);
+						if (MagnaScope::GetSettings()
+								.AllowsSynthesizedAperture() &&
+							scopeMeasuredRadius > 0.0F && scopeSynthSource) {
+							synthesizedRingValid =
+								hookIns->PublishSynthesizedApertureRing(
+									camNode,
+									scopeSynthSource,
+									scopeMeasuredCenter,
+									scopeMeasuredRadius,
+									scopeOpticalAxis,
+									firstPersonFov);
+						} else {
+							Hook::D3D::InvalidateSynthesizedApertureRing();
+						}
+
+						// Activation normally waits for ScopeAiming to actually
+						// submit its ScopeFade draw, because a matched draw is
+						// proof the optic rendered this frame. A synthesized
+						// aperture has no such draw: nothing is published for
+						// the classifier to match, so that signal is false
+						// forever, activation never leaves zero, and the pixel
+						// shader's magnification stays at lerp(1, x, 0) == 1.
+						// The lens then draws correctly and does nothing
+						// visible, which is exactly what a scope without an
+						// authored ScopeFade reported.
+						//
+						// Stand in for it with the two facts that are actually
+						// available: the player is sighted, and a ring was
+						// built this frame from live scene-graph data. Both are
+						// per-frame, so a lost aperture still stops activation
+						// advancing rather than latching it on.
+						const bool exactApertureVisible =
+							Hook::D3D::automaticSTSScopeFadeVisibleLastFrame
+								.load(std::memory_order_acquire);
+						// A matched placement draw is the synthesized optic's
+						// proof of rendering, and it is the strongest signal
+						// available: the lens mesh was actually submitted this
+						// frame. The CPU-projected ring is only a secondary
+						// witness now -- tying activation to it alone left
+						// activation pinned at zero whenever that projection
+						// failed, which multiplied the entire optical result,
+						// magnification included, by nothing.
+						const bool placementVisible =
+							Hook::D3D::automaticSTSPlacementVisibleLastFrame
+								.load(std::memory_order_acquire);
+						const bool apertureVisible =
+							scopeSupportsExactReplay ?
+								exactApertureVisible :
+								((placementVisible || synthesizedRingValid) &&
+									IsInADS(player));
 						const float activationProgress =
 							UpdateAutomaticSTSTracking(
 								scopeNode,
 								apertureProjection,
-								Hook::D3D::
-									automaticSTSScopeFadeVisibleLastFrame.load(
-										std::memory_order_acquire),
+								apertureVisible,
 								opticalFrameDelta);
+						Hook::HangDiag::updatePhase.store(
+							4,
+							std::memory_order_relaxed);
 						const Hook::D3D::PhysicalEyeBoxSample physicalEyeBox =
 							UpdateAutomaticSTSEyeBoxTracking(
 								currentData,
@@ -3079,7 +4117,12 @@ void HookedUpdate()
 								firstPersonFov,
 								activationProgress,
 								opticalFrameDelta,
-								tempOut);
+								tempOut,
+								aimProjectionPoint,
+								scopeLensLocalRadius);
+						Hook::HangDiag::updatePhase.store(
+							0,
+							std::memory_order_relaxed);
 						// Physical aperture and authored reticle centers must use the
 						// same current-frame projection as the ScopeFade geometry and
 						// lens basis. Smoothing either point against current geometry
