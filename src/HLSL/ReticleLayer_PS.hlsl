@@ -22,11 +22,20 @@ struct ReticleCompositeOutput
 
 ReticleCompositeOutput SampleAuthoredReticle(float2 uv)
 {
+    // The layer holds the reticle at the coordinates of the viewport it was
+    // CAPTURED with, and under dynamic resolution that is a top-left
+    // sub-rectangle of the target. The scene behind this composite was
+    // upscaled out of that subrect by the game; the private layer never was,
+    // so the output-space coordinate must be mapped back into the subrect
+    // here. At full render resolution both scales are exactly 1.
+    const float2 captureUv = uv * float2(
+        clamp(SCOPE_RETICLE_CAPTURE_SCALE_X, 0.05f, 1.0f),
+        clamp(SCOPE_RETICLE_CAPTURE_SCALE_Y, 0.05f, 1.0f));
     ReticleCompositeOutput output;
     const float4 blackCapture =
-        tBACKBUFFER.SampleLevel(gSamLinear, uv, 0.0f);
+        tBACKBUFFER.SampleLevel(gSamLinear, captureUv, 0.0f);
     const float4 whiteCapture =
-        ReticleTex.SampleLevel(gSamLinear, uv, 0.0f);
+        ReticleTex.SampleLevel(gSamLinear, captureUv, 0.0f);
     output.sourceContribution = blackCapture;
     output.destinationTransmittance =
         saturate(whiteCapture - blackCapture);

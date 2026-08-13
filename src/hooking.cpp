@@ -1920,10 +1920,28 @@ namespace Hook
 	std::atomic<float> gLastPublishedPhysicalEyeBoxValid{ 0.0F };
 
 	// Inverse of DecodeHalfFloat in main.cpp, for writing the game-format
-	// vertex stream. Truncating rather than round-to-nearest; the half a ULP
-	// this loses is far below vertex quantization in the authored meshes.
+	// vertex stream.
+	//
+	// Round-to-nearest-even, not truncation. The old comment argued the half
+	// ULP truncation loses is below authored-mesh quantization, which is true
+	// of the authored meshes and false of the synthesized ring this actually
+	// writes: that ring is encoded in the source mesh's model space, where the
+	// measured optical centre sits eight-plus units from the origin and a half
+	// ULP is two thousandths of a unit -- and truncation is a bias, not noise,
+	// so the error does not average out across the ring. The fill shader
+	// fabricates the centre fan from these vertices, and biased quantization
+	// scattered the fabricated apexes visibly at magnification.
 	std::uint16_t EncodeHalfFloat(float value)
 	{
+		{
+			std::uint16_t rounded = 0U;
+			if (MagnaScope::ReticleVertexScaling::FloatToHalf(
+					value,
+					rounded)) {
+				return rounded;
+			}
+		}
+		// Out of fp16 range or non-finite: keep the original saturation.
 		std::uint32_t bits = 0U;
 		std::memcpy(&bits, &value, sizeof(bits));
 		const auto sign = static_cast<std::uint16_t>((bits >> 16U) & 0x8000U);
@@ -3196,6 +3214,32 @@ namespace Hook
 			scopeReticleSize.load(std::memory_order_acquire),
 			0.01F,
 			128.0F);
+		resolution.apertureInnerRatio = std::clamp(
+			scopeApertureInnerRatio.load(std::memory_order_acquire),
+			0.05F,
+			0.95F);
+		// Capture-to-composite viewport ratio for the reticle layer. Identity
+		// unless a capture actually ran and rasterized into a sub-viewport of
+		// the target, which is what dynamic resolution does; see the capture
+		// site. Clamped to at most 1: the weapon pass never renders larger
+		// than the target, so a ratio above one is a stale or torn reading
+		// and identity is the safe interpretation.
+		{
+			const float captureWidth =
+				reticleCaptureViewportWidth.load(std::memory_order_acquire);
+			const float captureHeight =
+				reticleCaptureViewportHeight.load(std::memory_order_acquire);
+			if (std::isfinite(captureWidth) && captureWidth > 1.0F &&
+				renderWidth > 1.0F) {
+				resolution.reticleCaptureScaleX =
+					std::clamp(captureWidth / renderWidth, 0.05F, 1.0F);
+			}
+			if (std::isfinite(captureHeight) && captureHeight > 1.0F &&
+				renderHeight > 1.0F) {
+				resolution.reticleCaptureScaleY =
+					std::clamp(captureHeight / renderHeight, 0.05F, 1.0F);
+			}
+		}
 		resolution.reticleOffsetX = std::clamp(
 			scopeReticleOffsetX.load(std::memory_order_acquire),
 			-1000.0F,
@@ -3565,6 +3609,10 @@ namespace Hook
 		g_Context->PSSetShaderResources(4, 1, &source);
 		g_Context->PSSetSamplers(0, 1, &sampler);
 		g_Context->PSSetConstantBuffers(4, 1, &resolutionBuffer);
+		// The fill geometry shader reads the aperture's measured inner-rim
+		// ratio from b4; without this bind it would derive lens coordinates
+		// and the centre fan from whatever the game left in the slot.
+		g_Context->GSSetConstantBuffers(4, 1, &resolutionBuffer);
 		if (scopeEffectBuffer) {
 			g_Context->PSSetConstantBuffers(5, 1, &scopeEffectBuffer);
 		}
@@ -3819,6 +3867,10 @@ namespace Hook
 			g_Context->PSSetShaderResources(4, 1, &source);
 			g_Context->PSSetSamplers(0, 1, &sampler);
 			g_Context->PSSetConstantBuffers(4, 1, &resolutionBuffer);
+		// The fill geometry shader reads the aperture's measured inner-rim
+		// ratio from b4; without this bind it would derive lens coordinates
+		// and the centre fan from whatever the game left in the slot.
+		g_Context->GSSetConstantBuffers(4, 1, &resolutionBuffer);
 			if (scopeEffectBuffer) {
 				g_Context->PSSetConstantBuffers(5, 1, &scopeEffectBuffer);
 			}
@@ -3951,6 +4003,10 @@ namespace Hook
 		g_Context->PSSetShaderResources(4, 1, &source);
 		g_Context->PSSetSamplers(0, 1, &sampler);
 		g_Context->PSSetConstantBuffers(4, 1, &resolutionBuffer);
+		// The fill geometry shader reads the aperture's measured inner-rim
+		// ratio from b4; without this bind it would derive lens coordinates
+		// and the centre fan from whatever the game left in the slot.
+		g_Context->GSSetConstantBuffers(4, 1, &resolutionBuffer);
 		if (scopeEffectBuffer) {
 			g_Context->PSSetConstantBuffers(5, 1, &scopeEffectBuffer);
 		}
@@ -4286,6 +4342,26 @@ namespace Hook
 		if (!context || !sourceTarget) {
 			return false;
 		}
+		// Leave the reticle entirely alone until the optic is actually doing
+		// something.
+		//
+		// This capture diverts the authored reticle draw into a private target
+		// with DepthEnable FALSE, because inside the layer there is nothing for
+		// it to test against. The composite then puts it back unconditionally.
+		// That is right while looking through the scope, and wrong the rest of
+		// the time: at the hip the reticle is geometry sitting inside a tube,
+		// kept out of sight by the housing occluding it. Capturing it without
+		// depth and compositing it over the frame resurrects it, so it floats
+		// in the open air away from the weapon -- the reticle appearing
+		// detached from the optic, with no editor or profile involvement.
+		//
+		// Below any activation there is no magnified layer to keep it attached
+		// to, so the correct behaviour is simply not to intercept the draw and
+		// let Fallout render it with its own depth state.
+		if (projectedActivationProgress.load(std::memory_order_acquire) <=
+			0.0F) {
+			return false;
+		}
 		if (context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE ||
 			!g_Context.Get() ||
 			!HaveSameCOMIdentity(context, g_Context.Get())) {
@@ -4565,6 +4641,25 @@ namespace Hook
 				opaqueWhite);
 			mAutomaticSTSReticleLayerReady = false;
 			mAutomaticSTSReticleLayerCaptureGeneration = frameGeneration;
+			// The viewport the authored draw is about to rasterize with. It is
+			// deliberately left bound -- the game positioned this draw for that
+			// viewport -- but the composite has to know its extent: under
+			// dynamic resolution it is a top-left sub-rectangle of the target,
+			// the game upscales its own subrect to the output, and nothing
+			// upscales this layer. The composite divides its sample through
+			// these dimensions; without them it read the layer 1:1 and drew
+			// the reticle uniformly shrunk toward the top-left corner.
+			UINT captureViewportCount = 1U;
+			D3D11_VIEWPORT captureViewport{};
+			context->RSGetViewports(
+				&captureViewportCount,
+				&captureViewport);
+			reticleCaptureViewportWidth.store(
+				captureViewportCount > 0U ? captureViewport.Width : 0.0F,
+				std::memory_order_release);
+			reticleCaptureViewportHeight.store(
+				captureViewportCount > 0U ? captureViewport.Height : 0.0F,
+				std::memory_order_release);
 		}
 		ID3D11RenderTargetView* const layerTarget =
 			whiteBackground ?
@@ -4737,6 +4832,82 @@ namespace Hook
 			!m_pPixelShader_STSReticleLayer.Get() ||
 			!m_pVertexShader_Legacy.Get() || !compositeTarget) {
 			return false;
+		}
+
+		// Everything the reticle composite's placement depends on, in one line.
+		//
+		// The reticle has been observed rendering far outside the optic on some
+		// scopes while the sight picture itself is correct, and the two
+		// transforms that could move it are both provably identity at default
+		// settings: the vertex-scaling path never prepares, and the layer's
+		// own scale is (ReticleSize / 4) * magnification, which is 1 at the
+		// authored 4.0 and 1.0. What remains is a disagreement between the
+		// space the layer was captured in and the space it is sampled back in,
+		// so report both, plus the pivot the sampling is built on.
+		//
+		// PixelSize and BUFFER_WIDTH/HEIGHT in ReticleLayer_PS come from the
+		// resolution buffer, and the layer texture is sized from the live
+		// render target. If those two disagree the composite reads the layer at
+		// the wrong scale and the reticle lands somewhere else entirely.
+		{
+			static std::atomic_uint32_t compositeLogCountdown{ 0U };
+			if (compositeLogCountdown.fetch_add(
+					1U,
+					std::memory_order_relaxed) %
+					600U ==
+				0U) {
+				D3D11_TEXTURE2D_DESC layerDescription{};
+				if (mAutomaticSTSReticleLayerTexture.Get()) {
+					mAutomaticSTSReticleLayerTexture->GetDesc(
+						&layerDescription);
+				}
+				UINT viewportCount = 1U;
+				D3D11_VIEWPORT viewport{};
+				g_Context->RSGetViewports(&viewportCount, &viewport);
+				D3D11_TEXTURE2D_DESC targetDescription{};
+				{
+					ComPtr<ID3D11Resource> targetResource;
+					compositeTarget->GetResource(
+						targetResource.GetAddressOf());
+					ComPtr<ID3D11Texture2D> targetTexture;
+					if (targetResource.Get() &&
+						SUCCEEDED(targetResource.As(&targetTexture)) &&
+						targetTexture.Get()) {
+						targetTexture->GetDesc(&targetDescription);
+					}
+				}
+				const auto snapshot = GetLensProjectionSnapshot();
+				logger::info(
+					"Reticle layer composite: layer={}x{}, target={}x{}, "
+					"viewport={:.0f}x{:.0f} at ({:.0f}, {:.0f}), "
+					"captureViewport={:.0f}x{:.0f}, "
+					"projectionSource={:.0f}x{:.0f}, "
+					"aimCenter=({:.1f}, {:.1f}), lensCenter=({:.1f}, {:.1f}), "
+					"reticleSize={:.2f}, reticleMagnification={:.2f}, "
+					"activation={:.2f}",
+					layerDescription.Width,
+					layerDescription.Height,
+					targetDescription.Width,
+					targetDescription.Height,
+					viewport.Width,
+					viewport.Height,
+					viewport.TopLeftX,
+					viewport.TopLeftY,
+					reticleCaptureViewportWidth.load(
+						std::memory_order_acquire),
+					reticleCaptureViewportHeight.load(
+						std::memory_order_acquire),
+					snapshot.sourceWidth,
+					snapshot.sourceHeight,
+					snapshot.aimCenterX,
+					snapshot.aimCenterY,
+					snapshot.centerX,
+					snapshot.centerY,
+					scopeReticleSize.load(std::memory_order_acquire),
+					scopeReticleMagnification.load(std::memory_order_acquire),
+					projectedActivationProgress.load(
+						std::memory_order_acquire));
+			}
 		}
 
 		const std::vector<VSConstantBufferSlot> noVertexConstants;
@@ -8876,6 +9047,9 @@ namespace Hook
 	std::atomic<float> D3D::projectedAimLensX = 0.0F;
 	std::atomic<float> D3D::projectedAimLensY = 0.0F;
 	std::atomic_bool D3D::projectedAimLensValid = false;
+	std::atomic<float> D3D::reticleCaptureViewportWidth = 0.0F;
+	std::atomic<float> D3D::reticleCaptureViewportHeight = 0.0F;
+	std::atomic<float> D3D::scopeApertureInnerRatio = 0.5F;
 	std::atomic<float> D3D::projectedPhysicalEyeBoxBlend = 0.0F;
 	std::atomic_bool D3D::projectedPhysicalEyeBoxReady = false;
 	std::atomic_bool D3D::projectedTrackingReady = false;

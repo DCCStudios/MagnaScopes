@@ -306,7 +306,11 @@ namespace ImGuiImpl
 	{
 		kNone,
 		kReselect,
-		kReload
+		kReload,
+		// Removes this scope's preset file and drops the cached in-memory
+		// profile, so the next time the scope is selected it is synthesized
+		// from defaults again.
+		kDeletePreset
 	};
 
 	bool RegisterMenu();
@@ -367,8 +371,14 @@ namespace ImGuiImpl
 	void ClearEditorPreview();
 	void RequestProfileAction(ProfileRequest request);
 	[[nodiscard]] ProfileRequest ConsumeProfileAction();
-	void RequestProfileSave(const ScopeData::ScopeProfile& profile);
-	[[nodiscard]] std::unique_ptr<ScopeData::ScopeProfile> ConsumeProfileSave();
+	// writeToDisk false applies the snapshot to the in-memory profile only.
+	// That is what makes editor changes outlive the edit session without
+	// creating a preset file.
+	void RequestProfileSave(
+		const ScopeData::ScopeProfile& profile,
+		bool writeToDisk = true);
+	[[nodiscard]] std::unique_ptr<ScopeData::ScopeProfile> ConsumeProfileSave(
+		bool& writeToDisk);
 
 	class ImGuiImplClass
 	{
@@ -380,39 +390,45 @@ namespace ImGuiImpl
 	public:
 		std::atomic_bool bIsSaving{ false };
 
+		// Snapshot of every editor value, laid over the supplied profile.
+		// Shared by Save Profile and by the session-only apply that ends an
+		// edit session, so the two cannot capture different sets of values.
+		[[nodiscard]] ScopeData::ScopeProfile BuildEditedProfile(
+			const ScopeData::ScopeProfile& base);
+
 		ScopeData::ZoomDataOverwrite Imgui_ZDO;
 		ScopeData::ZoomDataOverwrite ori_ZDO;
 
-		bool bLegacyMode;
-		bool UsingSTS_UI;
-		int scopeFrame_UI;
-		float fovBase_UI;
-		bool IsCircle_UI;
-		float camDepth_UI;
-		float ReticleSize_UI;
-		float reticle_Offset[2];
-		float minZoom_UI;
-		float maxZoom_UI;
-		float PositionOffset_UI[2];
-		float OriPositionOffset_UI[2];
-		float Size_UI[2];
-		float Size_rect_UI[4];
-		float OriSize_UI[2];
-		float fishEyeStrength_UI;
-		float fishEyePower_UI;
-		float edgeRefractionStrength_UI;
-		float edgeRefractionWidth_UI;
-		float edgeChromaticAberration_UI;
-		float imageDenoise_UI;
-		float imageSharpen_UI;
+		bool bLegacyMode = true;
+		bool UsingSTS_UI = false;
+		int scopeFrame_UI = 1;
+		float fovBase_UI = 0.0F;
+		bool IsCircle_UI = true;
+		float camDepth_UI = 1.0F;
+		float ReticleSize_UI = 4.0F;
+		float reticle_Offset[2] = { 0.0F, 0.0F };
+		float minZoom_UI = 1.0F;
+		float maxZoom_UI = 4.0F;
+		float PositionOffset_UI[2] = { 0.0F, 0.0F };
+		float OriPositionOffset_UI[2] = { 0.0F, 0.0F };
+		float Size_UI[2] = { 200.0F, 0.0F };
+		float Size_rect_UI[4] = { 235.0F, 200.0F, 775.0F, 760.0F };
+		float OriSize_UI[2] = { 200.0F, 0.0F };
+		float fishEyeStrength_UI = 0.0F;
+		float fishEyePower_UI = 2.0F;
+		float edgeRefractionStrength_UI = 0.0F;
+		float edgeRefractionWidth_UI = 0.15F;
+		float edgeChromaticAberration_UI = 0.0F;
+		float imageDenoise_UI = 0.0F;
+		float imageSharpen_UI = 0.0F;
 		float reticleMagnification_UI = 1.0F;
 		float reticleShadowStrength_UI = 0.0F;
 		float reticleParallaxStrength_UI = 1.0F;
-		float radius_UI;
-		float relativeFogRadius_UI;
-		float scopeSwayAmount_UI;
-		float maxTravel_UI;
-		float sceneParallaxStrength_UI;
+		float radius_UI = 2.0F;
+		float relativeFogRadius_UI = 9.0F;
+		float scopeSwayAmount_UI = 3.0F;
+		float maxTravel_UI = 4.0F;
+		float sceneParallaxStrength_UI = 0.0F;
 		float opticalLagStrength_UI = 1.0F;
 		float sceneDepth_UI = 1.0F;
 		float shadowDepth_UI = 1.0F;
@@ -433,6 +449,25 @@ namespace ImGuiImpl
 		float breathPupilFollow_UI = 1.0F;
 		std::uint64_t selectionRevision_UI = 0;
 
+		// True once ResetUIData has copied the selected profile into the _UI
+		// members above. They have no constructor, so before that they hold
+		// whatever was in the allocation, and anything that writes them back
+		// into a profile has to check this first.
+		bool uiValuesLoaded = false;
+
+		// Draws a full-screen crosshair on the exact centre of the viewport,
+		// which is where a shot lands. The optic's own reticle is the point of
+		// aim, and the two agree only once the camera offsets are right, so
+		// this is the reference the offsets are dialled against.
+		//
+		// Deliberately not part of ScopeProfile: it is an alignment aid for
+		// whoever is authoring a profile, not a property of the scope, and
+		// persisting it would leave it drawn over somebody's game.
+		//
+		// Atomic because the HUD callback and the editor window are separate
+		// Menu Framework callbacks.
+		std::atomic_bool alignmentCrosshair_UI{ false };
+
 		bool bEnableFG;
 		bool bEnableZMove;
 		bool bEnableNVGEffect;
@@ -451,6 +486,7 @@ namespace ImGuiImpl
 		bool CheckAndInit();
 		void ReloadData();
 		void SaveData();
+		void DeletePresetData();
 		void MainMenuSection();
 		void ShaderDataSection();
 		void ParallaxDataSection();

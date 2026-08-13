@@ -254,6 +254,15 @@ namespace ScopeData
 			float defaultMagnification,
 			float zoomSpread);
 		bool WriteAutoProfile(ScopeProfile* data);
+		// Drops the cached automatic profile so the next GetOrCreateAutoProfile
+		// synthesizes it from defaults again.
+		//
+		// Only the lookup entry is erased. The object itself stays owned by
+		// ownedData because callers hold raw pointers to it -- currentData among
+		// them -- and freeing it here would leave those dangling for the rest of
+		// the session. One orphaned profile per delete is the cheap side of that
+		// trade.
+		void ForgetAutoProfile(const ScopeProfile* data);
 
 		int GetEffectIndex();
 		void SetEffectIndex(int);

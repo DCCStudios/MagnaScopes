@@ -98,6 +98,11 @@ namespace ImGuiImpl
 		};
 		std::mutex profileSaveMutex;
 		std::unique_ptr<ScopeData::ScopeProfile> pendingProfileSave;
+		// False for the session-only apply that ends an edit session. The
+		// snapshot still reaches the in-memory profile, so the values survive
+		// closing the editor, re-equipping, and ADS cycles; only the JSON write
+		// is skipped, which is what "unsaved" now means.
+		bool pendingProfileSaveWritesToDisk = true;
 		MENU_WINDOW scopeEditorWindow = nullptr;
 		F4SEMenuFramework::Model::HudElement* scopeVisualProbe = nullptr;
 		// The popout is intended to be an interactive editor by default.
@@ -298,16 +303,22 @@ namespace ImGuiImpl
 			std::memory_order_acq_rel);
 	}
 
-	void RequestProfileSave(const ScopeData::ScopeProfile& profile)
+	void RequestProfileSave(
+		const ScopeData::ScopeProfile& profile,
+		bool writeToDisk)
 	{
 		std::scoped_lock lock(profileSaveMutex);
 		pendingProfileSave =
 			std::make_unique<ScopeData::ScopeProfile>(profile);
+		pendingProfileSaveWritesToDisk = writeToDisk;
 	}
 
-	std::unique_ptr<ScopeData::ScopeProfile> ConsumeProfileSave()
+	std::unique_ptr<ScopeData::ScopeProfile> ConsumeProfileSave(
+		bool& writeToDisk)
 	{
 		std::scoped_lock lock(profileSaveMutex);
+		writeToDisk = pendingProfileSaveWritesToDisk;
+		pendingProfileSaveWritesToDisk = true;
 		return std::move(pendingProfileSave);
 	}
 
@@ -577,6 +588,12 @@ namespace ImGuiImpl
 
 			additionalKeywords_count = data->additionalKeywords.size();
 			additionalKeywords = data->additionalKeywords;
+
+			// Only now do the _UI members describe this profile. Nothing may
+			// read them back into a profile before this point: they are plain
+			// members with no constructor, so until this runs they hold
+			// whatever was in the allocation.
+			ins->uiValuesLoaded = true;
 		}
 	}
 
@@ -592,6 +609,186 @@ namespace ImGuiImpl
 				ClearEditorPreview();
 				RequestProfileAction(ProfileRequest::kReload);
 			}
+		}
+	}
+
+	ScopeData::ScopeProfile ImGuiImplClass::BuildEditedProfile(
+		const ScopeData::ScopeProfile& base)
+	{
+		// One snapshot builder for both destinations. Saving writes it to
+		// disk; ending an edit session applies the identical snapshot to the
+		// in-memory profile only. They must not drift apart -- two builders
+		// would mean closing the editor kept a different set of values than
+		// saving did.
+		auto editedProfile = base;
+		editedProfile.legacyMode = bLegacyMode;
+		Hook::D3D::bLegacyMode = bLegacyMode;
+
+		editedProfile.UsingSTS = UsingSTS_UI;
+		editedProfile.scopeFrame = scopeFrame_UI;
+		editedProfile.shaderData.IsCircle = IsCircle_UI;
+		editedProfile.shaderData.bCanEnableNV = bEnableNVGEffect;
+		editedProfile.shaderData.baseWeaponPos = baseWeaponPos_UI;
+		editedProfile.shaderData.bEnableZMove = bEnableZMove;
+		editedProfile.shaderData.movePercentage = MovePercentage_UI;
+		editedProfile.shaderData.camDepth = camDepth_UI;
+		editedProfile.shaderData.ReticleSize = ReticleSize_UI;
+		editedProfile.shaderData.minZoom = minZoom_UI;
+		editedProfile.shaderData.maxZoom = maxZoom_UI;
+		editedProfile.shaderData.reticle_Offset[0] = reticle_Offset[0];
+		editedProfile.shaderData.reticle_Offset[1] = reticle_Offset[1];
+		editedProfile.shaderData.PositionOffset[0] = PositionOffset_UI[0];
+		editedProfile.shaderData.PositionOffset[1] = PositionOffset_UI[1];
+		editedProfile.shaderData.OriPositionOffset[0] = OriPositionOffset_UI[0];
+		editedProfile.shaderData.OriPositionOffset[1] = OriPositionOffset_UI[1];
+		editedProfile.shaderData.Size[0] = Size_UI[0];
+		editedProfile.shaderData.Size[1] = Size_UI[1];
+		editedProfile.shaderData.OriSize[0] = OriSize_UI[0];
+		editedProfile.shaderData.OriSize[1] = OriSize_UI[1];
+		editedProfile.shaderData.fishEyeStrength = fishEyeStrength_UI;
+		editedProfile.shaderData.fishEyePower = fishEyePower_UI;
+		editedProfile.shaderData.edgeRefractionStrength =
+			edgeRefractionStrength_UI;
+		editedProfile.shaderData.edgeRefractionWidth =
+			edgeRefractionWidth_UI;
+		editedProfile.shaderData.edgeChromaticAberration =
+			edgeChromaticAberration_UI;
+		editedProfile.shaderData.imageDenoise = imageDenoise_UI;
+		editedProfile.shaderData.imageSharpen = imageSharpen_UI;
+		editedProfile.shaderData.reticleMagnification =
+			reticleMagnification_UI;
+		editedProfile.shaderData.reticleShadowStrength =
+			std::clamp(reticleShadowStrength_UI, 0.0F, 1.0F);
+		editedProfile.shaderData.reticleParallaxStrength =
+			std::clamp(reticleParallaxStrength_UI, 0.0F, 4.0F);
+		editedProfile.shaderData.parallax.radius = radius_UI;
+		editedProfile.shaderData.parallax.relativeFogRadius = relativeFogRadius_UI;
+		editedProfile.shaderData.parallax.scopeSwayAmount = scopeSwayAmount_UI;
+		editedProfile.shaderData.parallax.maxTravel = maxTravel_UI;
+		editedProfile.shaderData.sceneParallaxStrength =
+			sceneParallaxStrength_UI;
+		editedProfile.shaderData.opticalLagStrength =
+			std::isfinite(opticalLagStrength_UI) ?
+				std::clamp(opticalLagStrength_UI, 0.0F, 4.0F) :
+				1.0F;
+		editedProfile.shaderData.parallax.sceneDepth =
+			std::clamp(sceneDepth_UI, 0.0F, 4.0F);
+		editedProfile.shaderData.parallax.shadowDepth =
+			std::clamp(shadowDepth_UI, 0.0F, 4.0F);
+		editedProfile.shaderData.parallax.imageStillness =
+			std::clamp(imageStillness_UI, 0.0F, 8.0F);
+		editedProfile.shaderData.parallax.axialBreathing =
+			std::clamp(axialBreathing_UI, 0.0F, 4.0F);
+		editedProfile.shaderData.parallax.recenterSpeed =
+			std::clamp(recenterSpeed_UI, 0.1F, 10.0F);
+		editedProfile.shaderData.apertureSurface = apertureSurface_UI;
+		editedProfile.shaderData.reticleSurface = reticleSurface_UI;
+		editedProfile.shaderData.parallax.strafeLag =
+			std::clamp(strafeLag_UI, 0.0F, 4.0F);
+		editedProfile.shaderData.parallax.tubeDepth =
+			std::clamp(tubeDepth_UI, 0.0F, 1.0F);
+		editedProfile.shaderData.lensOffset[0] =
+			std::clamp(lensOffset_UI[0], -1.0F, 1.0F);
+		editedProfile.shaderData.lensOffset[1] =
+			std::clamp(lensOffset_UI[1], -1.0F, 1.0F);
+		editedProfile.shaderData.lensScale =
+			std::clamp(lensScale_UI, 0.25F, 2.0F);
+		editedProfile.shaderData.breathing.rate =
+			std::clamp(breathRate_UI, 0.0F, 4.0F);
+		editedProfile.shaderData.breathing.sway =
+			std::clamp(breathSway_UI, 0.0F, 1.0F);
+		editedProfile.shaderData.breathing.drift =
+			std::clamp(breathDrift_UI, 0.0F, 1.0F);
+		editedProfile.shaderData.breathing.figure =
+			std::clamp(breathFigure_UI, 0.0F, 1.0F);
+		editedProfile.shaderData.breathing.hold =
+			std::clamp(breathHold_UI, 0.0F, 1.0F);
+		editedProfile.shaderData.breathing.pupilFollow =
+			std::clamp(breathPupilFollow_UI, 0.0F, 2.0F);
+		editedProfile.shaderData.bBoltDisable = bDisableWhileBolt;
+		editedProfile.shaderData.nvIntensity = nvIntensity_UI;
+		editedProfile.shaderData.fovAdjust = fovBase_UI;
+
+		editedProfile.shaderData.rectSize[0] = Size_rect_UI[0];
+		editedProfile.shaderData.rectSize[1] = Size_rect_UI[1];
+		editedProfile.shaderData.rectSize[2] = Size_rect_UI[2];
+		editedProfile.shaderData.rectSize[3] = Size_rect_UI[3];
+
+		// The override editor works on Imgui_ZDO directly; the live weapon
+		// only mirrors it as a preview, so save the editor values.
+		editedProfile.zoomDataOverwrite = Imgui_ZDO;
+
+		editedProfile.additionalKeywords = additionalKeywords;
+		return editedProfile;
+	}
+
+	void ApplyEditorValuesForSession()
+	{
+		// Every way out of edit mode has to come through here, and it has to
+		// run BEFORE bEnableEditMode is cleared.
+		//
+		// The game thread restores the profile's zoom onto the live weapon the
+		// moment it observes that flag drop, and it reads the pending snapshot
+		// earlier in the same update than it reads the flag. Clearing the flag
+		// first leaves a window where it sees "not editing" with nothing
+		// waiting, reverts the weapon to the pre-edit zoom, and consumes the
+		// one-shot that would have reapplied -- so the snapshot lands a frame
+		// later, updates the profile, and never reaches the weapon.
+		auto* const instance = ImGuiImplClass::GetSington();
+		auto* const profile = sdh ? sdh->GetCurrentScopeProfile() : nullptr;
+		if (!instance || !profile) {
+			return;
+		}
+		// Two conditions, and skipping either one corrupts the profile.
+		//
+		// The editor's _UI members have no initializers and are populated only
+		// by ResetUIData, which runs while the menu page is rendering. Calling
+		// BuildEditedProfile before that has happened for the current scope
+		// snapshots uninitialised memory into the profile -- and a junk
+		// reticle_Offset translates the reticle right out of the optic, on
+		// every scope visited afterwards, because the bad values persist for
+		// the session by design.
+		//
+		// The edit-mode check is what distinguishes leaving a real session from
+		// the menu simply closing. Both callers run this before clearing the
+		// flag, so it is still set on the path that should apply.
+		if (!instance->uiValuesLoaded ||
+			!Hook::D3D::bEnableEditMode.load(std::memory_order_acquire)) {
+			return;
+		}
+		RequestProfileSave(instance->BuildEditedProfile(*profile), false);
+	}
+
+	void ImGuiImplClass::DeletePresetData()
+	{
+		// Only automatic profiles own a file this can remove. A hand-authored
+		// profile is somebody's source document that MagnaScope did not write,
+		// and deleting it from a scope editor would be well outside what the
+		// button says.
+		auto* const profile = sdh ? sdh->GetCurrentScopeProfile() : nullptr;
+		const bool deletable =
+			profile && profile->autoProfile && !profile->path.empty();
+		if (!deletable) {
+			ImGui::BeginDisabled();
+		}
+		const bool pressed = ImGui::Button("Delete Preset", { 150, 0 });
+		Tip("Deletes this scope's saved preset file and returns it to the\n"
+			"automatic defaults.\n"
+			"\n"
+			"The cached profile is dropped as well, so the reset is visible\n"
+			"immediately rather than at the next launch.\n"
+			"\n"
+			"Only available for automatic profiles, which are the ones\n"
+			"MagnaScope wrote itself under\n"
+			"Data/F4SE/Plugins/MagnaScope/Auto.");
+		if (pressed) {
+			// File removal and cache eviction are game-thread work, like every
+			// other profile mutation here.
+			ClearEditorPreview();
+			RequestProfileAction(ProfileRequest::kDeletePreset);
+		}
+		if (!deletable) {
+			ImGui::EndDisabled();
 		}
 	}
 
@@ -612,107 +809,9 @@ namespace ImGuiImpl
 			// Build a detached value snapshot. HookedUpdate validates its
 			// profile identity, applies it to the selected profile, writes the
 			// JSON, and reselects the weapon entirely on the game thread.
-			auto editedProfile = *currData;
-			editedProfile.legacyMode = bLegacyMode;
-			Hook::D3D::bLegacyMode = bLegacyMode;
+			auto editedProfile = BuildEditedProfile(*currData);
 
-			editedProfile.UsingSTS = UsingSTS_UI;
-			editedProfile.scopeFrame = scopeFrame_UI;
-			editedProfile.shaderData.IsCircle = IsCircle_UI;
-			editedProfile.shaderData.bCanEnableNV = bEnableNVGEffect;
-			editedProfile.shaderData.baseWeaponPos = baseWeaponPos_UI;
-			editedProfile.shaderData.bEnableZMove = bEnableZMove;
-			editedProfile.shaderData.movePercentage = MovePercentage_UI;
-			editedProfile.shaderData.camDepth = camDepth_UI;
-			editedProfile.shaderData.ReticleSize = ReticleSize_UI;
-			editedProfile.shaderData.minZoom = minZoom_UI;
-			editedProfile.shaderData.maxZoom = maxZoom_UI;
-			editedProfile.shaderData.reticle_Offset[0] = reticle_Offset[0];
-			editedProfile.shaderData.reticle_Offset[1] = reticle_Offset[1];
-			editedProfile.shaderData.PositionOffset[0] = PositionOffset_UI[0];
-			editedProfile.shaderData.PositionOffset[1] = PositionOffset_UI[1];
-			editedProfile.shaderData.OriPositionOffset[0] = OriPositionOffset_UI[0];
-			editedProfile.shaderData.OriPositionOffset[1] = OriPositionOffset_UI[1];
-			editedProfile.shaderData.Size[0] = Size_UI[0];
-			editedProfile.shaderData.Size[1] = Size_UI[1];
-			editedProfile.shaderData.OriSize[0] = OriSize_UI[0];
-			editedProfile.shaderData.OriSize[1] = OriSize_UI[1];
-			editedProfile.shaderData.fishEyeStrength = fishEyeStrength_UI;
-			editedProfile.shaderData.fishEyePower = fishEyePower_UI;
-			editedProfile.shaderData.edgeRefractionStrength =
-				edgeRefractionStrength_UI;
-			editedProfile.shaderData.edgeRefractionWidth =
-				edgeRefractionWidth_UI;
-			editedProfile.shaderData.edgeChromaticAberration =
-				edgeChromaticAberration_UI;
-			editedProfile.shaderData.imageDenoise = imageDenoise_UI;
-			editedProfile.shaderData.imageSharpen = imageSharpen_UI;
-			editedProfile.shaderData.reticleMagnification =
-				reticleMagnification_UI;
-			editedProfile.shaderData.reticleShadowStrength =
-				std::clamp(reticleShadowStrength_UI, 0.0F, 1.0F);
-			editedProfile.shaderData.reticleParallaxStrength =
-				std::clamp(reticleParallaxStrength_UI, 0.0F, 4.0F);
-			editedProfile.shaderData.parallax.radius = radius_UI;
-			editedProfile.shaderData.parallax.relativeFogRadius = relativeFogRadius_UI;
-			editedProfile.shaderData.parallax.scopeSwayAmount = scopeSwayAmount_UI;
-			editedProfile.shaderData.parallax.maxTravel = maxTravel_UI;
-			editedProfile.shaderData.sceneParallaxStrength =
-				sceneParallaxStrength_UI;
-			editedProfile.shaderData.opticalLagStrength =
-				std::isfinite(opticalLagStrength_UI) ?
-					std::clamp(opticalLagStrength_UI, 0.0F, 4.0F) :
-					1.0F;
-			editedProfile.shaderData.parallax.sceneDepth =
-				std::clamp(sceneDepth_UI, 0.0F, 4.0F);
-			editedProfile.shaderData.parallax.shadowDepth =
-				std::clamp(shadowDepth_UI, 0.0F, 4.0F);
-			editedProfile.shaderData.parallax.imageStillness =
-				std::clamp(imageStillness_UI, 0.0F, 8.0F);
-			editedProfile.shaderData.parallax.axialBreathing =
-				std::clamp(axialBreathing_UI, 0.0F, 4.0F);
-			editedProfile.shaderData.parallax.recenterSpeed =
-				std::clamp(recenterSpeed_UI, 0.1F, 10.0F);
-			editedProfile.shaderData.apertureSurface = apertureSurface_UI;
-			editedProfile.shaderData.reticleSurface = reticleSurface_UI;
-			editedProfile.shaderData.parallax.strafeLag =
-				std::clamp(strafeLag_UI, 0.0F, 4.0F);
-			editedProfile.shaderData.parallax.tubeDepth =
-				std::clamp(tubeDepth_UI, 0.0F, 1.0F);
-			editedProfile.shaderData.lensOffset[0] =
-				std::clamp(lensOffset_UI[0], -1.0F, 1.0F);
-			editedProfile.shaderData.lensOffset[1] =
-				std::clamp(lensOffset_UI[1], -1.0F, 1.0F);
-			editedProfile.shaderData.lensScale =
-				std::clamp(lensScale_UI, 0.25F, 2.0F);
-			editedProfile.shaderData.breathing.rate =
-				std::clamp(breathRate_UI, 0.0F, 4.0F);
-			editedProfile.shaderData.breathing.sway =
-				std::clamp(breathSway_UI, 0.0F, 1.0F);
-			editedProfile.shaderData.breathing.drift =
-				std::clamp(breathDrift_UI, 0.0F, 1.0F);
-			editedProfile.shaderData.breathing.figure =
-				std::clamp(breathFigure_UI, 0.0F, 1.0F);
-			editedProfile.shaderData.breathing.hold =
-				std::clamp(breathHold_UI, 0.0F, 1.0F);
-			editedProfile.shaderData.breathing.pupilFollow =
-				std::clamp(breathPupilFollow_UI, 0.0F, 2.0F);
-			editedProfile.shaderData.bBoltDisable = bDisableWhileBolt;
-			editedProfile.shaderData.nvIntensity = nvIntensity_UI;
-			editedProfile.shaderData.fovAdjust = fovBase_UI;
-
-			editedProfile.shaderData.rectSize[0] = Size_rect_UI[0];
-			editedProfile.shaderData.rectSize[1] = Size_rect_UI[1];
-			editedProfile.shaderData.rectSize[2] = Size_rect_UI[2];
-			editedProfile.shaderData.rectSize[3] = Size_rect_UI[3];
-
-			// The override editor works on Imgui_ZDO directly; the live weapon
-			// only mirrors it as a preview, so save the editor values.
-			editedProfile.zoomDataOverwrite = Imgui_ZDO;
-
-			editedProfile.additionalKeywords = additionalKeywords;
-
-			RequestProfileSave(editedProfile);
+			RequestProfileSave(editedProfile, true);
 
 			bIsSaving.store(false, std::memory_order_release);
 		}
@@ -1058,6 +1157,34 @@ namespace ImGuiImpl
 					ImGui::TextDisabled(
 						"Camera preview is disabled for Stage 2a.");
 				}
+
+				// Outside the camera-override guard on purpose: seeing where
+				// the shot lands is useful even when the offsets themselves
+				// cannot be previewed.
+				bool alignmentCrosshair =
+					alignmentCrosshair_UI.load(std::memory_order_acquire);
+				if (ImGui::Checkbox(
+						"Show Alignment Crosshair",
+						&alignmentCrosshair)) {
+					alignmentCrosshair_UI.store(
+						alignmentCrosshair,
+						std::memory_order_release);
+				}
+				Tip("Draws a crosshair on the exact centre of the screen,\n"
+					"which is where your shot goes.\n"
+					"\n"
+					"The scope's own reticle is where the shot appears to go.\n"
+					"Aim at something and adjust Camera Offset X and Z until\n"
+					"the reticle sits on the crosshair; the two agreeing is\n"
+					"what a correctly aligned sight means.\n"
+					"\n"
+					"Convert Zoom Data puts the reticle mesh's centre on the\n"
+					"crosshair, which is not always the same point as the\n"
+					"aiming mark drawn on it -- a reticle whose stadia lines\n"
+					"run further one way than the other has its centre away\n"
+					"from its cross. That residual is what this is for.\n"
+					"\n"
+					"Not saved with the profile.");
 
 				// Companion control: the scope overlay's magnification, so the
 				// circle zoom can be rebalanced right where the game zoom is
@@ -1674,6 +1801,10 @@ namespace ImGuiImpl
 		bool editMode =
 			Hook::D3D::bEnableEditMode.load(std::memory_order_acquire);
 		if (ImGui::Checkbox("Edit Mode", &editMode)) {
+			if (!editMode) {
+				// Before the flag, not after. See ApplyEditorValuesForSession.
+				ApplyEditorValuesForSession();
+			}
 			Hook::D3D::bEnableEditMode.store(
 				editMode,
 				std::memory_order_release);
@@ -1684,7 +1815,10 @@ namespace ImGuiImpl
 			}
 		}
 		Tip("Live-preview changes on the equipped scope while you aim.\n"
-			"Closing the menu without saving reverts the preview.");
+			"\n"
+			"Leaving edit mode keeps your changes for the rest of the\n"
+			"session without writing a preset file. Use Reload Profile to\n"
+			"discard them, or Save Profile to keep them permanently.");
 
 		ImGui::SameLine();
 		if (ImGui::Checkbox("Hold Aim", &bHoldAim)) {
@@ -1704,6 +1838,8 @@ namespace ImGuiImpl
 		instance->ReloadData();
 		ImGui::SameLine();
 		instance->SaveData();
+		ImGui::SameLine();
+		instance->DeletePresetData();
 		ImGui::Spacing();
 
 		instance->MainMenuSection();
@@ -1758,8 +1894,150 @@ namespace ImGuiImpl
 
 	namespace
 	{
-		void __stdcall RenderScopeVisualProbe()
+		// Where the bullet goes: the exact centre of the viewport. The scope's
+		// reticle is where the player thinks it goes. Aligning a sight means
+		// making those two the same point, and until now there was nothing on
+		// screen marking the first one.
+		//
+		// Full-span lines rather than a small reticle, because the error being
+		// dialled out is a few pixels on a 4K display and a short mark gives
+		// the eye nothing to judge against. The central gap leaves the optic's
+		// own reticle readable underneath -- covering it would hide the very
+		// thing being aligned.
+		void DrawSightAlignmentCrosshair()
 		{
+			const auto* instance = ImGuiImplClass::GetSington();
+			if (!instance ||
+				!instance->alignmentCrosshair_UI.load(
+					std::memory_order_acquire)) {
+				return;
+			}
+			const auto* io = ImGui::GetIO();
+			if (!io || io->DisplaySize.x <= 0.0F || io->DisplaySize.y <= 0.0F) {
+				return;
+			}
+			auto* drawList = ImGui::GetForegroundDrawList();
+			if (!drawList) {
+				return;
+			}
+
+			const float width = io->DisplaySize.x;
+			const float height = io->DisplaySize.y;
+			// Exact pixel centre. Half of an odd dimension lands between two
+			// pixels, and rounding here rather than letting the rasterizer do
+			// it keeps the two arms crossing on one pixel instead of smearing
+			// the crossing across two.
+			const float screenCenterX = std::round(width * 0.5F);
+			const float screenCenterY = std::round(height * 0.5F);
+
+			// Where the shot lands is screen centre, but that is a statement
+			// about the *unmagnified* frame. Inside the lens the shader is
+			// showing a resampled copy of that frame, so the impact point is
+			// not drawn where it lives.
+			//
+			// The shader displays, at screen position p, the backbuffer content
+			// from pivot + (p - pivot)/m. Solving that for the p which shows
+			// screen centre gives the position below. Any gap between the lens
+			// centre and screen centre is multiplied by the magnification,
+			// which is why a scope sitting a little high puts the real impact
+			// point far below the middle of its own glass.
+			//
+			// At m == 1 this reduces to screen centre exactly, so the hip-fire
+			// case needs no special path and cannot drift.
+			float centerX = screenCenterX;
+			float centerY = screenCenterY;
+			const auto* renderer = Hook::D3D::GetSington();
+			if (renderer) {
+				const auto projection =
+					renderer->GetLensProjectionSnapshot();
+				const float activation =
+					std::clamp(projection.activationProgress, 0.0F, 1.0F);
+				if (projection.renderEnabled && projection.automaticSTS &&
+					projection.trackingReady && activation > 0.0F &&
+					projection.sourceWidth > 0.0F &&
+					projection.sourceHeight > 0.0F) {
+					// Same ramp the pixel shader applies, so the marker tracks
+					// the sight picture through the aim-in rather than snapping
+					// at the end of it.
+					const float magnification =
+						1.0F +
+						(std::clamp(
+							 Hook::D3D::scopeFadeMagnification.load(
+								 std::memory_order_acquire),
+							 1.0F,
+							 15.0F) -
+							1.0F) *
+							activation;
+					// The projection is published in game-render pixels; Menu
+					// Framework draws in its own displayed viewport.
+					const float lensX = projection.centerX *
+						(width / projection.sourceWidth);
+					const float lensY = projection.centerY *
+						(height / projection.sourceHeight);
+					const float impactX =
+						lensX + (screenCenterX - lensX) * magnification;
+					const float impactY =
+						lensY + (screenCenterY - lensY) * magnification;
+					if (std::isfinite(impactX) && std::isfinite(impactY)) {
+						centerX = std::round(impactX);
+						centerY = std::round(impactY);
+					}
+				}
+			}
+			// Proportional to the display so the aid looks the same at every
+			// resolution.
+			const float gap = std::max(8.0F, height * 0.012F);
+			const float thickness = std::max(1.0F, height * 0.0015F);
+			const float outline = thickness + 2.0F;
+
+			// Amber. Distinct from Fallout's green HUD, from the red and black
+			// authored reticles, and from sky and terrain, so the aid is never
+			// confused with the thing being aligned.
+			const auto core = ImGui::ColorConvertFloat4ToU32(
+				ImGui::ImVec4{ 1.0F, 0.55F, 0.0F, 0.9F });
+			// Drawn under the amber so the aid stays visible against a bright
+			// sky as well as against the black inside of a scope tube.
+			const auto shadow = ImGui::ColorConvertFloat4ToU32(
+				ImGui::ImVec4{ 0.0F, 0.0F, 0.0F, 0.65F });
+
+			const ImGui::ImVec2 segments[4][2] = {
+				{ { 0.0F, centerY }, { centerX - gap, centerY } },
+				{ { centerX + gap, centerY }, { width, centerY } },
+				{ { centerX, 0.0F }, { centerX, centerY - gap } },
+				{ { centerX, centerY + gap }, { centerX, height } }
+			};
+			for (const auto& segment : segments) {
+				ImGui::ImDrawListManager::AddLine(
+					drawList,
+					segment[0],
+					segment[1],
+					shadow,
+					outline);
+			}
+			for (const auto& segment : segments) {
+				ImGui::ImDrawListManager::AddLine(
+					drawList,
+					segment[0],
+					segment[1],
+					core,
+					thickness);
+			}
+			// No ring around the gap. There was one, to keep the centre
+			// locatable where the arms cross busy terrain, but a circle is the
+			// wrong mark to add inside a circular lens: it competes with the
+			// optic's own rim and with dot and ring reticles, which is exactly
+			// the geometry being read. The four arm ends already point at the
+			// centre unambiguously.
+		}
+
+		void __stdcall RenderScopeHudOverlays()
+		{
+			// Two independent overlays behind one registration. The alignment
+			// crosshair is a user-facing tool on its own toggle; the probe
+			// below is a development diagnostic gated by the INI. Neither may
+			// gate the other.
+			DrawSightAlignmentCrosshair();
+
 			const auto& settings = MagnaScope::GetSettings();
 			if (!settings.AllowsVisualProbe()) {
 				return;
@@ -1863,6 +2141,31 @@ namespace ImGuiImpl
 					false,
 					std::memory_order_release);
 			}
+			// Publish the snapshot BEFORE clearing edit mode, never after.
+			//
+			// The game thread restores the profile's zoom onto the live weapon
+			// the moment it observes edit mode drop, and it reads the pending
+			// save earlier in the same update than it reads the edit flag. With
+			// the flag cleared first there is a window where it sees "no longer
+			// editing" with no snapshot waiting, restores the pre-edit zoom, and
+			// clears the one-shot that would have restored it again -- so the
+			// snapshot arriving a frame later updated the profile but never
+			// reached the weapon. That is the zoom data reverting on close.
+			//
+			// Hand the current values to the in-memory profile before dropping
+			// the preview.
+			//
+			// The preview is the only route live editor values have to the
+			// shader, and the game thread reads it solely while edit mode is
+			// on. Closing the editor therefore used to revert everything to the
+			// last state written to disk, which meant nothing could be tried
+			// out without committing a preset file first. Applying the snapshot
+			// here keeps the values for the rest of the session -- through
+			// re-equips and ADS cycles, because the automatic profile is cached
+			// per weapon and attachment -- while still writing nothing.
+			//
+			// Reload Profile remains the explicit discard.
+			ApplyEditorValuesForSession();
 			Hook::D3D::bEnableEditMode.store(
 				false,
 				std::memory_order_release);
@@ -1933,7 +2236,7 @@ namespace ImGuiImpl
 		// stay on screen while aiming through the scope.
 		scopeEditorWindow = F4SEMenuFramework::AddWindow(RenderPopout, false);
 		scopeVisualProbe =
-			F4SEMenuFramework::AddHudElement(RenderScopeVisualProbe);
+			F4SEMenuFramework::AddHudElement(RenderScopeHudOverlays);
 		if (!scopeVisualProbe) {
 			logger::error("F4SE Menu Framework HUD probe registration failed");
 			return false;

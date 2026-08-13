@@ -132,12 +132,18 @@ target("MagnaScope")
             path.join(os.projectdir(), "Compile", "F4SE", "Plugins", "MagnaScopeConfig.json")
         )
 
-        -- stage_ini is for the end-user package only. The live install's INI is
-        -- hand-tuned between test runs, and copying the repository default over
-        -- it silently resets diagnostic gates -- which then reads as a code
-        -- regression rather than a lost setting. Change live settings by
-        -- editing that file directly instead.
-        local function stage_runtime(root, stage_ini)
+        -- stage_user_files is for the end-user package only. Both files it
+        -- guards belong to the installation rather than to the build: the INI
+        -- is hand-tuned between test runs, and MagnaScopeConfig.json is written
+        -- by the game itself, holding the editor hotkey and render-pass
+        -- settings. Copying repository defaults over either silently resets
+        -- them, which then reads as a code regression rather than a lost
+        -- setting.
+        --
+        -- The config used to be copied unconditionally while only the INI was
+        -- gated, so every deploy overwrote a live installation's saved
+        -- settings. Change live settings by editing those files directly.
+        local function stage_runtime(root, stage_user_files)
             local plugin_dir = path.join(root, "F4SE", "Plugins")
             local staged_shader_dir = path.join(root, "Shaders", "MagnaScope")
             os.mkdir(plugin_dir)
@@ -146,16 +152,16 @@ target("MagnaScope")
                 target:targetfile(),
                 path.join(plugin_dir, "MagnaScope.dll")
             )
-            if stage_ini then
+            if stage_user_files then
                 os.cp(
                     path.join(os.projectdir(), "MagnaScope.ini"),
                     path.join(plugin_dir, "MagnaScope.ini")
                 )
+                os.cp(
+                    path.join(os.projectdir(), "MagnaScopeConfig.json"),
+                    path.join(plugin_dir, "MagnaScopeConfig.json")
+                )
             end
-            os.cp(
-                path.join(os.projectdir(), "MagnaScopeConfig.json"),
-                path.join(plugin_dir, "MagnaScopeConfig.json")
-            )
             for shader, _ in pairs(shader_profiles) do
                 os.cp(
                     path.join(shader_dir, shader .. ".cso"),

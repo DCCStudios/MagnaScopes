@@ -82,9 +82,21 @@ cbuffer ResolutionConstantData : register(b4){
 	float SCOPE_BREATH_HOLD;
 
 	float SCOPE_BREATH_PUPIL_FOLLOW;
-	float SCOPE_RESERVED_0;
-	float SCOPE_RESERVED_1;
-	float SCOPE_RESERVED_2;
+	// Viewport the reticle layer was captured with over the viewport this
+	// composite renders at; 1.0 when they agree. Under dynamic resolution the
+	// weapon pass rasterizes into a top-left sub-rectangle, the game upscales
+	// its own subrect to the output, and the private layer keeps subrect
+	// coordinates -- so the layer must be sampled through this ratio or the
+	// reticle appears uniformly shrunk toward the top-left corner.
+	float SCOPE_RETICLE_CAPTURE_SCALE_X;
+	float SCOPE_RETICLE_CAPTURE_SCALE_Y;
+	// Measured inner-rim over outer-rim ratio of the active aperture annulus.
+	// The fill geometry shader assigns inner-ring lens coordinates and
+	// extrapolates the centre-fan apex from this. Authored ScopeFade rings do
+	// not sit at exactly half -- the measured corpus reads 0.497 -- and
+	// assuming 0.5 planted each wedge's fabricated apex on a circle around
+	// the true centre rather than one point.
+	float SCOPE_APERTURE_INNER_RATIO;
 };
 
 // Breathing displacement in aperture radii, shared so the magnified scene and

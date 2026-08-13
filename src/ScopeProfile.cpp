@@ -899,6 +899,30 @@ namespace ScopeData
 		return result;
 	}
 
+	void ScopeDataHandler::ForgetAutoProfile(const ScopeProfile* data)
+	{
+		if (!data) {
+			return;
+		}
+		// Erase every lookup entry pointing at this profile. A weapon can reach
+		// the same profile under more than one attachment key, and leaving any
+		// of them behind would hand the deleted profile straight back.
+		for (auto entry = autoProfileMap.begin();
+			 entry != autoProfileMap.end();) {
+			if (entry->second == data) {
+				entry = autoProfileMap.erase(entry);
+			} else {
+				++entry;
+			}
+		}
+		// The object stays in ownedData; see the header. Clearing the selection
+		// is what forces the next ADS down the create path.
+		if (currentData == data) {
+			currentData = nullptr;
+			currentPath.clear();
+		}
+	}
+
 	bool ScopeDataHandler::WriteAutoProfile(ScopeProfile* data)
 	{
 		if (!data || !data->autoProfile || data->path.empty()) {

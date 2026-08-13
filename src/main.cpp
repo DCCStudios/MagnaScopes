@@ -3341,18 +3341,42 @@ void HookedUpdate()
 		// Menu Framework callbacks only publish copied requests. Apply a save
 		// only when its attachment-aware identity still matches the selected
 		// profile, then serialize and reselect entirely on the game thread.
-		if (auto pendingSave = ImGuiImpl::ConsumeProfileSave()) {
+		bool pendingSaveWritesToDisk = true;
+		if (auto pendingSave =
+				ImGuiImpl::ConsumeProfileSave(pendingSaveWritesToDisk)) {
 			if (currentData &&
 				IsSameProfileIdentity(*currentData, *pendingSave)) {
 				*currentData = *pendingSave;
 				sdh->SetCurrentScopeProfile(currentData);
-				sdh->WriteCurrentScopeProfile();
+				// The session-only apply takes the identical path minus this
+				// write. Editor values used to live only in the preview
+				// snapshot, which the shader reads solely while edit mode is
+				// on, so closing the editor silently reverted everything to
+				// whatever was last written to disk. Putting them into the
+				// in-memory profile instead makes them behave like the profile
+				// they will become: they survive closing the editor,
+				// re-equipping, and ADS cycles, and are lost only on exit.
+				if (pendingSaveWritesToDisk) {
+					sdh->WriteCurrentScopeProfile();
+				}
 				InitCurrentScopeData();
+				// Push the snapshot's zoom onto the live weapon here rather than
+				// relying on the edit-mode transition below to do it. That
+				// transition is a one-shot driven by a flag the render thread
+				// sets independently of this snapshot, so which of the two the
+				// game thread observes first is a race. Applying it on arrival
+				// makes the result the same either way, and it is idempotent:
+				// the call re-baselines and reapplies from the profile, which is
+				// exactly what the transition would have done.
+				ApplySelectedZoomOverride(currentData);
 				hookIns->bRefreshChar.store(
 					true,
 					std::memory_order_release);
 				logger::info(
-					"Saved and reapplied profile for attachment identity {}",
+					"{} profile for attachment identity {}",
+					pendingSaveWritesToDisk ?
+						"Saved and reapplied" :
+						"Applied for this session (not written to disk)",
 					currentData ? currentData->omodKey : std::string{});
 			} else {
 				logger::warn(
@@ -3371,6 +3395,37 @@ void HookedUpdate()
 				(!currentData->autoProfile ||
 					std::filesystem::exists(currentData->path))) {
 				sdh->ReloadScopeProfile(currentData);
+			}
+			if (profileRequest ==
+					ImGuiImpl::ProfileRequest::kDeletePreset &&
+				currentData && currentData->autoProfile) {
+				// Delete the file first. Dropping the cached profile without
+				// removing it would resynthesize defaults now and then load the
+				// stale preset back on the next launch, which reads as the
+				// delete having silently failed.
+				const std::string deletedPath = currentData->path;
+				std::error_code removeError;
+				const bool removed =
+					std::filesystem::remove(deletedPath, removeError);
+				if (removeError) {
+					logger::error(
+						"Could not delete preset '{}': {}",
+						deletedPath,
+						removeError.message());
+				} else {
+					// Evicting the cache entry is what makes the reset visible
+					// immediately: the next selection finds nothing cached and
+					// no file, so it synthesizes from defaults exactly as a
+					// scope being seen for the first time does.
+					sdh->ForgetAutoProfile(currentData);
+					currentData = nullptr;
+					scopeNode = nullptr;
+					InvalidateAutomaticSTSSelection();
+					logger::info(
+						"Deleted preset '{}' and dropped the cached profile; "
+						"defaults will be resynthesized on the next selection",
+						removed ? deletedPath : std::string{ "<absent>" });
+				}
 			}
 			InitCurrentScopeData();
 			hookIns->bRefreshChar.store(true, std::memory_order_release);
@@ -3815,6 +3870,26 @@ void HookedUpdate()
 				Hook::D3D::automaticSTSApertureSupportsExactReplay.store(
 					aperture.supportsExactReplay,
 					std::memory_order_release);
+				// The fill shader derives inner-ring lens coordinates and the
+				// centre-fan apex from this ratio. Authored rings carry the
+				// measured value; the synthesized ring is built at exactly
+				// half, so anything not driving the exact replay publishes
+				// 0.5. A ratio outside the plausible annulus band means the
+				// measurement ran on something that is not a ring, and 0.5 is
+				// the established behaviour for that case.
+				{
+					float innerRatio = 0.5F;
+					if (aperture.supportsExactReplay &&
+						aperture.measurementValid &&
+						std::isfinite(aperture.measuredInnerRatio) &&
+						aperture.measuredInnerRatio > 0.2F &&
+						aperture.measuredInnerRatio < 0.8F) {
+						innerRatio = aperture.measuredInnerRatio;
+					}
+					Hook::D3D::scopeApertureInnerRatio.store(
+						innerRatio,
+						std::memory_order_release);
+				}
 				hookIns->PublishAutomaticSTSGeometry(
 					aperture.supportsExactReplay ?
 						aperture.renderSurface :

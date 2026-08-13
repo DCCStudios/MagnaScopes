@@ -189,9 +189,31 @@ namespace Hook
 			float breathHold = 0.0F;
 
 			float breathPupilFollow = 1.0F;
-			float reserved0 = 0.0F;
-			float reserved1 = 0.0F;
-			float reserved2 = 0.0F;
+			// Viewport the reticle layer was CAPTURED with, over the viewport
+			// the composite renders at. 1.0 when they agree.
+			//
+			// They stop agreeing whenever the game rasterizes the weapon pass
+			// into a sub-rectangle of the render target -- dynamic resolution
+			// being the common case. The capture inherits that smaller
+			// viewport, so the reticle lands in the private layer at subrect
+			// coordinates; the game upscales its own subrect to the output but
+			// nothing upscales the private layer, and compositing it 1:1 drew
+			// the reticle uniformly scaled toward the top-left corner --
+			// measured at 0.60x in one session and 0.66x in another, floating
+			// in open air beside the optic.
+			float reticleCaptureScaleX = 1.0F;
+			float reticleCaptureScaleY = 1.0F;
+			// Measured inner-rim over outer-rim ratio of the active aperture
+			// annulus. The fill geometry shader derives lens coordinates and
+			// fabricates the centre fan from this; it used to hardcode 0.5,
+			// and authored ScopeFade rings do not sit at 0.5 -- the measured
+			// corpus reads 0.497, which planted every wedge's fabricated apex
+			// on a ~3-pixel circle around the true centre instead of one
+			// point. Adjacent fan triangles then cracked and overlapped, and
+			// each wedge sampled through a slightly different frame: the
+			// radial star and kinked edges visible around the lens centre
+			// under magnification.
+			float apertureInnerRatio = 0.5F;
 		};
 		static_assert(
 			sizeof(ConstBufferData) == 208,
@@ -820,6 +842,18 @@ namespace Hook
 		static std::atomic<float> projectedAimLensX;
 		static std::atomic<float> projectedAimLensY;
 		static std::atomic_bool projectedAimLensValid;
+		// Viewport bound when the reticle layer was captured this frame, in
+		// pixels. Zero until a capture has run. Written on the render thread
+		// during capture, read on the same thread when the composite fills its
+		// constant buffer; atomic because the resolution fill also runs from
+		// other composite entry points.
+		static std::atomic<float> reticleCaptureViewportWidth;
+		static std::atomic<float> reticleCaptureViewportHeight;
+		// Measured inner/outer rim ratio of the active aperture annulus,
+		// published by the game thread with the rest of the selection. 0.5
+		// when unmeasured or when the synthesized ring (which is built at
+		// exactly half) is the active geometry.
+		static std::atomic<float> scopeApertureInnerRatio;
 		static std::atomic<float> projectedPhysicalEyeBoxBlend;
 		static std::atomic_bool projectedPhysicalEyeBoxReady;
 		static std::atomic_bool projectedTrackingReady;
