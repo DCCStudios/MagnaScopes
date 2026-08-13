@@ -237,6 +237,54 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
     if (lensOffsetSolveValid) {
         aperturePivotPixels += pixelsToLensOffset - pixelsToCenter;
     }
+
+    // Magnify about the bore axis, not about the glass.
+    //
+    // The pivot is the fixed point of the magnification: the one screen
+    // position showing the same world point it would show at 1x. The shot
+    // goes down the bore axis, which is screen centre -- so that is the
+    // position that has to be fixed, and pivoting anywhere else multiplies
+    // the gap between the two by (m - 1).
+    //
+    // Pivoting on the solved lens centre did exactly that. The glass sits a
+    // little off screen centre because the camera offsets never align it
+    // perfectly, and magnification turned those few pixels into a visible
+    // displacement that grew every time the magnification was raised -- so
+    // the point of impact drifted away from screen centre inside the lens
+    // and no amount of dialling converged, because the target moved with the
+    // zoom. Pivoting here instead makes screen centre a fixed point at every
+    // magnification: the impact is drawn where the bullet goes, and any
+    // remaining reticle misalignment is a constant the player can dial out
+    // once rather than a magnification-dependent one they cannot.
+    //
+    // This is NOT Lens Center. That control displaces the mask and the pivot
+    // together, sliding the lit disc off the glass and leaving a crescent of
+    // tube wall. Nothing here touches the mask; only the sampled region
+    // moves, and any authored Lens Center displacement is carried through
+    // relative to the new pivot rather than discarded.
+    {
+        const float2 screenCenterPixels = 0.5f * ScreenSize;
+        const float2 authoredPivotShift =
+            aperturePivotPixels - centerPixels;
+        float2 pivotDelta =
+            screenCenterPixels + authoredPivotShift - centerPixels;
+        // The sampled region stays inside the aperture for any pivot within
+        // one lens radius of its centre: |s| <= |p|(1 - 1/m) + 1/m, which is
+        // at most 1 when |p| <= 1. Clamping here is what keeps a mid-ADS
+        // frame -- when the optic can still be far from screen centre --
+        // from sampling the housing.
+        const float pivotDeltaLength = length(pivotDelta);
+        if (pivotDeltaLength > currentProjectedRadius &&
+            pivotDeltaLength > 0.0001f) {
+            pivotDelta *= currentProjectedRadius / pivotDeltaLength;
+        }
+        // Faded in by activation for the same reason: at the start of an aim
+        // the glass is nowhere near the bore axis, and the lens centre is the
+        // only safe pivot there. By full ADS the two are a few pixels apart
+        // and the correction is small and steady.
+        aperturePivotPixels = centerPixels + pivotDelta * activation;
+    }
+
     // Nothing transient may move this pivot.
     //
     // The pivot is the fixed point of the magnification: the screen position

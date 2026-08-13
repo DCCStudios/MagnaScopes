@@ -994,6 +994,19 @@ namespace ImGuiImpl
 				// rather than of value: the multiplier goes to 1, leaving the
 				// surrounding view at its normal width, and the same number
 				// becomes optical magnification inside the aperture.
+				//
+				// That equivalence holds only because ScopeGeometryMagnify_PS
+				// pivots on screen centre. The FOV multiplier zooms the view
+				// about the view axis, so a point at angle theta lands at
+				// m*theta from screen centre; the lens shows a source point s
+				// at pivot + (s - pivot)*m, which is the same mapping if and
+				// only if the pivot is screen centre. While the pivot was the
+				// glass centre the two agreed at exactly one point and drifted
+				// apart everywhere else by the lens-to-centre gap times
+				// (m - 1) -- the converted sight picture could not match the
+				// authored one, and raising the magnification widened the
+				// disagreement. Move that pivot and this conversion silently
+				// stops being a conversion.
 				const float authoredFovMul = authoredZoom.values.fovMul;
 				Imgui_ZDO.fovMul = 1.0F;
 				Imgui_ZDO.enableZoomDateOverwrite = true;
@@ -1930,60 +1943,23 @@ namespace ImGuiImpl
 			const float screenCenterX = std::round(width * 0.5F);
 			const float screenCenterY = std::round(height * 0.5F);
 
-			// Where the shot lands is screen centre, but that is a statement
-			// about the *unmagnified* frame. Inside the lens the shader is
-			// showing a resampled copy of that frame, so the impact point is
-			// not drawn where it lives.
+			// Screen centre, and nothing else.
 			//
-			// The shader displays, at screen position p, the backbuffer content
-			// from pivot + (p - pivot)/m. Solving that for the p which shows
-			// screen centre gives the position below. Any gap between the lens
-			// centre and screen centre is multiplied by the magnification,
-			// which is why a scope sitting a little high puts the real impact
-			// point far below the middle of its own glass.
+			// This briefly compensated for the magnification, because the
+			// magnified image was pivoted on the lens centre and that drew the
+			// impact point away from screen centre by the lens-to-centre gap
+			// times (m - 1). Compensating here was treating the symptom: it
+			// put the marker in the right place while leaving the sight
+			// picture itself disagreeing with the bore axis, and it made the
+			// aid wander during ADS for reasons no player could be expected to
+			// read.
 			//
-			// At m == 1 this reduces to screen centre exactly, so the hip-fire
-			// case needs no special path and cannot drift.
-			float centerX = screenCenterX;
-			float centerY = screenCenterY;
-			const auto* renderer = Hook::D3D::GetSington();
-			if (renderer) {
-				const auto projection =
-					renderer->GetLensProjectionSnapshot();
-				const float activation =
-					std::clamp(projection.activationProgress, 0.0F, 1.0F);
-				if (projection.renderEnabled && projection.automaticSTS &&
-					projection.trackingReady && activation > 0.0F &&
-					projection.sourceWidth > 0.0F &&
-					projection.sourceHeight > 0.0F) {
-					// Same ramp the pixel shader applies, so the marker tracks
-					// the sight picture through the aim-in rather than snapping
-					// at the end of it.
-					const float magnification =
-						1.0F +
-						(std::clamp(
-							 Hook::D3D::scopeFadeMagnification.load(
-								 std::memory_order_acquire),
-							 1.0F,
-							 15.0F) -
-							1.0F) *
-							activation;
-					// The projection is published in game-render pixels; Menu
-					// Framework draws in its own displayed viewport.
-					const float lensX = projection.centerX *
-						(width / projection.sourceWidth);
-					const float lensY = projection.centerY *
-						(height / projection.sourceHeight);
-					const float impactX =
-						lensX + (screenCenterX - lensX) * magnification;
-					const float impactY =
-						lensY + (screenCenterY - lensY) * magnification;
-					if (std::isfinite(impactX) && std::isfinite(impactY)) {
-						centerX = std::round(impactX);
-						centerY = std::round(impactY);
-					}
-				}
-			}
+			// ScopeGeometryMagnify_PS now pivots the magnification on screen
+			// centre, which makes it a fixed point of the resample -- the
+			// impact point is drawn here at every magnification, so the marker
+			// belongs here too, unconditionally and in both hip-fire and ADS.
+			const float centerX = screenCenterX;
+			const float centerY = screenCenterY;
 			// Proportional to the display so the aid looks the same at every
 			// resolution.
 			const float gap = std::max(8.0F, height * 0.012F);

@@ -2677,6 +2677,38 @@ bool IsInADS(Actor* actor)
 	       cameraState->id == RE::CameraStates::kIronSights;
 }
 
+// Whether the player is looking through their own eyes.
+//
+// The optic is a first-person effect built entirely out of the first-person
+// rig: the aperture, the reticle and the eye box are all weapon geometry
+// measured against the first-person Camera node. From a detached camera none
+// of that is what fills the screen, so compositing spends the geometry replay
+// and the reticle capture drawing a lens over a view it does not belong to.
+//
+// Only the cameras that genuinely leave the player's eyes are rejected.
+// kIronSights and kFirstPerson are the optic's normal home; kPCTransition,
+// kTween and kAnimated are what the camera passes through entering and
+// leaving iron sights, and rejecting those would blink the optic off for the
+// frames either side of every ADS. kFurniture, kMount, kDialogue and
+// kBleedout all still render first person in Fallout 4 and are left alone
+// deliberately.
+[[nodiscard]] bool IsFirstPersonCameraView()
+{
+	const auto* camera = RE::PlayerCamera::GetSingleton();
+	const auto state = camera ? camera->GetCameraCurrentState() : nullptr;
+	if (!state) {
+		// Fail open. An unreadable camera state must not be able to switch
+		// the optic off; that would be a much louder bug than rendering it
+		// one frame too long.
+		return true;
+	}
+	// Compared rather than switched: id is a REX::TEnum wrapper, which has
+	// equality but no implicit conversion to a switch expression.
+	return state->id != RE::CameraStates::k3rdPerson &&
+	       state->id != RE::CameraStates::kAutoVanity &&
+	       state->id != RE::CameraStates::kFree;
+}
+
 bool IsADSInputHeld()
 {
 	// CommonLibF4 Pre-NG only forward-declares AttackBlockHandler. The full
@@ -3789,6 +3821,24 @@ void HookedUpdate()
 			}
 
 			if (!settings.AllowsProjection()) {
+				hookIns->EnableRender(false);
+				hookIns->QueryRender(false);
+				InvalidateAutomaticSTSSelection();
+				callOriginal();
+				return;
+			}
+
+			// Nothing optical happens from a detached camera. Bail alongside
+			// the projection gate rather than deeper in, so the whole
+			// per-frame chain -- aperture search, projection, eye-box
+			// tracking, and the draw classification that feeds the replay --
+			// is skipped rather than computed and then discarded.
+			//
+			// Invalidating the selection matters as much as clearing the
+			// render flags: the classifier matches draws against a published
+			// aperture identity, and leaving a stale one live would let a
+			// third-person weapon draw match it.
+			if (!IsFirstPersonCameraView()) {
 				hookIns->EnableRender(false);
 				hookIns->QueryRender(false);
 				InvalidateAutomaticSTSSelection();
