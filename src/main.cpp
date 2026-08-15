@@ -2992,18 +2992,21 @@ RE::BGSZoomData* AcquireRuntimeSightZoom(std::size_t index)
 // authored form is in place. Game thread only.
 RE::BGSZoomData* installedSightZoom = nullptr;
 
-// Fires the configured animation-graph events at the player after a pointer
-// swap. This is the experiment: the engine samples ZoomData at aim-in, and
-// one of these events may make it re-run that sampling without leaving the
-// sighted state. Configured via [Sights] SightSwapGraphEvents in
-// MagnaScope.ini (semicolon separated); unknown event names are ignored by
-// the graph.
+// Fires the configured animation-graph events at the player. Confirmed in
+// game: the engine samples ZoomData when the graph is poked (GunUp), not
+// only at aim-in, so this is what makes a pointer swap or a per-tick value
+// write actually reach the eye mid-ADS. Configured via
+// [Sights] SightSwapGraphEvents in MagnaScope.ini (semicolon separated);
+// unknown event names are ignored by the graph.
 //
-// The key is re-read from the INI on EVERY firing, deliberately: the whole
-// point is iterating candidate event names, and a swap is a rare user action,
-// so a file read here buys edit-INI -> swap -> observe with no restart and no
-// save reload.
-void FireSightSwapGraphEvents()
+// The key is re-read from the INI on EVERY firing, deliberately: it keeps
+// candidate event names testable with no restart, and even the per-tick
+// transition burst is a few dozen reads of a small cached file.
+//
+// logEachEvent quiets the per-firing log lines for the transition burst,
+// which pokes the graph every tick for the blend's duration; the burst is
+// bounded in the log by the transition started/settled lines instead.
+void FireSightSwapGraphEvents(bool logEachEvent = true)
 {
 	if (!player) {
 		return;
@@ -3035,10 +3038,12 @@ void FireSightSwapGraphEvents()
 		}
 		const bool handled = player->NotifyAnimationGraphImpl(
 			RE::BSFixedString(token.c_str()));
-		logger::info(
-			"[sight] graph event '{}' fired (handled={})",
-			token,
-			handled);
+		if (logEachEvent) {
+			logger::info(
+				"[sight] graph event '{}' fired (handled={})",
+				token,
+				handled);
+		}
 	}
 }
 
@@ -3062,25 +3067,31 @@ void ReconcileSightZoomPointer()
 	}
 
 	auto& state = MagnaScope::SessionStateFor(*currentData);
+	// The pointer follows the BLEND, not the raw selection: while the ease
+	// is still gliding back to the primary optic the runtime form must stay
+	// installed, because it is the form receiving the per-tick lerped values
+	// the engine keeps re-sampling (DriveSightZoomTransition). Only a
+	// settled blend restores the authored pointer.
+	const int blendSight = state.secondaryIndex >= 0 ?
+	                           state.secondaryIndex :
+	                           (state.sightBlend > 0.0001F ?
+	                                state.lastSightIndex :
+	                                -1);
 	RE::BGSZoomData* desired = originalZoomForm;
-	if (state.secondaryIndex >= 0 &&
-		state.secondaryIndex <
-			static_cast<int>(currentData->secondarySights.size())) {
+	if (blendSight >= 0 &&
+		blendSight < static_cast<int>(currentData->secondarySights.size())) {
 		auto* runtime = AcquireRuntimeSightZoom(
-			static_cast<std::size_t>(state.secondaryIndex));
+			static_cast<std::size_t>(blendSight));
 		if (runtime) {
-			const auto& sight = currentData->secondarySights[
-				static_cast<std::size_t>(state.secondaryIndex)];
-			// Start from the authored data so the imagespace modifier and
-			// overlay carry over; only the fields a sight owns are replaced.
-			runtime->zoomData = originalZoomData;
-			runtime->isMod = originalZoomForm->isMod;
-			runtime->zoomData.fovMult = sight.zoomData.fovMul;
-			runtime->zoomData.cameraOffset = {
-				sight.zoomData.x,
-				sight.zoomData.y,
-				sight.zoomData.z
-			};
+			// Seed with what the engine is looking at RIGHT NOW -- the live
+			// authored form, which already carries this tick's override
+			// values -- so the first re-sample after the swap sees no
+			// discontinuity. The transition writer then moves the values
+			// every tick; reseeding while installed would fight it.
+			if (originalZoomInstance->zoomData != runtime) {
+				runtime->zoomData = originalZoomForm->zoomData;
+				runtime->isMod = originalZoomForm->isMod;
+			}
 			desired = runtime;
 		}
 	}
@@ -3108,6 +3119,59 @@ void RestoreSightZoomPointer()
 			"[sight] instance zoom pointer restored to the authored form");
 	}
 	installedSightZoom = nullptr;
+}
+
+// Turns the pointer swap from a snap into a glide. The resolver eases
+// sightBlend and publishes lerped zoom values every tick; this writes them
+// into the installed runtime form and re-pokes the graph while the ease is
+// in flight, so the engine -- which only samples ZoomData when poked --
+// tracks the moving values and the eye glides between sights. Runs from
+// the snapshot consumer, after the resolver has published this tick.
+void DriveSightZoomTransition(const ScopeData::ZoomDataOverwrite& blended)
+{
+	if (!installedSightZoom || !originalZoomInstance ||
+		originalZoomInstance->zoomData != installedSightZoom ||
+		!currentData) {
+		return;
+	}
+	// Both blend endpoints declining the override means the snapshot holds the
+	// struct's inert defaults, not values; leave the seeded authored data in
+	// place. One enabled endpoint is enough (LerpZoom keeps the flag on across
+	// the blend so the glide is continuous).
+	if (!blended.enableZoomDateOverwrite) {
+		return;
+	}
+	installedSightZoom->zoomData.fovMult = blended.fovMul;
+	if (settings.AllowsCameraOverrides()) {
+		installedSightZoom->zoomData.cameraOffset = {
+			blended.x,
+			blended.y,
+			blended.z
+		};
+	}
+
+	auto& state = MagnaScope::SessionStateFor(*currentData);
+	const float target = state.secondaryIndex >= 0 ? 1.0F : 0.0F;
+	// Approach() snaps exactly onto its target when it settles, so a plain
+	// equality comparison is the settled test, no epsilon needed.
+	const bool inFlight = state.sightBlend != target;
+	static bool wasInFlight = false;
+	const bool settledThisTick = !inFlight && wasInFlight;
+	if (inFlight != wasInFlight) {
+		wasInFlight = inFlight;
+		logger::info(
+			"[sight] transition {} (blend={:.2f}, target={:.0f})",
+			inFlight ? "started" : "settled",
+			state.sightBlend,
+			target);
+	}
+	// Poke while the ease is moving, plus once more on the settle edge so
+	// the engine is guaranteed to sample the exact final values. Sighted
+	// only: the sample is only observable in ADS, and the ADS-entry rising
+	// edge already covers the next aim-in.
+	if ((inFlight || settledThisTick) && player && IsInADS(player)) {
+		FireSightSwapGraphEvents(false);
+	}
 }
 
 void WriteSelectedZoomOverride(const ScopeData::ZoomDataOverwrite& overrideData)
@@ -4628,6 +4692,10 @@ void HookedUpdate()
 				// DetachIsolatedZoomForSave exists to prevent.
 				if (!savingInProgress) {
 					ApplySelectedEditorPreview(editorPreview.zoomOverride);
+					// The live sight glide: the same lerped values into the
+					// installed runtime form, plus the graph poke that makes
+					// the engine re-sample them mid-ADS.
+					DriveSightZoomTransition(editorPreview.zoomOverride);
 				}
 				Hook::D3D::scopeApertureActivationScale.store(
 					std::clamp(

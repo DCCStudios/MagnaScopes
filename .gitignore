@@ -38,5 +38,7 @@
 # Same policy as /_reference/ -- comparison-only binary trees stay out of
 # history. The loose reference NIFs directly under meshes/ remain tracked.
 /tests/NifInspector/meshes/Conversion/
+/tests/NifInspector/meshes/Materials/
+/tests/NifInspector/meshes/STS Reference Scope Meshes/
 
 __pycache__/

@@ -284,11 +284,16 @@ namespace MagnaScope
 			state.secondaryIndex = -1;
 		}
 		const float sightTarget = state.secondaryIndex >= 0 ? 1.0F : 0.0F;
-		const float sightSeconds = state.secondaryIndex >= 0 ?
-		                               profile.secondarySights[
-			                               static_cast<std::size_t>(state.secondaryIndex)]
-			                               .transitionSeconds :
-		                               0.18F;
+		// The return glide reuses the transition time of the sight being left
+		// (lastSightIndex), so a swap reads symmetric in both directions.
+		const int easeSight = state.secondaryIndex >= 0 ?
+		                          state.secondaryIndex :
+		                          state.lastSightIndex;
+		const float sightSeconds =
+			easeSight >= 0 && easeSight < sightCount ?
+				profile.secondarySights[static_cast<std::size_t>(easeSight)]
+					.transitionSeconds :
+				0.18F;
 		Approach(state.sightBlend, sightTarget, sightSeconds, deltaSeconds);
 
 		// --- build the overlay ---------------------------------------------
@@ -337,15 +342,16 @@ namespace MagnaScope
 			shaderData, zoom, selectionRevision);
 
 		// --- secondary sight -------------------------------------------------
-		// The transition is a pure ZoomData lerp on the form, applied every
-		// tick while the player STAYS sighted -- the engine consumes the
-		// form's camera offset live (the editor's alignment sliders depend on
-		// exactly that), so the eye glides to the other sight with no state
-		// manipulation at all. Never drop and re-raise the sighted state to
-		// force a re-sample: doing that opened a not-sighted window that other
-		// wheel mods acted on and could wedge the engine's aim state machine.
-		// The one entry-sampled field, fovMult, simply lands at its final
-		// value for the next aim-in.
+		// The transition is a pure ZoomData lerp, applied every tick while the
+		// player STAYS sighted. The engine samples ZoomData only when the
+		// animation graph is poked, so the consumer writes these lerped values
+		// into the installed runtime zoom form and re-fires the [Sights] graph
+		// events every tick the blend is in flight (DriveSightZoomTransition
+		// in main.cpp) -- the engine tracks the moving values and the eye
+		// glides between sights, camera offset and FOV together. Never drop
+		// and re-raise the sighted state to force a re-sample: doing that
+		// opened a not-sighted window that other wheel mods acted on and could
+		// wedge the engine's aim state machine.
 		//
 		// lastSightIndex keeps the transition symmetric: blending BACK to the
 		// optic lerps from the sight just left rather than snapping.
@@ -358,19 +364,15 @@ namespace MagnaScope
 				const auto& sight = profile.secondarySights[
 					static_cast<std::size_t>(blendSight)];
 				const float blend = Smooth(state.sightBlend);
-				// The form still receives the lerped values so the NEXT aim-in
-				// starts from the right data, but the engine only samples the
-				// form at aim-in -- the LIVE eye move is the sightShift below,
-				// which the game thread turns into a per-frame first-person
-				// weapon shift through the Camera node's frame.
+				// Smoothstepped so the glide has no velocity discontinuity at
+				// either end; the graph re-sample makes these lerped values
+				// live every tick, not just at the next aim-in.
 				LerpZoom(outOverlay.zoomOverride, zoom, sight.zoomData, blend);
 				// sightShiftX/Y/Z deliberately stay zero: shifting the
 				// first-person weapon subtree mid-frame tore the scope render
 				// apart in game (skinned arms, capture fingerprints, and the
-				// optical projections all disagree about the pose). Until a
-				// proper engine-cooperative re-sample exists (MSF-style
-				// UpdateAnimGraph), the swap writes the form and the offsets
-				// take effect on the next aim-in.
+				// optical projections all disagree about the pose). The graph
+				// re-sample made that whole mechanism unnecessary anyway.
 				// Deliberately no aperture suppression either: the swap does
 				// exactly one thing -- set the other sight's zoom offsets.
 			}
