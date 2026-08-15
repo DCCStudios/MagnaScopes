@@ -46,6 +46,46 @@ namespace ScopeData
 			}
 		}
 
+		// Windows-illegal characters plus a few that make a folder awkward to
+		// type. Trailing dots and spaces are stripped because Windows silently
+		// drops them, which would make a directory unreachable by the name we
+		// recorded.
+		std::string SanitiseForPath(std::string_view value)
+		{
+			std::string result;
+			result.reserve(value.size());
+			for (const char character : value) {
+				switch (character) {
+				case '<': case '>': case ':': case '"': case '/':
+				case '\\': case '|': case '?': case '*':
+					result.push_back('_');
+					break;
+				default:
+					result.push_back(
+						static_cast<unsigned char>(character) < 0x20 ?
+							'_' :
+							character);
+					break;
+				}
+			}
+			while (!result.empty() &&
+				   (result.back() == '.' || result.back() == ' ')) {
+				result.pop_back();
+			}
+			if (result.empty()) {
+				result = "Unnamed";
+			}
+			// Keep well inside MAX_PATH once the root and the omod folder are
+			// appended.
+			if (result.size() > 64U) {
+				result.resize(64U);
+			}
+			return result;
+		}
+
+		constexpr const char* kAutoRoot = "Data\\F4SE\\Plugins\\MagnaScope\\Auto";
+		constexpr const char* kProfileFileName = "profile.json";
+
 		void UpdateConfigValue(std::string_view key, const json& value)
 		{
 			const std::filesystem::path path = "Data\\F4SE\\Plugins\\MagnaScopeConfig.json";
@@ -76,6 +116,56 @@ namespace ScopeData
 	ScopeProfile::ScopeProfile(std::string pathO)
 	{
 		path = pathO;
+	}
+
+	bool ScopeProfile::UsesFolderLayout() const
+	{
+		if (path.empty()) {
+			return false;
+		}
+		return std::filesystem::path(path).filename() == kProfileFileName;
+	}
+
+	std::string ScopeProfile::ProfileDirectory() const
+	{
+		if (!UsesFolderLayout()) {
+			return {};
+		}
+		return std::filesystem::path(path).parent_path().string();
+	}
+
+	std::string ScopeProfile::ReticleDirectory() const
+	{
+		const auto directory = ProfileDirectory();
+		if (directory.empty()) {
+			return {};
+		}
+		return (std::filesystem::path(directory) / "reticles").string();
+	}
+
+	std::string ScopeDataHandler::BuildProfileDirectory(
+		const std::string& weaponLabel,
+		const std::string& sourcePlugin,
+		std::uint32_t sourceFormID,
+		const std::string& omodKey)
+	{
+		// The folder name is readable, but it is never the lookup key: every
+		// key comes from the identity fields inside profile.json. Renaming a
+		// folder by hand therefore only moves where its reticles live, and
+		// cannot orphan the profile.
+		const auto label = SanitiseForPath(
+			weaponLabel.empty() ?
+				std::filesystem::path(sourcePlugin).stem().string() :
+				weaponLabel);
+		const auto weaponFolder = std::format(
+			"{} [{}_{:08X}]",
+			label,
+			SanitiseForPath(std::filesystem::path(sourcePlugin).stem().string()),
+			sourceFormID);
+		const auto scopeFolder =
+			SanitiseForPath(omodKey.empty() ? std::string("Default") : omodKey);
+		return (std::filesystem::path(kAutoRoot) / weaponFolder / scopeFolder)
+			.string();
 	}
 
 #pragma region jsonRead
@@ -164,6 +254,63 @@ namespace ScopeData
 		s.breathing = j.value("Breathing", Breathing());
 	}
 
+	void from_json(const json& j, ProfileVariant& v)
+	{
+		v.id = j.value("Id", 0U);
+		v.magnification = j.value("Magnification", 1.0F);
+		v.label = j.value("Label", "");
+		v.shaderData = j.value("ShaderData", ShaderData());
+		v.zoomDataOverwrite = j.value("ZoomDataOverwrite", ZoomDataOverwrite());
+	}
+
+	void from_json(const json& j, VariantSet& v)
+	{
+		v.enabled = j.value("Enabled", false);
+		v.continuous = j.value("Continuous", false);
+		v.stepSeconds = j.value("StepSeconds", 0.12F);
+		v.nextId = j.value("NextId", 1U);
+		v.defaultVariantId = j.value("DefaultVariantId", 0U);
+		v.variants = j.value("Variants", std::vector<ProfileVariant>());
+		// Ids are the co-save's key, so a hand-edited or pre-id file must be
+		// repaired on load rather than left with colliding zeros.
+		for (auto& variant : v.variants) {
+			if (variant.id == 0U) {
+				variant.id = v.nextId++;
+			}
+			v.nextId = std::max(v.nextId, variant.id + 1U);
+		}
+		std::ranges::stable_sort(
+			v.variants,
+			[](const ProfileVariant& left, const ProfileVariant& right) {
+				return left.magnification < right.magnification;
+			});
+	}
+
+	void from_json(const json& j, SecondarySight& s)
+	{
+		s.name = j.value("Name", "Iron Sights");
+		s.zoomData = j.value("ZoomData", ZoomDataOverwrite());
+		s.suppressOptics = j.value("SuppressOptics", true);
+		s.transitionSeconds = j.value("TransitionSeconds", 0.18F);
+	}
+
+	void from_json(const json& j, OcclusionSettings& o)
+	{
+		o.enabled = j.value("Enabled", false);
+		o.sphereRadius = j.value("SphereRadius", 5.0F);
+		const auto offset =
+			j.value("SphereOffset", std::vector<float>{ 0.0F, 0.0F, 0.0F });
+		for (std::size_t index = 0;
+			 index < 3U && index < offset.size();
+			 ++index) {
+			o.sphereOffset[index] = offset[index];
+		}
+		o.frontOnly = j.value("FrontOnly", true);
+		o.flipFront = j.value("FlipFront", false);
+		o.excludedShapes =
+			j.value("ExcludedShapes", std::vector<std::string>());
+	}
+
 	void from_json(const json& j, ScopeProfile& f)
 	{
 		f.keywordName = j.value("keywordEditorID", "AUTO_Default");
@@ -188,11 +335,23 @@ namespace ScopeData
 		f.autoProfile = j.value("AutoProfile", false);
 		f.sourcePlugin = j.value("SourcePlugin", "");
 		f.sourceFormID = j.value("SourceFormID", 0U);
+		f.omodKey = j.value("OmodKey", "");
 		f.scopeFrame = j.value("scopeFrame", 1);
 		f.ZoomNodePath = j.value("ReticleTexturePath", "");
 
+		f.weaponLabel = j.value("WeaponLabel", "");
+
 		f.shaderData = j.value("ShaderData", ShaderData());
 		f.zoomDataOverwrite = j.value("ZoomDataOverwrite", ZoomDataOverwrite());
+
+		f.variants = j.value("Variants", VariantSet());
+		f.secondarySights = j.value("SecondarySights", std::vector<SecondarySight>());
+		f.defaultReticleFile = j.value("DefaultReticleFile", "");
+		f.customReticleScale = j.value("CustomReticleScale", 1.0F);
+		// Absent on every pre-existing profile -> default-constructed ->
+		// disabled; old files round-trip unchanged apart from gaining the key
+		// on their next save.
+		f.occlusion = j.value("Occlusion", OcclusionSettings());
 	}
 
 #pragma endregion
@@ -284,6 +443,53 @@ namespace ScopeData
 	}
 
 	// 为ScopeProfile类型定义to_json函数
+	void to_json(json& j, const ProfileVariant& v)
+	{
+		j = json{
+			{ "Id", v.id },
+			{ "Magnification", v.magnification },
+			{ "Label", v.label },
+			{ "ShaderData", v.shaderData },
+			{ "ZoomDataOverwrite", v.zoomDataOverwrite }
+		};
+	}
+
+	void to_json(json& j, const VariantSet& v)
+	{
+		j = json{
+			{ "Enabled", v.enabled },
+			{ "Continuous", v.continuous },
+			{ "StepSeconds", v.stepSeconds },
+			{ "NextId", v.nextId },
+			{ "DefaultVariantId", v.defaultVariantId },
+			{ "Variants", v.variants }
+		};
+	}
+
+	void to_json(json& j, const SecondarySight& s)
+	{
+		j = json{
+			{ "Name", s.name },
+			{ "ZoomData", s.zoomData },
+			{ "SuppressOptics", s.suppressOptics },
+			{ "TransitionSeconds", s.transitionSeconds }
+		};
+	}
+
+	void to_json(json& j, const OcclusionSettings& o)
+	{
+		j = json{
+			{ "Enabled", o.enabled },
+			{ "SphereRadius", o.sphereRadius },
+			{ "SphereOffset",
+				std::vector<float>{
+					o.sphereOffset[0], o.sphereOffset[1], o.sphereOffset[2] } },
+			{ "FrontOnly", o.frontOnly },
+			{ "FlipFront", o.flipFront },
+			{ "ExcludedShapes", o.excludedShapes }
+		};
+	}
+
 	void to_json(json& j, const ScopeProfile& f)
 	{
 		std::ostringstream oss;
@@ -305,11 +511,18 @@ namespace ScopeData
 			{ "AutoProfile", f.autoProfile },
 			{ "SourcePlugin", f.sourcePlugin },
 			{ "SourceFormID", f.sourceFormID },
+			{ "OmodKey", f.omodKey },
 			{ "scopeFrame", f.scopeFrame },
 			{ "ReticleTexturePath", f.ZoomNodePath },
 			//
+			{ "WeaponLabel", f.weaponLabel },
 			{ "ShaderData", f.shaderData },
-			{ "ZoomDataOverwrite", f.zoomDataOverwrite }
+			{ "ZoomDataOverwrite", f.zoomDataOverwrite },
+			{ "Variants", f.variants },
+			{ "SecondarySights", f.secondarySights },
+			{ "DefaultReticleFile", f.defaultReticleFile },
+			{ "CustomReticleScale", f.customReticleScale },
+			{ "Occlusion", f.occlusion }
 		};
 	}
 
@@ -340,6 +553,15 @@ namespace ScopeData
 				throw std::runtime_error("file could not be opened");
 			}
 			const auto parsed = json::parse(input, nullptr, true, true);
+
+			// Folder layout: the file is this profile and nothing else.
+			if (parsed.contains("MagnaScopeProfile")) {
+				const auto keptPath = data->path;
+				parsed.get_to(*data);
+				data->path = keptPath;
+				data->autoProfile = true;
+				return;
+			}
 
 			// Automatic profile files hold one entry per scope attachment;
 			// reload only this profile's own entry. If the entry is missing
@@ -419,6 +641,30 @@ namespace ScopeData
 							0.0F,
 							4.0F);
 				};
+
+			// Version 3: folder-per-weapon layout, one profile.json per scope
+			// attachment, with its reticle textures beside it. Identified by a
+			// marker key rather than by its path, so the folder can be renamed.
+			if (parsed.contains("MagnaScopeProfile")) {
+				auto data = std::make_unique<ScopeProfile>(path);
+				parsed.get_to(*data);
+				data->autoProfile = true;
+				applyAutomaticOpticsDefaults(parsed, *data);
+				if (data->sourcePlugin.empty() || data->sourceFormID == 0) {
+					logger::warn(
+						"Skipping profile {}: missing weapon identity",
+						path);
+					return false;
+				}
+				if (data->omodKey.empty()) {
+					data->omodKey = "Default";
+				}
+				autoProfileMap.insert_or_assign(
+					{ data->sourcePlugin, data->sourceFormID, data->omodKey },
+					data.get());
+				ownedData.push_back(std::move(data));
+				return true;
+			}
 
 			// Version 2 automatic profile file: one file per weapon, holding
 			// one entry per scope attachment under "Scopes", keyed by the
@@ -574,6 +820,11 @@ namespace ScopeData
 
 		nvKey = data.value("NvKey", 0);
 		guiKey = data.value("guiKey", 117);
+		// Unbound by default. A key that does something out of the box would
+		// collide with whatever the user or another mod already has bound, and
+		// reticle cycling on an unexpected key is worse than a feature that
+		// waits to be asked for.
+		opticsKey = data.value("opticsKey", -1);
 
 		data["RenderPassIndex"] = PassRenderIndex;
 		data["EnableRenderBeforeUI"] = bEnableRenderBeforeUI;
@@ -581,6 +832,7 @@ namespace ScopeData
 		data["ComboNVKey"] = comboNVKey;
 		data["NvKey"] = nvKey;
 		data["guiKey"] = guiKey;
+		data["opticsKey"] = opticsKey;
 
 		try {
 			std::filesystem::create_directories(path.parent_path());
@@ -628,6 +880,24 @@ namespace ScopeData
 	{
 		guiKey = mainkeycode;
 		UpdateConfigValue("guiKey", guiKey);
+	}
+
+	void ScopeDataHandler::SetOpticsKey(unsigned int mainkeycode)
+	{
+		opticsKey = static_cast<int>(mainkeycode);
+		UpdateConfigValue("opticsKey", opticsKey);
+	}
+
+	std::vector<ScopeProfile*> ScopeDataHandler::AllAutoProfiles() const
+	{
+		std::vector<ScopeProfile*> result;
+		result.reserve(ownedData.size());
+		for (const auto& owned : ownedData) {
+			if (owned && owned->autoProfile) {
+				result.push_back(owned.get());
+			}
+		}
+		return result;
 	}
 
 	void ScopeDataHandler::ReadCustomScopeDataFiles(std::string path)
@@ -766,20 +1036,31 @@ namespace ScopeData
 			return migrated;
 		}
 
-		std::string safePlugin = sourcePlugin;
-		std::ranges::replace_if(
-			safePlugin,
-			[](const char value) {
-				return value == '<' || value == '>' || value == ':' || value == '"' ||
-			           value == '/' || value == '\\' || value == '|' || value == '?' || value == '*';
-			},
-			'_');
+		// Readable folder name, best effort. Fallout 4 strips EditorIDs from
+		// most runtime forms, so GetFormEditorID is usually empty and the
+		// weapon's full name is what actually identifies it to a human. The
+		// FormID is appended by BuildProfileDirectory regardless, so two mods
+		// shipping a weapon of the same name cannot collide.
+		std::string weaponLabel;
+		if (const auto* editorID = weapon->GetFormEditorID();
+			editorID && editorID[0] != 0) {
+			weaponLabel = editorID;
+		}
+		if (weaponLabel.empty()) {
+			if (const auto fullName = weapon->GetFullName();
+				fullName && fullName[0] != 0) {
+				weaponLabel = fullName;
+			}
+		}
 
-		const auto profilePath = std::filesystem::path("Data\\F4SE\\Plugins\\MagnaScope\\Auto") /
-		                         std::format("{}_{:08X}.json", safePlugin, sourceFormID);
+		const auto profilePath =
+			std::filesystem::path(BuildProfileDirectory(
+				weaponLabel, sourcePlugin, sourceFormID, omodKey)) /
+			"profile.json";
 		auto profile = std::make_unique<ScopeProfile>(profilePath.string());
 		profile->keywordName = std::format("AUTO_{:08X} [{}]", sourceFormID, omodKey);
 		profile->omodKey = omodKey;
+		profile->weaponLabel = weaponLabel;
 		profile->legacyMode = true;
 		profile->UsingSTS = true;
 		profile->autoProfile = true;
@@ -925,50 +1206,63 @@ namespace ScopeData
 
 	bool ScopeDataHandler::WriteAutoProfile(ScopeProfile* data)
 	{
-		if (!data || !data->autoProfile || data->path.empty()) {
+		if (!data || !data->autoProfile) {
 			return false;
 		}
 
 		try {
+			// Migration is save-triggered and one-way. A profile still living in
+			// the old shared-file layout is written to the folder layout on its
+			// next explicit save, and the old file is deliberately left where it
+			// is: nothing bulk-rewrites files the user did not ask to have
+			// touched. The old file simply stops being the newest source for
+			// this identity, and the reader prefers the folder layout.
+			const bool migrating = !data->UsesFolderLayout();
+			const std::string previousPath = data->path;
+			if (migrating) {
+				const auto directory = BuildProfileDirectory(
+					data->weaponLabel,
+					data->sourcePlugin,
+					data->sourceFormID,
+					data->omodKey);
+				data->path =
+					(std::filesystem::path(directory) / kProfileFileName)
+						.string();
+			}
+
 			const std::filesystem::path outputPath(data->path);
 
-			// The file is shared by every scope attachment on this weapon, so
-			// merge into the existing content instead of overwriting it.
-			json fileJson = json::object();
-			if (std::ifstream input(outputPath); input) {
-				try {
-					fileJson = json::parse(input, nullptr, true, true);
-				} catch (const std::exception&) {
-					fileJson = json::object();
-				}
-			}
-			if (!fileJson.is_object() || !fileJson.contains("Scopes") || !fileJson["Scopes"].is_object()) {
-				// Also covers legacy flat files: their single entry becomes
-				// the "Default" entry of the new container format.
-				json scopes = json::object();
-				if (fileJson.is_object() && fileJson.value("AutoProfile", false)) {
-					scopes["Default"] = fileJson;
-				}
-				fileJson = json::object();
-				fileJson["Scopes"] = std::move(scopes);
-			}
-
-			fileJson["AutoProfileFile"] = 2;
-			fileJson["SourcePlugin"] = data->sourcePlugin;
-			fileJson["SourceFormID"] = data->sourceFormID;
-			const std::string entryKey = data->omodKey.empty() ? "Default" : data->omodKey;
-			fileJson["Scopes"][entryKey] = *data;
+			json fileJson = *data;
+			fileJson["MagnaScopeProfile"] = 3;
 
 			std::filesystem::create_directories(outputPath.parent_path());
+			// The reticle folder is created up front so there is somewhere
+			// obvious to drop textures without having to guess the name.
+			std::error_code reticleError;
+			std::filesystem::create_directories(
+				std::filesystem::path(outputPath.parent_path()) / "reticles",
+				reticleError);
+
 			std::ofstream output(outputPath, std::ios::trunc);
 			if (!output) {
 				throw std::runtime_error("file could not be opened");
 			}
 			output << fileJson.dump(2) << '\n';
-			logger::info("Saved STS auto profile {} entry [{}]", outputPath.string(), entryKey);
+
+			if (migrating) {
+				logger::info(
+					"Migrated profile for [{}] from '{}' to '{}'; the old file "
+					"was left in place and is no longer read for this scope",
+					data->omodKey,
+					previousPath,
+					outputPath.string());
+			} else {
+				logger::info("Saved profile {}", outputPath.string());
+			}
 			return true;
 		} catch (const std::exception& error) {
-			logger::error("Unable to save STS auto profile {}: {}", data->path, error.what());
+			logger::error(
+				"Unable to save profile {}: {}", data->path, error.what());
 			return false;
 		}
 	}

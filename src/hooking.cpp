@@ -773,6 +773,31 @@ bool bResetZoomDelta = false;
 // this guard thread-local prevents an unrelated deferred/context thread from
 // accidentally bypassing capture while the immediate context is replaying.
 thread_local bool bSelfDraw = false;
+
+// --- sphere occlusion state -------------------------------------------------
+// The game thread publishes ready-made holed index arrays (it owns the CPU
+// geometry copies); UpdateScene turns them into immutable D3D buffers; the
+// draw dispatch swaps a matching draw's index buffer for its holed twin.
+// occlusionPending crosses threads under the mutex; occlusionBuilt is touched
+// only on the render thread (UpdateScene and the draw hook share it), so it
+// needs no lock of its own.
+namespace
+{
+	std::mutex occlusionMutex;
+	std::vector<Hook::D3D::OcclusionEntry> occlusionPending;
+	std::uint64_t occlusionGeneration = 0U;
+	std::uint64_t occlusionBuiltGeneration = 0U;
+
+	struct BuiltOcclusionEntry
+	{
+		std::uintptr_t sourceIndexBuffer = 0;
+		std::uint32_t sourceIndexOffset = 0;
+		std::uint32_t indexCount = 0;
+		std::uint32_t culledTriangles = 0;
+		Microsoft::WRL::ComPtr<ID3D11Buffer> buffer;
+	};
+	std::vector<BuiltOcclusionEntry> occlusionBuilt;
+}
 // Retained so Present can compare what we hooked against what is in the vtable
 // now. An upscaler proxy or another integration replacing the entry after us
 // silently removes our detour from the chain, and the only visible symptom is
@@ -3218,6 +3243,19 @@ namespace Hook
 			scopeApertureInnerRatio.load(std::memory_order_acquire),
 			0.05F,
 			0.95F);
+		// A custom reticle only takes effect once its texture is actually
+		// resident. Publishing the index before the load completes would leave
+		// the composite sampling an unbound t6, which is transparent black in
+		// D3D11 -- a silently missing reticle rather than a visible failure.
+		resolution.customReticleIndex =
+			mCustomReticleReady ?
+				static_cast<float>(
+					scopeCustomReticleIndex.load(std::memory_order_acquire)) :
+				-1.0F;
+		resolution.customReticleScale = std::clamp(
+			scopeCustomReticleScale.load(std::memory_order_acquire),
+			0.05F,
+			8.0F);
 		// Capture-to-composite viewport ratio for the reticle layer. Identity
 		// unless a capture actually ran and rasterized into a sub-viewport of
 		// the target, which is what dynamic resolution does; see the capture
@@ -4818,19 +4856,39 @@ namespace Hook
 				nullptr);
 			compositeTarget = boundTarget.Get();
 		}
-		if (!mAutomaticSTSReticleLayerReady ||
-			mAutomaticSTSReticleLayerGeneration == 0U ||
-			mAutomaticSTSReticleLayerGeneration !=
-				automaticSTSReplayFrameGeneration.load(
-					std::memory_order_acquire) ||
-			mAutomaticSTSReticleLayerResourceGeneration !=
-				mScopeFadeResourceGeneration.load(
-					std::memory_order_acquire) ||
-			!mAutomaticSTSReticleLayerSRV.Get() ||
-			!mAutomaticSTSReticleLayerWhiteSRV.Get() ||
-			!mAutomaticSTSReticleLayerCompositeBlend.Get() ||
+		// Render prerequisites, needed by either reticle source.
+		if (!mAutomaticSTSReticleLayerCompositeBlend.Get() ||
 			!m_pPixelShader_STSReticleLayer.Get() ||
 			!m_pVertexShader_Legacy.Get() || !compositeTarget) {
+			return false;
+		}
+
+		// The captured authored reticle: a dual black/white capture taken this
+		// frame, against the current resources.
+		const bool capturedLayerUsable =
+			mAutomaticSTSReticleLayerReady &&
+			mAutomaticSTSReticleLayerGeneration != 0U &&
+			mAutomaticSTSReticleLayerGeneration ==
+				automaticSTSReplayFrameGeneration.load(
+					std::memory_order_acquire) &&
+			mAutomaticSTSReticleLayerResourceGeneration ==
+				mScopeFadeResourceGeneration.load(std::memory_order_acquire) &&
+			mAutomaticSTSReticleLayerSRV.Get() &&
+			mAutomaticSTSReticleLayerWhiteSRV.Get();
+
+		// A custom reticle needs no capture at all. Requiring one would leave
+		// every scope without an authored Reticle node -- and there are plenty
+		// -- unable to show a custom reticle, because this composite would
+		// simply never run for them. What it does need is for the aperture
+		// replay to have happened this frame, so there is an optic to draw into.
+		const bool customReticleUsable =
+			mCustomReticleReady &&
+			mCustomReticleSRV.Get() &&
+			scopeCustomReticleIndex.load(std::memory_order_acquire) >= 0 &&
+			automaticSTSExactScopeFadeReplacementThisFrame.load(
+				std::memory_order_acquire);
+
+		if (!capturedLayerUsable && !customReticleUsable) {
 			return false;
 		}
 
@@ -4943,6 +5001,12 @@ namespace Hook
 		// shader's shadow.
 		ID3D11Buffer* scopeEffectBuffer = m_pScopeEffectBuffer.Get();
 		g_Context->PSSetShaderResources(4U, 2U, layerSources);
+		// t6: the custom reticle texture. Bound unconditionally, including as
+		// null -- an unbound SRV samples transparent black in D3D11, and the
+		// published reticle index is forced negative until a texture is
+		// actually resident, so the shader never reads a stale binding.
+		ID3D11ShaderResourceView* customReticle = mCustomReticleSRV.Get();
+		g_Context->PSSetShaderResources(6U, 1U, &customReticle);
 		g_Context->PSSetSamplers(0U, 1U, &sampler);
 		g_Context->PSSetConstantBuffers(4U, 1U, &resolutionBuffer);
 		if (scopeEffectBuffer) {
@@ -5291,11 +5355,120 @@ namespace Hook
 		dst.ScopeScreenPos = { src.scopeScreenPos.x, src.scopeScreenPos.y };
 	}
 
+	void D3D::RequestCustomReticleTexture(const std::string& path)
+	{
+		std::scoped_lock lock(mCustomReticleMutex);
+		mPendingCustomReticlePath = path;
+	}
+
+	void D3D::PublishScopeOcclusion(std::vector<OcclusionEntry> entries)
+	{
+		std::scoped_lock lock(occlusionMutex);
+		occlusionPending = std::move(entries);
+		++occlusionGeneration;
+	}
+
+	void D3D::LoadCustomReticleTexture(const std::string& path)
+	{
+		mCustomReticleSRV.Reset();
+		mCustomReticleReady = false;
+		if (path.empty()) {
+			return;
+		}
+
+		const std::wstring widePath(path.begin(), path.end());
+		const bool isDds = path.size() > 4U &&
+		                   _stricmp(path.c_str() + path.size() - 4U, ".dds") == 0;
+
+		// Both loaders are already in the tree, so a user can drop either a
+		// .dds or a .png into the reticles folder without converting anything.
+		HRESULT result = isDds ?
+			CreateDDSTextureFromFile(
+				g_Device.Get(),
+				widePath.c_str(),
+				nullptr,
+				mCustomReticleSRV.ReleaseAndGetAddressOf()) :
+			CreateWICTextureFromFile(
+				g_Device.Get(),
+				widePath.c_str(),
+				nullptr,
+				mCustomReticleSRV.ReleaseAndGetAddressOf());
+
+		if (FAILED(result)) {
+			logger::warn(
+				"Custom reticle texture '{}' failed to load (0x{:08X}); falling "
+				"back to the authored 3D reticle",
+				path,
+				static_cast<std::uint32_t>(result));
+			mCustomReticleSRV.Reset();
+			return;
+		}
+
+		mCustomReticleReady = true;
+		logger::info("Loaded custom reticle texture '{}'", path);
+	}
+
 	void D3D::UpdateScene(ScopeProfile* currData)
 	{
 		if (bChangeAimTexture) {
 			LoadAimTexture(currData->ZoomNodePath);
 			bChangeAimTexture = false;
+		}
+
+		// Reticle swaps are rare and the path is only published on change, so
+		// comparing strings here costs nothing and avoids reloading the same
+		// texture every frame.
+		{
+			std::scoped_lock lock(mCustomReticleMutex);
+			if (mPendingCustomReticlePath != mLoadedCustomReticlePath) {
+				LoadCustomReticleTexture(mPendingCustomReticlePath);
+				mLoadedCustomReticlePath = mPendingCustomReticlePath;
+			}
+		}
+
+		// Sphere occlusion: turn freshly published holed index arrays into
+		// immutable buffers. Generation-gated, so this is a no-op every frame
+		// the publish did not change; an empty publish drops every buffer and
+		// the draw dispatch falls back to passing everything through.
+		{
+			std::scoped_lock lock(occlusionMutex);
+			if (occlusionBuiltGeneration != occlusionGeneration) {
+				occlusionBuiltGeneration = occlusionGeneration;
+				occlusionBuilt.clear();
+				std::uint32_t totalCulled = 0U;
+				for (const auto& entry : occlusionPending) {
+					if (entry.indices.empty() ||
+						entry.indexCount != entry.indices.size() ||
+						entry.culledTriangles == 0U) {
+						continue;
+					}
+					D3D11_BUFFER_DESC description{};
+					description.ByteWidth = static_cast<UINT>(
+						entry.indices.size() * sizeof(std::uint16_t));
+					description.Usage = D3D11_USAGE_IMMUTABLE;
+					description.BindFlags = D3D11_BIND_INDEX_BUFFER;
+					D3D11_SUBRESOURCE_DATA initial{};
+					initial.pSysMem = entry.indices.data();
+					Microsoft::WRL::ComPtr<ID3D11Buffer> buffer;
+					if (SUCCEEDED(g_Device->CreateBuffer(
+							&description, &initial, buffer.GetAddressOf()))) {
+						occlusionBuilt.push_back(BuiltOcclusionEntry{
+							entry.sourceIndexBuffer,
+							entry.sourceIndexOffset,
+							entry.indexCount,
+							entry.culledTriangles,
+							std::move(buffer) });
+						totalCulled += entry.culledTriangles;
+					}
+				}
+				if (!occlusionBuilt.empty() || totalCulled > 0U) {
+					logger::info(
+						"[occlusion] built {} holed index buffer(s), {} "
+						"triangle(s) culled",
+						occlusionBuilt.size(),
+						totalCulled);
+				}
+			}
 		}
 
 #pragma region FO4GameConstantBuffer
@@ -5312,11 +5485,22 @@ namespace Hook
 		// magnification controls preview live instead of waiting for a save.
 		const bool editing =
 			bEnableEditMode.load(std::memory_order_acquire);
-		const float zoomMin =
-			editing ? editZoomMin : currData->shaderData.minZoom;
-		const float zoomMax = std::max(
-			zoomMin,
-			editing ? editZoomMax : currData->shaderData.maxZoom);
+		// A pinned variant magnification overrides both, and collapses the
+		// range to a point. Leaving the profile's own min/max in force here
+		// would let the free-scroll clamp fight the resolver: during a blend
+		// both the bounds and the magnification move, and nothing guarantees
+		// the latter stays inside the former.
+		const float pinnedZoom =
+			scopeVariantPinnedZoom.load(std::memory_order_acquire);
+		const bool zoomPinned = pinnedZoom > 0.0F;
+		const float zoomMin = zoomPinned ?
+			pinnedZoom :
+			(editing ? editZoomMin : currData->shaderData.minZoom);
+		const float zoomMax = zoomPinned ?
+			pinnedZoom :
+			std::max(
+				zoomMin,
+				editing ? editZoomMax : currData->shaderData.maxZoom);
 
 		if (bResetZoomDelta) {
 			gameZoomDelta = zoomMin;
@@ -5324,6 +5508,30 @@ namespace Hook
 		}
 
 		gameZoomDelta = std::clamp(gameZoomDelta, zoomMin, zoomMax);
+
+		// Probe: the render side's view of the variant pin, once per second
+		// while pinned. Read alongside the [variant] lines from the game
+		// thread: if 'consumer stored pinned' moves but this stays put, the
+		// atomic is not being read here; if this moves and the image does not,
+		// the shader is not using ScopeEffect_Zoom the way we think.
+		if (zoomPinned) {
+			static std::uint64_t lastPinProbe = 0U;
+			const auto nowSec = static_cast<std::uint64_t>(
+				std::chrono::duration_cast<std::chrono::seconds>(
+					std::chrono::steady_clock::now().time_since_epoch())
+					.count());
+			if (nowSec != lastPinProbe) {
+				lastPinProbe = nowSec;
+				logger::info(
+					"[variant] render pinned={:.2f} zoom=[{:.2f},{:.2f}] "
+					"delta={:.2f} effectOn={}",
+					pinnedZoom,
+					zoomMin,
+					zoomMax,
+					gameZoomDelta,
+					isEnableScopeEffect);
+			}
+		}
 
 		scopeData.ScopeEffect_Zoom = gameZoomDelta;
 		scopeData.GameFov = pcam->firstPersonFOV;
@@ -5991,6 +6199,42 @@ namespace Hook
 				IndexCount,
 				StartIndexLocation,
 				BaseVertexLocation);
+		}
+		// Sphere occlusion: a draw whose bound index buffer matches a published
+		// entry is redrawn with its holed twin -- identical indices except the
+		// in-sphere triangles are degenerate -- and everything else about the
+		// draw is untouched. Identity is (buffer pointer, pooled byte offset,
+		// index count), recorded from the same rendererData the game binds
+		// from; StartIndexLocation must be zero because the holed buffer
+		// replicates exactly the entry's range. No match means no
+		// substitution, so the fail-open path is the default path.
+		if (!occlusionBuilt.empty() && StartIndexLocation == 0U &&
+			pContext->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE) {
+			Microsoft::WRL::ComPtr<ID3D11Buffer> currentIndexBuffer;
+			DXGI_FORMAT currentFormat = DXGI_FORMAT_UNKNOWN;
+			UINT currentOffset = 0U;
+			pContext->IAGetIndexBuffer(
+				currentIndexBuffer.GetAddressOf(),
+				&currentFormat,
+				&currentOffset);
+			if (currentIndexBuffer && currentFormat == DXGI_FORMAT_R16_UINT) {
+				const auto identity =
+					reinterpret_cast<std::uintptr_t>(currentIndexBuffer.Get());
+				for (const auto& built : occlusionBuilt) {
+					if (built.sourceIndexBuffer == identity &&
+						built.sourceIndexOffset == currentOffset &&
+						built.indexCount == IndexCount) {
+						pContext->IASetIndexBuffer(
+							built.buffer.Get(), DXGI_FORMAT_R16_UINT, 0U);
+						original(pContext, IndexCount, 0U, BaseVertexLocation);
+						pContext->IASetIndexBuffer(
+							currentIndexBuffer.Get(),
+							currentFormat,
+							currentOffset);
+						return;
+					}
+				}
+			}
 		}
 		if (MagnaScope::GetSettings().AllowsWorldColorCapture()) {
 			(void)MagnaScope::WorldOnlyScopeRenderer::GetSingleton()
@@ -7763,8 +8007,18 @@ namespace Hook
 		projectedAimY.store(aimCenterY, std::memory_order_relaxed);
 		projectedLensRadiusX.store(radiusX, std::memory_order_relaxed);
 		projectedLensRadiusY.store(radiusY, std::memory_order_relaxed);
+		// The secondary-sight blend fades the whole optic out through this one
+		// constant, which the scene replay and the reticle layer both already
+		// consume. Scaling it here rather than adding a separate kill switch is
+		// what guarantees the two layers cannot disagree about how far the optic
+		// has faded -- a reticle still lit inside an aperture the scene has
+		// already darkened is exactly the class of desync this avoids.
 		projectedActivationProgress.store(
-			std::clamp(activationProgress, 0.0F, 1.0F),
+			std::clamp(activationProgress, 0.0F, 1.0F) *
+				std::clamp(
+					scopeApertureActivationScale.load(std::memory_order_acquire),
+					0.0F,
+					1.0F),
 			std::memory_order_relaxed);
 		projectedSourceWidth.store(
 			static_cast<float>(windowWidth),
@@ -9050,6 +9304,10 @@ namespace Hook
 	std::atomic<float> D3D::reticleCaptureViewportWidth = 0.0F;
 	std::atomic<float> D3D::reticleCaptureViewportHeight = 0.0F;
 	std::atomic<float> D3D::scopeApertureInnerRatio = 0.5F;
+	std::atomic<float> D3D::scopeApertureActivationScale = 1.0F;
+	std::atomic<float> D3D::scopeVariantPinnedZoom = -1.0F;
+	std::atomic<int> D3D::scopeCustomReticleIndex = -1;
+	std::atomic<float> D3D::scopeCustomReticleScale = 1.0F;
 	std::atomic<float> D3D::projectedPhysicalEyeBoxBlend = 0.0F;
 	std::atomic_bool D3D::projectedPhysicalEyeBoxReady = false;
 	std::atomic_bool D3D::projectedTrackingReady = false;

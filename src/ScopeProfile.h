@@ -198,6 +198,88 @@ namespace ScopeData
 		Parallax parallax;
 	};
 
+	// One magnification stop of a variable-power optic.
+	//
+	// Only numeric optical values vary per variant. The structural fields that
+	// also live in ShaderData -- apertureSurface, reticleSurface, IsCircle and
+	// the bool flags -- are owned by the base profile and are overwritten from
+	// it after interpolation. They are not lerpable, and changing
+	// apertureSurface mid-blend would re-trigger aperture discovery and
+	// geometry selection on every frame of the transition.
+	//
+	// The whole ShaderData is copied rather than a hand-picked lerpable subset,
+	// because a subset would need maintaining in lockstep with ShaderData
+	// forever and would silently drop any field added later.
+	struct ProfileVariant
+	{
+		// Stable identity, assigned once and never reused within a profile.
+		// The co-save stores this rather than a list index: inserting a variant
+		// shifts every index, which would silently select the wrong optic on
+		// load. Magnification is the sort key and the display value, not the
+		// identity -- two variants a rounding error apart are indistinguishable
+		// to a user and would collapse unpredictably.
+		std::uint32_t id = 0;
+		float magnification = 1.0F;
+		std::string label;
+		ShaderData shaderData;
+		ZoomDataOverwrite zoomDataOverwrite;
+	};
+
+	struct VariantSet
+	{
+		// Opt-in. Absent from a profile means disabled, so every existing
+		// profile keeps behaving exactly as it does today.
+		bool enabled = false;
+		// false steps between variants, true blends continuously.
+		bool continuous = false;
+		// Ease time for a stepped change, so a ratchet does not pop.
+		float stepSeconds = 0.12F;
+		// Never decreases; guarantees ids stay unique across edits.
+		std::uint32_t nextId = 1;
+		// Authored starting variant for a character with no co-save entry.
+		std::uint32_t defaultVariantId = 0;
+		// Sorted ascending by magnification.
+		std::vector<ProfileVariant> variants;
+	};
+
+	// An offset iron sight or piggyback optic: new zoom data plus a lerp.
+	// Deliberately flat -- no magnification variants of its own.
+	struct SecondarySight
+	{
+		std::string name = "Iron Sights";
+		ZoomDataOverwrite zoomData;
+		// Fade the aperture and magnification out while this sight is up.
+		// Offset irons are not magnified.
+		bool suppressOptics = true;
+		float transitionSeconds = 0.18F;
+	};
+
+	// Sphere occlusion: hides the parts of the scope's own meshes that sit
+	// inside a glass-anchored sphere (and optionally in front of the glass), so
+	// housing geometry cannot clutter the sight picture. Per-triangle -- only
+	// the triangles inside the sphere are removed, the rest of each mesh stays
+	// -- via an index-buffer substitution at draw time; nothing outside the
+	// scope's own NIF is ever touched. One set per profile, disabled by
+	// default.
+	struct OcclusionSettings
+	{
+		bool enabled = false;
+		// World-unit radius of the cull sphere.
+		float sphereRadius = 5.0F;
+		// Offset of the sphere centre from the glass centre, in the glass
+		// plane's local axes (X = right, Y = optical axis, Z = up).
+		float sphereOffset[3] = { 0.0F, 0.0F, 0.0F };
+		// Restrict culling to triangles on the objective side of the glass
+		// plane, so the eyepiece side can never be cut into.
+		bool frontOnly = true;
+		// Flip which side of the glass counts as "front" for NIFs whose
+		// authored plane normal points the other way.
+		bool flipFront = false;
+		// Shape names never culled. The reticle, dot, aperture, and ScopeFade
+		// surfaces are always protected regardless of this list.
+		std::vector<std::string> excludedShapes;
+	};
+
 	class ScopeProfile
 	{
 	public:
@@ -223,8 +305,37 @@ namespace ScopeData
 		unsigned int scopeFrame = 1;
 		std::string ZoomNodePath;
 
+		// Readable weapon name for the folder-per-weapon layout. Best effort:
+		// Fallout 4 strips EditorIDs from most runtime forms, so this falls back
+		// to the weapon's full name and then to the plugin stem. It is display
+		// only -- lookup keys always come from the identity fields above, never
+		// from a path, so renaming a folder by hand cannot break matching.
+		std::string weaponLabel;
+
 		ShaderData shaderData;
 		ZoomDataOverwrite zoomDataOverwrite;
+
+		// Magnification variants, secondary sights, and the authored default
+		// reticle. Session state (which of these is currently selected) lives in
+		// the co-save instead, because it has to fork when a save forks.
+		VariantSet variants;
+		std::vector<SecondarySight> secondarySights;
+		// File name inside the profile's reticles folder; empty means the
+		// authored 3D reticle mesh.
+		std::string defaultReticleFile;
+		// Size of a texture reticle, in aperture radii.
+		float customReticleScale = 1.0F;
+		// Sphere occlusion of the scope's own front geometry. Per profile, not
+		// per variant: ShaderData is copied into every variant, so a setting
+		// that must stay single-instance cannot live there.
+		OcclusionSettings occlusion;
+
+		// Directory holding this profile, when it uses the folder-per-weapon
+		// layout. Empty for a legacy single-file profile.
+		[[nodiscard]] std::string ProfileDirectory() const;
+		// <profile directory>\reticles, or empty on the legacy layout.
+		[[nodiscard]] std::string ReticleDirectory() const;
+		[[nodiscard]] bool UsesFolderLayout() const;
 
 		ScopeProfile(std::string pathO);
 		//ScopeProfile(json j, std::string pathO);
@@ -264,6 +375,21 @@ namespace ScopeData
 		// trade.
 		void ForgetAutoProfile(const ScopeProfile* data);
 
+		// Every loaded automatic profile, for reticle discovery to walk. Raw
+		// pointers into ownedData; valid until ReloadZoomData clears it.
+		[[nodiscard]] std::vector<ScopeProfile*> AllAutoProfiles() const;
+
+		void SetOpticsKey(unsigned int keycode);
+
+		// Directory a folder-layout profile for this identity would live in.
+		// Used by the save path to migrate a legacy profile, and by reticle
+		// discovery to find the textures beside it.
+		[[nodiscard]] static std::string BuildProfileDirectory(
+			const std::string& weaponLabel,
+			const std::string& sourcePlugin,
+			std::uint32_t sourceFormID,
+			const std::string& omodKey);
+
 		int GetEffectIndex();
 		void SetEffectIndex(int);
 
@@ -298,6 +424,10 @@ namespace ScopeData
 		int comboNVKey = -1;
 		int nvKey = -1;
 		int guiKey = -1;
+		// Optics key: tap cycles reticles, hold + scroll switches secondary
+		// sights. Unbound by default so it cannot collide with another mod's
+		// binding or the user's own; the editor binds it.
+		int opticsKey = -1;
 
 	private:
 		int baseRenderCount = 0;

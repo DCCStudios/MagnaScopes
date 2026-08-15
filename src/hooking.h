@@ -214,9 +214,22 @@ namespace Hook
 			// radial star and kinked edges visible around the lens centre
 			// under magnification.
 			float apertureInnerRatio = 0.5F;
+
+			// One new 16-byte row. This struct, the static_assert below, and
+			// the cbuffer in Triangle.hlsli are three hand-maintained copies of
+			// one layout; the assert only guards the C++ side, so a drift
+			// against the HLSL is silent constant corruption rather than a
+			// compile error. Change all three together.
+			//
+			// customReticleIndex is a float because the whole buffer is floats;
+			// negative selects the authored 3D reticle.
+			float customReticleIndex = -1.0F;
+			float customReticleScale = 1.0F;
+			float reservedReticle0 = 0.0F;
+			float reservedReticle1 = 0.0F;
 		};
 		static_assert(
-			sizeof(ConstBufferData) == 208,
+			sizeof(ConstBufferData) == 224,
 			"ScopeFade constant buffer must match Triangle.hlsli");
 
 	public:
@@ -538,6 +551,35 @@ namespace Hook
 		void QueryChangeReticleTexture();
 		void ResetZoomDelta();
 		void AdjustZoomDelta(float delta);
+		// Game thread -> render thread handoff for the custom reticle. Only the
+		// path crosses; the texture is created in UpdateScene, which is the only
+		// place a device call is safe.
+		void RequestCustomReticleTexture(const std::string& path);
+
+		// One scope mesh whose index buffer is substituted at draw time to hide
+		// the triangles inside the occlusion sphere. Produced entirely on the
+		// game thread from the engine's CPU-side geometry copies; the render
+		// thread only creates the replacement D3D buffer and swaps it in.
+		struct OcclusionEntry
+		{
+			// Identity of the game's own index buffer for this mesh, as bound
+			// at draw time: the ID3D11Buffer* plus the pooled-byte offset.
+			std::uintptr_t sourceIndexBuffer = 0;
+			std::uint32_t sourceIndexOffset = 0;
+			std::uint32_t indexCount = 0;
+			// The full index range with in-sphere triangles degenerated
+			// (v0,v0,v0). Same length and format as the source range.
+			std::vector<std::uint16_t> indices;
+			std::uint32_t culledTriangles = 0;
+		};
+
+		// Game thread -> render thread handoff for sphere occlusion. An empty
+		// vector clears every substitution (no scope, occlusion disabled, ADS
+		// exit). The render thread builds immutable index buffers in
+		// UpdateScene and DrawIndexedHook swaps them in for matching draws;
+		// with nothing published every draw passes through untouched, so
+		// clearing is the fail-open path.
+		static void PublishScopeOcclusion(std::vector<OcclusionEntry> entries);
 		void SetZoom(float zoom);
 		void ScreenTextureMod();
 		// Returns true only when this call accounts for a visible composite.
@@ -720,6 +762,8 @@ namespace Hook
 			UINT numVertexBuffers, ID3D11RenderTargetView* backBufferRTV);
 
 		void LoadAimTexture(const std::string& path);
+		// Custom reticle texture, bound at t6 for the reticle composite.
+		void LoadCustomReticleTexture(const std::string& path);
 		template <typename T>
 		void UpdateConstantBuffer(const ComPtr<ID3D11Buffer>& buffer, const T& data);
 		void UpdateGameConstants(const GameConstBuffer& src, ScopeEffectShaderData& dst);
@@ -854,6 +898,20 @@ namespace Hook
 		// when unmeasured or when the synthesized ring (which is built at
 		// exactly half) is the active geometry.
 		static std::atomic<float> scopeApertureInnerRatio;
+		// Secondary-sight fade. Multiplies the aperture activation so the whole
+		// optical composite -- scene replay and reticle layer alike -- goes with
+		// it, instead of each layer needing its own suppression path.
+		static std::atomic<float> scopeApertureActivationScale;
+		// Magnification the variant resolver has pinned, or a negative value when
+		// no variant set is active. Variants and free-scroll zoom are two systems
+		// writing one variable; when variants are on, the resolver owns it
+		// outright rather than leaving gameZoomDelta wherever the wheel last left
+		// it, clamped against bounds that are themselves moving during a blend.
+		static std::atomic<float> scopeVariantPinnedZoom;
+		// Custom reticle: -1 selects the authored 3D mesh, >= 0 selects a loaded
+		// texture. The scale is in aperture radii.
+		static std::atomic<int> scopeCustomReticleIndex;
+		static std::atomic<float> scopeCustomReticleScale;
 		static std::atomic<float> projectedPhysicalEyeBoxBlend;
 		static std::atomic_bool projectedPhysicalEyeBoxReady;
 		static std::atomic_bool projectedTrackingReady;
@@ -1108,6 +1166,17 @@ namespace Hook
 		// and emissive dots without guessing the reticle texture's alpha mode.
 		// Both layers are recreated with the active render-target dimensions
 		// and format, and are valid for exactly one presented frame.
+		ComPtr<ID3D11ShaderResourceView> mCustomReticleSRV;
+		// Guards the path handoff only; the SRV itself is created and read on the
+		// render thread.
+		std::mutex mCustomReticleMutex;
+		std::string mPendingCustomReticlePath;
+		std::string mLoadedCustomReticlePath;
+		// False until a texture has actually loaded. The published reticle index
+		// is forced back to "authored mesh" until then, so the composite never
+		// samples an unbound slot.
+		bool mCustomReticleReady = false;
+
 		ComPtr<ID3D11Texture2D> mAutomaticSTSReticleLayerTexture;
 		ComPtr<ID3D11RenderTargetView> mAutomaticSTSReticleLayerRTV;
 		ComPtr<ID3D11ShaderResourceView> mAutomaticSTSReticleLayerSRV;

@@ -1,9 +1,11 @@
 #include "ImGuiImpl.h"
+#include "ScopeResolver.h"
 #include "ScopeProfile.h"
 #include "Settings.h"
 #include "hooking.h"
 #include <DirectXMath.h>
 #include <cmath>
+#include <cstdio>
 #include <d3d11.h>
 #include <mutex>
 
@@ -159,124 +161,300 @@ namespace ImGuiImpl
 		return apertureCandidates;
 	}
 
-	void PublishEditorPreview(
-		const ScopeData::ZoomDataOverwrite& zoomOverride,
-		std::uint64_t selectionRevision,
-		float magnification,
-		float imageDenoise,
-		float imageSharpen,
-		float fishEyeStrength,
-		float fishEyePower,
-		float edgeRefractionStrength,
-		float edgeRefractionWidth,
-		float edgeChromaticAberration,
-		float reticleMagnification,
-		float reticleSize,
-		float reticleOffsetX,
-		float reticleOffsetY,
-		float eyeBoxRadius,
-		float vignetteReach,
-		float vignetteSharpness,
-		float eyeBoxMaxTravel,
-		float sceneParallaxStrength,
-		float opticalLagStrength,
-		float reticleShadowStrength,
-		float reticleParallaxStrength,
-		float sceneDepth,
-		float shadowDepth,
-		float imageStillness,
-		float axialBreathing,
-		float recenterSpeed,
-		float strafeLag,
-		float tubeDepth,
-		float lensOffsetX,
-		float lensOffsetY,
-		float lensScale,
-		const ScopeData::Breathing& breathing,
-		const std::string& apertureSurface,
-		const std::string& reticleSurface)
+	std::mutex discoveredReticleMutex;
+	std::vector<std::string> discoveredReticles;
+
+	void PublishDiscoveredReticles(const std::vector<std::string>& reticles)
 	{
+		std::scoped_lock lock(discoveredReticleMutex);
+		discoveredReticles = reticles;
+	}
+
+	// --- occlusion preview + shape list (editor <-> game thread) ----------
+	std::mutex occlusionChannelMutex;
+	ScopeData::OcclusionSettings occlusionPreview;
+	bool occlusionPreviewActive = false;
+	std::vector<std::string> occlusionShapeNames;
+
+	void PublishOcclusionPreview(
+		const ScopeData::OcclusionSettings& settings, bool active)
+	{
+		std::scoped_lock lock(occlusionChannelMutex);
+		occlusionPreview = settings;
+		occlusionPreviewActive = active;
+	}
+
+	bool GetOcclusionPreview(ScopeData::OcclusionSettings& out)
+	{
+		std::scoped_lock lock(occlusionChannelMutex);
+		if (!occlusionPreviewActive) {
+			return false;
+		}
+		out = occlusionPreview;
+		return true;
+	}
+
+	void PublishOcclusionShapes(const std::vector<std::string>& names)
+	{
+		std::scoped_lock lock(occlusionChannelMutex);
+		occlusionShapeNames = names;
+	}
+
+	std::vector<std::string> GetOcclusionShapes()
+	{
+		std::scoped_lock lock(occlusionChannelMutex);
+		return occlusionShapeNames;
+	}
+
+	std::atomic<int> activeVariantIndex{ -1 };
+
+	// --- Optics-key rebind capture -------------------------------------
+	//
+	// Polled from the editor every frame while active, the same mechanism the
+	// framework's own MCM keybind widget uses (MCMWidgetRenderer::
+	// ProcessHotkeyCapture). The input-event stream cannot serve here: the
+	// framework suppresses both hotkey dispatch and plugin input callbacks
+	// while a blocking window is open, and the editor is exactly such a
+	// window -- a capture routed through the input callback never sees the
+	// keypress. GetAsyncKeyState reads the keyboard regardless of who has
+	// input focus inside the game.
+	constexpr const char* kOpticsHotkeyIdUI = "MagnaScope.Optics";
+	bool opticsCaptureActive = false;
+	// First capture frame snapshots every key already held so the click or
+	// Enter/Space that pressed the Rebind button cannot bind itself; a held
+	// key becomes bindable once released and pressed again.
+	bool opticsCaptureArmPending = false;
+	bool opticsCaptureHeldAtStart[256] = {};
+
+	// VK -> DIK. MapVirtualKeyA covers the main block; extended keys (arrows,
+	// nav cluster, right-side modifiers) carry the 0xE0 prefix in DirectInput
+	// and land at 0x80+ in the DIK space the game reports.
+	unsigned int DikFromVirtualKey(int vk)
+	{
+		switch (vk) {
+		case VK_UP: return 0xC8;
+		case VK_DOWN: return 0xD0;
+		case VK_LEFT: return 0xCB;
+		case VK_RIGHT: return 0xCD;
+		case VK_HOME: return 0xC7;
+		case VK_END: return 0xCF;
+		case VK_PRIOR: return 0xC9;
+		case VK_NEXT: return 0xD1;
+		case VK_INSERT: return 0xD2;
+		case VK_DELETE: return 0xD3;
+		case VK_RCONTROL: return 0x9D;
+		case VK_RMENU: return 0xB8;
+		default:
+			return MapVirtualKeyA(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
+		}
+	}
+
+	void ProcessOpticsKeyCapture()
+	{
+		if (!opticsCaptureActive) {
+			return;
+		}
+
+		if (opticsCaptureArmPending) {
+			opticsCaptureArmPending = false;
+			for (int vk = 0; vk < 256; ++vk) {
+				opticsCaptureHeldAtStart[vk] =
+					(GetAsyncKeyState(vk) & 0x8000) != 0;
+			}
+		}
+
+		// A key held since before capture began is armed again on release, so
+		// only a fresh press can bind.
+		for (int vk = 0; vk < 256; ++vk) {
+			if (opticsCaptureHeldAtStart[vk] &&
+				!(GetAsyncKeyState(vk) & 0x8000)) {
+				opticsCaptureHeldAtStart[vk] = false;
+			}
+		}
+
+		const auto freshlyDown = [](int vk) {
+			return (GetAsyncKeyState(vk) & 0x8000) != 0 &&
+			       !opticsCaptureHeldAtStart[vk];
+		};
+
+		// Esc cancels, Tab unbinds -- the same pair the framework's own
+		// capture (and the real MCM remap flow) uses.
+		if (freshlyDown(VK_ESCAPE)) {
+			opticsCaptureActive = false;
+			return;
+		}
+		if (freshlyDown(VK_TAB)) {
+			F4SEMenuFramework::Hotkeys::SetBinding(kOpticsHotkeyIdUI, 0U);
+			logger::info("Optics key unbound");
+			opticsCaptureActive = false;
+			return;
+		}
+
+		// Keyboard only, deliberately: the optics key is a hold-and-scroll
+		// modifier, and a mouse binding would fight the wheel it modifies.
+		// The range starts past the mouse VKs.
+		for (int vk = 0x08; vk <= 0xFE; ++vk) {
+			if (vk == VK_ESCAPE || vk == VK_TAB) {
+				continue;
+			}
+			if (!freshlyDown(vk)) {
+				continue;
+			}
+			const auto dik = DikFromVirtualKey(vk);
+			if (dik == 0U) {
+				continue;
+			}
+			// The framework persists the binding to its PluginHotkeys.ini and
+			// shows its own confirmation dialog when the code collides with
+			// another registered hotkey.
+			F4SEMenuFramework::Hotkeys::SetBinding(kOpticsHotkeyIdUI, dik);
+			logger::info("Optics key rebound to scan code 0x{:02X}", dik);
+			opticsCaptureActive = false;
+			return;
+		}
+	}
+
+	// DIK scan code -> human-readable key name via the active keyboard layout,
+	// the same self-contained approach FPGunplayOverhaul uses. A WM_KEYDOWN
+	// lParam carries the scan code in bits 16-23 and the extended-key flag in
+	// bit 24 (set for the 0x80+ codes), which is what GetKeyNameTextA reads.
+	std::string OpticsKeyDisplayName(unsigned int code)
+	{
+		if (code == 0U) {
+			return "Unbound";
+		}
+		LONG lparam = static_cast<LONG>((code & 0x7FU) << 16);
+		if (code & 0x80U) {
+			lparam |= (1L << 24);
+		}
+		char name[64]{};
+		if (GetKeyNameTextA(lparam, name, sizeof(name)) > 0) {
+			return name;
+		}
+		char fallback[16]{};
+		std::snprintf(fallback, sizeof(fallback), "Key 0x%02X", code);
+		return fallback;
+	}
+
+	void PublishActiveVariantIndex(int index)
+	{
+		activeVariantIndex.store(index, std::memory_order_release);
+	}
+
+	int ActiveVariantIndexForEditor()
+	{
+		return activeVariantIndex.load(std::memory_order_acquire);
+	}
+
+	std::vector<std::string> GetDiscoveredReticles()
+	{
+		std::scoped_lock lock(discoveredReticleMutex);
+		return discoveredReticles;
+	}
+
+	void EditorPreviewSnapshot::Clamp()
+	{
+		// One clamp path, shared by every producer. This used to live inside a
+		// 34-parameter publish function, which meant a second producer either
+		// duplicated the ranges or silently skipped them.
+		magnification = std::clamp(magnification, 1.0F, 15.0F);
+		sightShiftX = std::clamp(sightShiftX, -50.0F, 50.0F);
+		sightShiftY = std::clamp(sightShiftY, -50.0F, 50.0F);
+		sightShiftZ = std::clamp(sightShiftZ, -50.0F, 50.0F);
+		imageDenoise = std::clamp(imageDenoise, 0.0F, 1.0F);
+		imageSharpen = std::clamp(imageSharpen, 0.0F, 1.0F);
+		fishEyeStrength = std::clamp(fishEyeStrength, 0.0F, 2.0F);
+		fishEyePower = std::clamp(fishEyePower, 0.5F, 6.0F);
+		edgeRefractionStrength = std::clamp(edgeRefractionStrength, 0.0F, 0.25F);
+		edgeRefractionWidth = std::clamp(edgeRefractionWidth, 0.02F, 0.5F);
+		edgeChromaticAberration = std::clamp(edgeChromaticAberration, 0.0F, 2.0F);
+		reticleMagnification = std::clamp(reticleMagnification, 0.25F, 8.0F);
+		reticleSize = std::clamp(reticleSize, 0.01F, 128.0F);
+		reticleOffsetX = std::clamp(reticleOffsetX, -1000.0F, 1000.0F);
+		reticleOffsetY = std::clamp(reticleOffsetY, -1000.0F, 1000.0F);
+		reticleShadowStrength = std::clamp(reticleShadowStrength, 0.0F, 1.0F);
+		reticleParallaxStrength = std::clamp(reticleParallaxStrength, 0.0F, 4.0F);
+		// These profile values also drive the physical ScopeFade pupil. Copies
+		// here preserve live editing without sharing the menu-owned profile with
+		// the game/render threads.
+		eyeBoxRadius = std::clamp(eyeBoxRadius, 0.01F, 20.0F);
+		vignetteReach = std::clamp(vignetteReach, 1.01F, 20.0F);
+		vignetteSharpness = std::clamp(vignetteSharpness, 0.1F, 20.0F);
+		eyeBoxMaxTravel = std::clamp(eyeBoxMaxTravel, 0.0F, 4.0F);
+		sceneParallaxStrength = std::clamp(sceneParallaxStrength, 0.0F, 2.0F);
+		opticalLagStrength = std::clamp(opticalLagStrength, 0.0F, 4.0F);
+		sceneDepth = std::clamp(sceneDepth, 0.0F, 4.0F);
+		shadowDepth = std::clamp(shadowDepth, 0.0F, 4.0F);
+		imageStillness = std::clamp(imageStillness, 0.0F, 8.0F);
+		axialBreathing = std::clamp(axialBreathing, 0.0F, 4.0F);
+		recenterSpeed = std::clamp(recenterSpeed, 0.1F, 10.0F);
+		strafeLag = std::clamp(strafeLag, 0.0F, 4.0F);
+		tubeDepth = std::clamp(tubeDepth, 0.0F, 1.0F);
+		lensOffsetX = std::clamp(lensOffsetX, -1.0F, 1.0F);
+		lensOffsetY = std::clamp(lensOffsetY, -1.0F, 1.0F);
+		lensScale = std::clamp(lensScale, 0.25F, 2.0F);
+		breathing.rate = std::clamp(breathing.rate, 0.0F, 4.0F);
+		breathing.sway = std::clamp(breathing.sway, 0.0F, 1.0F);
+		breathing.drift = std::clamp(breathing.drift, 0.0F, 1.0F);
+		breathing.figure = std::clamp(breathing.figure, 0.0F, 1.0F);
+		breathing.hold = std::clamp(breathing.hold, 0.0F, 1.0F);
+		breathing.pupilFollow = std::clamp(breathing.pupilFollow, 0.0F, 2.0F);
+		apertureActivationScale = std::clamp(apertureActivationScale, 0.0F, 1.0F);
+		customReticleScale = std::clamp(customReticleScale, 0.05F, 8.0F);
+	}
+
+	EditorPreviewSnapshot EditorPreviewSnapshot::FromProfile(
+		const ScopeData::ShaderData& shaderData,
+		const ScopeData::ZoomDataOverwrite& zoomOverride,
+		std::uint64_t selectionRevision)
+	{
+		EditorPreviewSnapshot snapshot;
+		snapshot.zoomOverride = zoomOverride;
+		snapshot.selectionRevision = selectionRevision;
+		snapshot.magnification = shaderData.minZoom;
+		snapshot.imageDenoise = shaderData.imageDenoise;
+		snapshot.imageSharpen = shaderData.imageSharpen;
+		snapshot.fishEyeStrength = shaderData.fishEyeStrength;
+		snapshot.fishEyePower = shaderData.fishEyePower;
+		snapshot.edgeRefractionStrength = shaderData.edgeRefractionStrength;
+		snapshot.edgeRefractionWidth = shaderData.edgeRefractionWidth;
+		snapshot.edgeChromaticAberration = shaderData.edgeChromaticAberration;
+		snapshot.reticleMagnification = shaderData.reticleMagnification;
+		snapshot.reticleSize = shaderData.ReticleSize;
+		snapshot.reticleOffsetX = shaderData.reticle_Offset[0];
+		snapshot.reticleOffsetY = shaderData.reticle_Offset[1];
+		snapshot.reticleShadowStrength = shaderData.reticleShadowStrength;
+		snapshot.reticleParallaxStrength = shaderData.reticleParallaxStrength;
+		snapshot.eyeBoxRadius = shaderData.parallax.radius;
+		snapshot.vignetteReach = shaderData.parallax.relativeFogRadius;
+		snapshot.vignetteSharpness = shaderData.parallax.scopeSwayAmount;
+		snapshot.eyeBoxMaxTravel = shaderData.parallax.maxTravel;
+		snapshot.sceneParallaxStrength = shaderData.sceneParallaxStrength;
+		snapshot.opticalLagStrength = shaderData.opticalLagStrength;
+		snapshot.sceneDepth = shaderData.parallax.sceneDepth;
+		snapshot.shadowDepth = shaderData.parallax.shadowDepth;
+		snapshot.imageStillness = shaderData.parallax.imageStillness;
+		snapshot.axialBreathing = shaderData.parallax.axialBreathing;
+		snapshot.recenterSpeed = shaderData.parallax.recenterSpeed;
+		snapshot.strafeLag = shaderData.parallax.strafeLag;
+		snapshot.tubeDepth = shaderData.parallax.tubeDepth;
+		snapshot.lensOffsetX = shaderData.lensOffset[0];
+		snapshot.lensOffsetY = shaderData.lensOffset[1];
+		snapshot.lensScale = shaderData.lensScale;
+		snapshot.breathing = shaderData.breathing;
+		snapshot.apertureSurface = shaderData.apertureSurface;
+		snapshot.reticleSurface = shaderData.reticleSurface;
+		snapshot.Clamp();
+		return snapshot;
+	}
+
+	void PublishEditorPreview(const EditorPreviewSnapshot& snapshot)
+	{
+		EditorPreviewSnapshot copy = snapshot;
+		copy.Clamp();
+		copy.active = true;
 		std::scoped_lock lock(editorPreviewMutex);
-		editorPreview.apertureSurface = apertureSurface;
-		editorPreview.reticleSurface = reticleSurface;
-		editorPreview.zoomOverride = zoomOverride;
-		editorPreview.selectionRevision = selectionRevision;
-		editorPreview.magnification =
-			std::clamp(magnification, 1.0F, 15.0F);
-		editorPreview.imageDenoise =
-			std::clamp(imageDenoise, 0.0F, 1.0F);
-		editorPreview.imageSharpen =
-			std::clamp(imageSharpen, 0.0F, 1.0F);
-		editorPreview.fishEyeStrength =
-			std::clamp(fishEyeStrength, 0.0F, 2.0F);
-		editorPreview.fishEyePower =
-			std::clamp(fishEyePower, 0.5F, 6.0F);
-		editorPreview.edgeRefractionStrength =
-			std::clamp(edgeRefractionStrength, 0.0F, 0.25F);
-		editorPreview.edgeRefractionWidth =
-			std::clamp(edgeRefractionWidth, 0.02F, 0.5F);
-		editorPreview.edgeChromaticAberration =
-			std::clamp(edgeChromaticAberration, 0.0F, 2.0F);
-		editorPreview.reticleMagnification =
-			std::clamp(reticleMagnification, 0.25F, 8.0F);
-		editorPreview.reticleSize =
-			std::clamp(reticleSize, 0.01F, 128.0F);
-		editorPreview.reticleOffsetX =
-			std::clamp(reticleOffsetX, -1000.0F, 1000.0F);
-		editorPreview.reticleOffsetY =
-			std::clamp(reticleOffsetY, -1000.0F, 1000.0F);
-		editorPreview.reticleShadowStrength =
-			std::clamp(reticleShadowStrength, 0.0F, 1.0F);
-		editorPreview.reticleParallaxStrength =
-			std::clamp(reticleParallaxStrength, 0.0F, 4.0F);
-		// These profile values also drive the physical
-		// ScopeFade pupil. Publishing copies here preserves live editing
-		// without sharing the menu-owned profile with the game/render threads.
-		editorPreview.eyeBoxRadius =
-			std::clamp(eyeBoxRadius, 0.01F, 20.0F);
-		editorPreview.vignetteReach =
-			std::clamp(vignetteReach, 1.01F, 20.0F);
-		editorPreview.vignetteSharpness =
-			std::clamp(vignetteSharpness, 0.1F, 20.0F);
-		editorPreview.eyeBoxMaxTravel =
-			std::clamp(eyeBoxMaxTravel, 0.0F, 4.0F);
-		editorPreview.sceneParallaxStrength =
-			std::clamp(sceneParallaxStrength, 0.0F, 2.0F);
-		editorPreview.opticalLagStrength =
-			std::clamp(opticalLagStrength, 0.0F, 4.0F);
-		editorPreview.sceneDepth =
-			std::clamp(sceneDepth, 0.0F, 4.0F);
-		editorPreview.shadowDepth =
-			std::clamp(shadowDepth, 0.0F, 4.0F);
-		editorPreview.imageStillness =
-			std::clamp(imageStillness, 0.0F, 8.0F);
-		editorPreview.axialBreathing =
-			std::clamp(axialBreathing, 0.0F, 4.0F);
-		editorPreview.recenterSpeed =
-			std::clamp(recenterSpeed, 0.1F, 10.0F);
-		editorPreview.strafeLag =
-			std::clamp(strafeLag, 0.0F, 4.0F);
-		editorPreview.tubeDepth =
-			std::clamp(tubeDepth, 0.0F, 1.0F);
-		editorPreview.lensOffsetX =
-			std::clamp(lensOffsetX, -1.0F, 1.0F);
-		editorPreview.lensOffsetY =
-			std::clamp(lensOffsetY, -1.0F, 1.0F);
-		editorPreview.lensScale =
-			std::clamp(lensScale, 0.25F, 2.0F);
-		editorPreview.breathing.rate =
-			std::clamp(breathing.rate, 0.0F, 4.0F);
-		editorPreview.breathing.sway =
-			std::clamp(breathing.sway, 0.0F, 1.0F);
-		editorPreview.breathing.drift =
-			std::clamp(breathing.drift, 0.0F, 1.0F);
-		editorPreview.breathing.figure =
-			std::clamp(breathing.figure, 0.0F, 1.0F);
-		editorPreview.breathing.hold =
-			std::clamp(breathing.hold, 0.0F, 1.0F);
-		editorPreview.breathing.pupilFollow =
-			std::clamp(breathing.pupilFollow, 0.0F, 2.0F);
-		editorPreview.active = true;
+		editorPreview = copy;
 	}
 
 	EditorPreviewSnapshot GetEditorPreviewSnapshot()
@@ -439,6 +617,94 @@ namespace ImGuiImpl
 		}
 		Tip("Key that switches the scope's night vision effect on and off while aiming.\n"
 			"Night vision must be enabled for the scope under Effects.");
+
+		// The optics key is owned by F4SE Menu Framework's hotkey registry, not
+		// by the Virtual-Key combos above. That registry works in DIK scan
+		// codes, which is the same code space Fallout reports for keyboard
+		// input -- binding it from the VK table meant the bound code and the
+		// reported code were never comparable, which is why the hotkey did
+		// nothing at all.
+		ImGui::SeparatorText("Optics Key");
+		const auto opticsBinding =
+			F4SEMenuFramework::Hotkeys::GetBinding(kOpticsHotkeyIdUI);
+
+		ProcessOpticsKeyCapture();
+
+		// The button itself is the binding readout: it shows the bound key's
+		// name, and clicking it captures the next keypress as the new binding.
+		// The "##" suffix keeps a stable widget id while the visible label
+		// changes between the key name and the capture prompt.
+		const std::string opticsLabel =
+			(opticsCaptureActive
+					? std::string("Press a key...  (Esc cancels, Tab unbinds)")
+					: OpticsKeyDisplayName(opticsBinding)) +
+			"##opticsKeyBind";
+
+		if (ImGui::Button(opticsLabel.c_str(), { 260, 0 })) {
+			opticsCaptureActive = !opticsCaptureActive;
+			opticsCaptureArmPending = opticsCaptureActive;
+		}
+		Tip("Click, then press the key you want -- the next keypress becomes the "
+			"binding (Esc cancels, Tab unbinds).\n\n"
+			"Tap the bound key to cycle this scope's reticles; hold it and "
+			"scroll to switch to a secondary sight.\n\n"
+			"The binding lives in F4SE Menu Framework's PluginHotkeys.ini, so "
+			"MagnaScope updates never overwrite it and the framework warns "
+			"about conflicts with other mods.\n\n"
+			"Reticle textures go in the 'reticles' folder beside the scope's "
+			"profile.json.");
+	}
+
+	// Points the sliders at one variant's values.
+	//
+	// Only the fields a variant is allowed to vary are touched. The structural
+	// ones -- aperture and reticle surface names, the bool flags -- stay on the
+	// base profile and are edited once for the whole optic, so they are
+	// deliberately absent here.
+	void LoadVariantIntoUI(
+		ImGuiImplClass* ins,
+		const ScopeData::ProfileVariant& variant)
+	{
+		const auto& shaderData = variant.shaderData;
+		ins->minZoom_UI = variant.magnification;
+		ins->maxZoom_UI = variant.magnification;
+		ins->camDepth_UI = shaderData.camDepth;
+		ins->ReticleSize_UI = shaderData.ReticleSize;
+		ins->reticle_Offset[0] = shaderData.reticle_Offset[0];
+		ins->reticle_Offset[1] = shaderData.reticle_Offset[1];
+		ins->fishEyeStrength_UI = shaderData.fishEyeStrength;
+		ins->fishEyePower_UI = shaderData.fishEyePower;
+		ins->edgeRefractionStrength_UI = shaderData.edgeRefractionStrength;
+		ins->edgeRefractionWidth_UI = shaderData.edgeRefractionWidth;
+		ins->edgeChromaticAberration_UI = shaderData.edgeChromaticAberration;
+		ins->imageDenoise_UI = shaderData.imageDenoise;
+		ins->imageSharpen_UI = shaderData.imageSharpen;
+		ins->reticleMagnification_UI = shaderData.reticleMagnification;
+		ins->reticleShadowStrength_UI = shaderData.reticleShadowStrength;
+		ins->reticleParallaxStrength_UI = shaderData.reticleParallaxStrength;
+		ins->sceneParallaxStrength_UI = shaderData.sceneParallaxStrength;
+		ins->opticalLagStrength_UI = shaderData.opticalLagStrength;
+		ins->lensOffset_UI[0] = shaderData.lensOffset[0];
+		ins->lensOffset_UI[1] = shaderData.lensOffset[1];
+		ins->lensScale_UI = shaderData.lensScale;
+		ins->radius_UI = shaderData.parallax.radius;
+		ins->relativeFogRadius_UI = shaderData.parallax.relativeFogRadius;
+		ins->scopeSwayAmount_UI = shaderData.parallax.scopeSwayAmount;
+		ins->maxTravel_UI = shaderData.parallax.maxTravel;
+		ins->sceneDepth_UI = shaderData.parallax.sceneDepth;
+		ins->shadowDepth_UI = shaderData.parallax.shadowDepth;
+		ins->imageStillness_UI = shaderData.parallax.imageStillness;
+		ins->axialBreathing_UI = shaderData.parallax.axialBreathing;
+		ins->recenterSpeed_UI = shaderData.parallax.recenterSpeed;
+		ins->strafeLag_UI = shaderData.parallax.strafeLag;
+		ins->tubeDepth_UI = shaderData.parallax.tubeDepth;
+		ins->breathRate_UI = shaderData.breathing.rate;
+		ins->breathSway_UI = shaderData.breathing.sway;
+		ins->breathDrift_UI = shaderData.breathing.drift;
+		ins->breathFigure_UI = shaderData.breathing.figure;
+		ins->breathHold_UI = shaderData.breathing.hold;
+		ins->breathPupilFollow_UI = shaderData.breathing.pupilFollow;
+		ins->Imgui_ZDO = variant.zoomDataOverwrite;
 	}
 
 	void ResetUIData(ImGuiImplClass* ins)
@@ -589,11 +855,454 @@ namespace ImGuiImpl
 			additionalKeywords_count = data->additionalKeywords.size();
 			additionalKeywords = data->additionalKeywords;
 
+			ins->variantsEnabled_UI = data->variants.enabled;
+			ins->variantsContinuous_UI = data->variants.continuous;
+			ins->variantStepSeconds_UI = data->variants.stepSeconds;
+			ins->variants_UI = data->variants.variants;
+			ins->variantsNextId_UI = std::max(1U, data->variants.nextId);
+			ins->variantDefaultId_UI = data->variants.defaultVariantId;
+			ins->secondarySights_UI = data->secondarySights;
+			ins->editedSecondarySight_UI = 0;
+			ins->defaultReticleFile_UI = data->defaultReticleFile;
+			ins->customReticleScale_UI = data->customReticleScale;
+			ins->occlusion_UI = data->occlusion;
+			ins->occlusionPreviewPublished_UI = false;
+
+			// Start editing whichever variant the player is actually looking
+			// through, so opening the editor mid-session does not silently
+			// retarget the sliders at a different magnification.
+			ins->editedVariantId_UI = 0;
+			if (ins->variantsEnabled_UI && !ins->variants_UI.empty()) {
+				// Read a published index rather than reaching into the session
+				// map. This runs on the renderer thread, and that map is
+				// inserted into by the game thread -- SessionStateFor here would
+				// be a second writer racing the resolver.
+				const int active = ActiveVariantIndexForEditor();
+				const auto index = static_cast<std::size_t>(
+					active >= 0 ? active : 0);
+				if (index < ins->variants_UI.size()) {
+					ins->editedVariantId_UI = ins->variants_UI[index].id;
+					// The sliders below were filled from the base profile; point
+					// them at the variant instead so what is shown is what is
+					// being edited.
+					LoadVariantIntoUI(ins, ins->variants_UI[index]);
+				}
+			}
+
 			// Only now do the _UI members describe this profile. Nothing may
 			// read them back into a profile before this point: they are plain
 			// members with no constructor, so until this runs they hold
 			// whatever was in the allocation.
 			ins->uiValuesLoaded = true;
+		}
+	}
+
+	void ImGuiImplClass::VariantSection()
+	{
+		if (!ImGui::CollapsingHeader("Magnification Variants")) {
+			return;
+		}
+
+		ImGui::Checkbox("Enable magnification variants", &variantsEnabled_UI);
+		Tip("Off by default. When on, the scroll wheel selects between saved "
+			"magnifications instead of zooming freely, and each one carries its "
+			"own optical settings and zoom data.");
+
+		if (!variantsEnabled_UI) {
+			ImGui::TextDisabled(
+				"Free scroll zoom is active (Min/Max Zoom above).");
+			return;
+		}
+
+		// The variant's magnification is minZoom_UI. Giving it a slider of its
+		// own here, under its real name, avoids the situation where the value
+		// that decides a variant's magnification is labelled "Min Zoom" in a
+		// section that has just said free-scroll zoom no longer applies.
+		ImGui::SliderFloat(
+			"Magnification (this variant)", &minZoom_UI, 1.0F, 15.0F, "%.2fx");
+		Tip("The selected variant's magnification, and its sort key. This is "
+			"the same value as Min Zoom above -- with variants enabled, that "
+			"slider means 'this variant's magnification' rather than the bottom "
+			"of a free-scroll range. Max Zoom is ignored; the resolver pins the "
+			"range to this single value.");
+
+		ImGui::Checkbox("Blend continuously", &variantsContinuous_UI);
+		Tip("Off: the wheel steps from one variant to the next. On: the wheel "
+			"moves smoothly through every variant, interpolating their settings.");
+
+		ImGui::SliderFloat(
+			"Step ease (s)", &variantStepSeconds_UI, 0.0F, 1.0F, "%.2f");
+		Tip("How long a stepped change takes to settle. Zero snaps.");
+
+		// --- variant picker ------------------------------------------------
+		int currentIndex = -1;
+		std::vector<std::string> labels;
+		labels.reserve(variants_UI.size());
+		for (std::size_t index = 0; index < variants_UI.size(); ++index) {
+			const auto& variant = variants_UI[index];
+			labels.push_back(
+				variant.label.empty() ?
+					std::format("{:.2f}x", variant.magnification) :
+					std::format("{:.2f}x  {}", variant.magnification, variant.label));
+			if (variant.id == editedVariantId_UI) {
+				currentIndex = static_cast<int>(index);
+			}
+		}
+
+		if (variants_UI.empty()) {
+			ImGui::TextDisabled(
+				"No variants yet. Add one to capture the current settings.");
+		} else {
+			std::vector<const char*> items;
+			items.reserve(labels.size());
+			for (const auto& label : labels) {
+				items.push_back(label.c_str());
+			}
+			int selected = currentIndex < 0 ? 0 : currentIndex;
+			if (ImGui::Combo(
+					"Editing",
+					&selected,
+					items.data(),
+					static_cast<int>(items.size()))) {
+				const auto index = static_cast<std::size_t>(selected);
+				if (index < variants_UI.size()) {
+					// Capture what is on the sliders into the variant being
+					// left, or switching away would discard it.
+					StoreUIIntoEditedVariant();
+					editedVariantId_UI = variants_UI[index].id;
+					LoadVariantIntoUI(this, variants_UI[index]);
+				}
+			}
+			Tip("Every slider in this editor edits the selected variant. The "
+				"aperture and reticle surface pins are shared across all of them.");
+		}
+
+		if (ImGui::Button("Add Variant", { 130, 0 })) {
+			StoreUIIntoEditedVariant();
+			ScopeData::ProfileVariant variant;
+			variant.id = variantsNextId_UI++;
+			variant.magnification = std::clamp(minZoom_UI, 1.0F, 15.0F);
+			variant.shaderData = BuildEditedShaderData(variant.shaderData);
+			variant.shaderData.minZoom = variant.magnification;
+			variant.shaderData.maxZoom = variant.magnification;
+			variant.zoomDataOverwrite = Imgui_ZDO;
+			variants_UI.push_back(variant);
+			editedVariantId_UI = variant.id;
+			if (variantDefaultId_UI == 0U) {
+				variantDefaultId_UI = variant.id;
+			}
+		}
+		Tip("Captures the current settings as a new variant at the current "
+			"magnification.");
+
+		ImGui::SameLine();
+		const bool canRemove = variants_UI.size() > 0U && editedVariantId_UI != 0U;
+		if (!canRemove) {
+			ImGui::BeginDisabled();
+		}
+		if (ImGui::Button("Remove Variant", { 130, 0 })) {
+			std::erase_if(
+				variants_UI,
+				[this](const ScopeData::ProfileVariant& variant) {
+					return variant.id == editedVariantId_UI;
+				});
+			// Ids are never reused, so a removed variant's co-save entry simply
+			// stops resolving and falls back to the default rather than
+			// selecting whatever slid into its index.
+			if (variantDefaultId_UI == editedVariantId_UI) {
+				variantDefaultId_UI =
+					variants_UI.empty() ? 0U : variants_UI.front().id;
+			}
+			editedVariantId_UI =
+				variants_UI.empty() ? 0U : variants_UI.front().id;
+			if (!variants_UI.empty()) {
+				LoadVariantIntoUI(this, variants_UI.front());
+			}
+		}
+		if (!canRemove) {
+			ImGui::EndDisabled();
+		}
+
+		if (editedVariantId_UI != 0U) {
+			ImGui::SameLine();
+			const bool isDefault = variantDefaultId_UI == editedVariantId_UI;
+			if (isDefault) {
+				ImGui::BeginDisabled();
+			}
+			if (ImGui::Button("Set As Default", { 130, 0 })) {
+				variantDefaultId_UI = editedVariantId_UI;
+			}
+			if (isDefault) {
+				ImGui::EndDisabled();
+			}
+			Tip("Which variant a character starts on when they have no saved "
+				"selection for this scope yet.");
+		}
+	}
+
+	void ImGuiImplClass::SecondarySightSection()
+	{
+		if (!ImGui::CollapsingHeader("Secondary Sights")) {
+			return;
+		}
+
+		ImGui::TextDisabled(
+			"Offset irons or a piggyback optic. Hold the optics hotkey and "
+			"scroll to switch. These are flat: no magnification variants.");
+
+		if (ImGui::Button("Add Sight", { 130, 0 })) {
+			ScopeData::SecondarySight sight;
+			// Seeded from the current zoom data so the starting point is the
+			// primary optic's alignment rather than zeros, which would throw the
+			// camera somewhere unusable on the first switch.
+			sight.zoomData = Imgui_ZDO;
+			sight.name = std::format("Sight {}", secondarySights_UI.size() + 1U);
+			secondarySights_UI.push_back(sight);
+			editedSecondarySight_UI =
+				static_cast<int>(secondarySights_UI.size()) - 1;
+		}
+
+		if (secondarySights_UI.empty()) {
+			return;
+		}
+
+		editedSecondarySight_UI = std::clamp(
+			editedSecondarySight_UI,
+			0,
+			static_cast<int>(secondarySights_UI.size()) - 1);
+
+		std::vector<std::string> labels;
+		std::vector<const char*> items;
+		for (const auto& sight : secondarySights_UI) {
+			labels.push_back(sight.name);
+		}
+		for (const auto& label : labels) {
+			items.push_back(label.c_str());
+		}
+		ImGui::Combo(
+			"Sight",
+			&editedSecondarySight_UI,
+			items.data(),
+			static_cast<int>(items.size()));
+
+		ImGui::SameLine();
+		if (ImGui::Button("Remove Sight", { 130, 0 })) {
+			secondarySights_UI.erase(
+				secondarySights_UI.begin() + editedSecondarySight_UI);
+			editedSecondarySight_UI = 0;
+			return;
+		}
+
+		auto& sight = secondarySights_UI[
+			static_cast<std::size_t>(editedSecondarySight_UI)];
+
+		char nameBuffer[64]{};
+		const auto copied = std::min(sight.name.size(), sizeof(nameBuffer) - 1U);
+		std::memcpy(nameBuffer, sight.name.data(), copied);
+		if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer))) {
+			sight.name = nameBuffer;
+		}
+
+		ImGui::Checkbox(
+			"Show Secondary Sight Zoom", &showSecondarySightZoom_UI);
+		Tip("Applies this sight's zoom data to the weapon live while the editor "
+			"is open, so you can align it with the sliders below and see the "
+			"result immediately.\n"
+			"Off by default, because it moves the camera to the secondary sight "
+			"and that is not what you want while tuning the main optic.");
+
+		ImGui::Checkbox("Suppress optics while up", &sight.suppressOptics);
+		Tip("Fades the magnified image and the aperture out while this sight is "
+			"selected. Offset irons are not magnified.");
+
+		ImGui::SliderFloat(
+			"Transition (s)", &sight.transitionSeconds, 0.0F, 1.0F, "%.2f");
+
+		ImGui::SliderFloat("Sight FOV Mult", &sight.zoomData.fovMul, 0.05F, 2.0F);
+		ImGui::SliderFloat("Sight Camera X", &sight.zoomData.x, -20.0F, 20.0F);
+		ImGui::SliderFloat("Sight Camera Y", &sight.zoomData.y, -20.0F, 20.0F);
+		ImGui::SliderFloat("Sight Camera Z", &sight.zoomData.z, -20.0F, 20.0F);
+		sight.zoomData.enableZoomDateOverwrite = true;
+
+		if (ImGui::Button("Copy From Current Zoom Data", { 240, 0 })) {
+			sight.zoomData = Imgui_ZDO;
+			sight.zoomData.enableZoomDateOverwrite = true;
+		}
+		Tip("Takes the zoom data currently in the editor, so you can align the "
+			"secondary sight with the main controls and then capture it here.");
+	}
+
+	void ImGuiImplClass::OcclusionSection()
+	{
+		if (!ImGui::CollapsingHeader("Sphere Occlusion")) {
+			return;
+		}
+
+		ImGui::TextDisabled(
+			"Hides the scope's own geometry inside a glass-anchored sphere so "
+			"the housing cannot clutter the view. Per-triangle: only what is "
+			"inside the sphere disappears. Applies while aiming only; the "
+			"reticle, dot, and glass are always protected.");
+
+		bool changed = false;
+		changed |= ImGui::Checkbox("Enable Occlusion", &occlusion_UI.enabled);
+		Tip("Off by default. When on, triangles of the scope's meshes inside "
+			"the sphere are skipped at draw time while you aim through the "
+			"scope. The mesh files are never modified.");
+
+		if (occlusion_UI.enabled) {
+			changed |= ImGui::SliderFloat(
+				"Sphere Radius",
+				&occlusion_UI.sphereRadius,
+				0.1F,
+				50.0F,
+				"%.2f");
+			Tip("World-unit radius of the cull sphere, centred on the glass "
+				"(plus the offset below).");
+			changed |= ImGui::SliderFloat3(
+				"Sphere Offset",
+				occlusion_UI.sphereOffset,
+				-30.0F,
+				30.0F,
+				"%.2f");
+			Tip("Moves the sphere centre away from the glass centre, in the "
+				"glass's own axes: X right, Y along the optical axis, Z up.");
+			changed |= ImGui::Checkbox(
+				"Front Of Glass Only", &occlusion_UI.frontOnly);
+			Tip("Restricts culling to the objective side of the glass plane, "
+				"so the eyepiece side can never be cut into.");
+			if (occlusion_UI.frontOnly) {
+				ImGui::SameLine();
+				changed |= ImGui::Checkbox(
+					"Flip Front", &occlusion_UI.flipFront);
+				Tip("Swap which side counts as 'front' for meshes whose "
+					"authored glass normal points backwards.");
+			}
+
+			const auto shapes = GetOcclusionShapes();
+			if (!shapes.empty() &&
+				ImGui::TreeNode("Excluded Parts")) {
+				ImGui::TextDisabled(
+					"Checked parts are never culled. Use this for a part the "
+					"sphere clips wrongly -- a mesh spanning both sides of "
+					"the glass can only be excluded whole.");
+				for (const auto& name : shapes) {
+					const bool wasExcluded = std::any_of(
+						occlusion_UI.excludedShapes.begin(),
+						occlusion_UI.excludedShapes.end(),
+						[&name](const std::string& entry) {
+							return _stricmp(entry.c_str(), name.c_str()) == 0;
+						});
+					bool excluded = wasExcluded;
+					if (ImGui::Checkbox(name.c_str(), &excluded)) {
+						changed = true;
+						if (excluded && !wasExcluded) {
+							occlusion_UI.excludedShapes.push_back(name);
+						} else if (!excluded && wasExcluded) {
+							std::erase_if(
+								occlusion_UI.excludedShapes,
+								[&name](const std::string& entry) {
+									return _stricmp(
+											   entry.c_str(),
+											   name.c_str()) == 0;
+								});
+						}
+					}
+				}
+				ImGui::TreePop();
+			}
+		}
+
+		// Publish on every edit so the game thread rebuilds against the
+		// unsaved values; the rebuild itself is hash-gated on the game thread,
+		// so an unchanged publish costs nothing. Also publish once on first
+		// render so the preview channel starts from the profile's values.
+		if (changed || !occlusionPreviewPublished_UI) {
+			occlusionPreviewPublished_UI = true;
+			PublishOcclusionPreview(occlusion_UI, true);
+		}
+	}
+
+	void ImGuiImplClass::ReticleSection()
+	{
+		if (!ImGui::CollapsingHeader("Reticle Switching")) {
+			return;
+		}
+
+		const auto reticles = GetDiscoveredReticles();
+		if (reticles.empty()) {
+			ImGui::TextDisabled(
+				"No reticle textures found. Drop .dds or .png files into the "
+				"'reticles' folder beside this scope's profile.json, then press "
+				"Rescan.");
+		} else {
+			std::vector<const char*> items;
+			items.push_back("(authored 3D reticle)");
+			for (const auto& reticle : reticles) {
+				items.push_back(reticle.c_str());
+			}
+
+			int selected = 0;
+			for (std::size_t index = 0; index < reticles.size(); ++index) {
+				if (reticles[index] == defaultReticleFile_UI) {
+					selected = static_cast<int>(index) + 1;
+					break;
+				}
+			}
+			if (ImGui::Combo(
+					"Default reticle",
+					&selected,
+					items.data(),
+					static_cast<int>(items.size()))) {
+				defaultReticleFile_UI = selected <= 0 ?
+				                            std::string{} :
+				                            reticles[static_cast<std::size_t>(selected - 1)];
+			}
+			Tip("Which reticle a character starts on for this scope. The optics "
+				"hotkey cycles through them in game; that selection lives in the "
+				"save, not here.");
+
+			ImGui::SliderFloat(
+				"Reticle scale", &customReticleScale_UI, 0.05F, 4.0F, "%.2f");
+			Tip("Size of a texture reticle, in aperture radii. Has no effect on "
+				"the authored 3D reticle, which uses Reticle Size above.");
+		}
+
+		if (ImGui::Button("Rescan Reticles", { 150, 0 })) {
+			RequestProfileAction(ProfileRequest::kRescanReticles);
+		}
+		Tip("Reticle folders are read once at startup rather than on every "
+			"weapon swap, because a directory walk under MO2's virtual file "
+			"system is not a bounded operation. Press this after adding files.");
+	}
+
+	ScopeData::ShaderData ImGuiImplClass::BuildEditedShaderData(
+		const ScopeData::ShaderData& base)
+	{
+		// Routed through BuildEditedProfile rather than duplicating the
+		// slider-to-field mapping. A second copy of that mapping would drift,
+		// and the drift would be invisible: a variant would quietly save one
+		// field's stale value.
+		ScopeData::ScopeProfile scratch(std::string{});
+		scratch.shaderData = base;
+		return BuildEditedProfile(scratch).shaderData;
+	}
+
+	void ImGuiImplClass::StoreUIIntoEditedVariant()
+	{
+		if (editedVariantId_UI == 0U) {
+			return;
+		}
+		for (auto& variant : variants_UI) {
+			if (variant.id != editedVariantId_UI) {
+				continue;
+			}
+			variant.magnification = std::clamp(minZoom_UI, 1.0F, 15.0F);
+			variant.shaderData = BuildEditedShaderData(variant.shaderData);
+			variant.shaderData.minZoom = variant.magnification;
+			variant.shaderData.maxZoom = variant.magnification;
+			variant.zoomDataOverwrite = Imgui_ZDO;
+			return;
 		}
 	}
 
@@ -719,6 +1428,54 @@ namespace ImGuiImpl
 		editedProfile.zoomDataOverwrite = Imgui_ZDO;
 
 		editedProfile.additionalKeywords = additionalKeywords;
+
+		// --- variants, secondary sights, reticle --------------------------
+		editedProfile.variants.enabled = variantsEnabled_UI;
+		editedProfile.variants.continuous = variantsContinuous_UI;
+		editedProfile.variants.stepSeconds =
+			std::clamp(variantStepSeconds_UI, 0.0F, 2.0F);
+		editedProfile.variants.variants = variants_UI;
+		editedProfile.variants.nextId = std::max(1U, variantsNextId_UI);
+		editedProfile.variants.defaultVariantId = variantDefaultId_UI;
+		editedProfile.secondarySights = secondarySights_UI;
+		editedProfile.defaultReticleFile = defaultReticleFile_UI;
+		editedProfile.customReticleScale =
+			std::clamp(customReticleScale_UI, 0.05F, 8.0F);
+		editedProfile.occlusion = occlusion_UI;
+		editedProfile.occlusion.sphereRadius =
+			std::clamp(editedProfile.occlusion.sphereRadius, 0.1F, 50.0F);
+
+		// The sliders were pointed at one variant, so their values belong to
+		// that variant -- not to the whole set. Assigning the built shaderData
+		// straight over editedProfile and stopping there would silently apply
+		// one magnification's tuning to every other one as well.
+		if (editedVariantId_UI != 0U) {
+			for (auto& variant : editedProfile.variants.variants) {
+				if (variant.id != editedVariantId_UI) {
+					continue;
+				}
+				variant.shaderData = editedProfile.shaderData;
+				variant.zoomDataOverwrite = editedProfile.zoomDataOverwrite;
+				// Magnification is the variant's key and its own field; the
+				// min/max pair is what the resolver pins per frame, so it is
+				// derived from the key rather than stored twice.
+				variant.magnification = std::clamp(minZoom_UI, 1.0F, 15.0F);
+				variant.shaderData.minZoom = variant.magnification;
+				variant.shaderData.maxZoom = variant.magnification;
+				break;
+			}
+			// Keep the list sorted by magnification: the resolver interpolates
+			// between adjacent entries and treats position as monotonic in
+			// magnification, so an out-of-order entry would make the wheel run
+			// backwards through part of its range.
+			std::ranges::stable_sort(
+				editedProfile.variants.variants,
+				[](const ScopeData::ProfileVariant& left,
+					const ScopeData::ProfileVariant& right) {
+					return left.magnification < right.magnification;
+				});
+		}
+
 		return editedProfile;
 	}
 
@@ -1858,49 +2615,77 @@ namespace ImGuiImpl
 		instance->MainMenuSection();
 		instance->ShaderDataSection();
 		instance->ParallaxDataSection();
+		instance->VariantSection();
+		instance->SecondarySightSection();
+		instance->ReticleSection();
+		instance->OcclusionSection();
 		instance->MapScopeShaderEffect();
-		PublishEditorPreview(
-			instance->Imgui_ZDO,
-			instance->selectionRevision_UI,
-			instance->minZoom_UI,
-			instance->imageDenoise_UI,
-			instance->imageSharpen_UI,
-			instance->fishEyeStrength_UI,
-			instance->fishEyePower_UI,
-			instance->edgeRefractionStrength_UI,
-			instance->edgeRefractionWidth_UI,
-			instance->edgeChromaticAberration_UI,
-			instance->reticleMagnification_UI,
-			instance->ReticleSize_UI,
-			instance->reticle_Offset[0],
-			instance->reticle_Offset[1],
-			instance->radius_UI,
-			instance->relativeFogRadius_UI,
-			instance->scopeSwayAmount_UI,
-			instance->maxTravel_UI,
-			instance->sceneParallaxStrength_UI,
-			instance->opticalLagStrength_UI,
-			instance->reticleShadowStrength_UI,
-			instance->reticleParallaxStrength_UI,
-			instance->sceneDepth_UI,
-			instance->shadowDepth_UI,
-			instance->imageStillness_UI,
-			instance->axialBreathing_UI,
-			instance->recenterSpeed_UI,
-			instance->strafeLag_UI,
-			instance->tubeDepth_UI,
-			instance->lensOffset_UI[0],
-			instance->lensOffset_UI[1],
-			instance->lensScale_UI,
-			ScopeData::Breathing{
+		{
+			// The editor is one producer on the live-overlay channel; the
+			// variant resolver is the other. Both go through the same struct and
+			// the same Clamp(), so they cannot disagree about ranges.
+			EditorPreviewSnapshot preview;
+			// Secondary sights are aligned with the same camera-offset controls
+			// as the primary optic, so while their zoom preview is on, the
+			// selected sight's values are what goes to the live weapon. Without
+			// this the sliders move numbers that only take effect after saving
+			// and switching to the sight in game, which is not a workable way to
+			// dial an offset iron.
+			preview.zoomOverride = instance->Imgui_ZDO;
+			if (instance->showSecondarySightZoom_UI &&
+				!instance->secondarySights_UI.empty()) {
+				const auto index = static_cast<std::size_t>(
+					std::clamp(
+						instance->editedSecondarySight_UI,
+						0,
+						static_cast<int>(instance->secondarySights_UI.size()) - 1));
+				preview.zoomOverride =
+					instance->secondarySights_UI[index].zoomData;
+				preview.zoomOverride.enableZoomDateOverwrite = true;
+			}
+			preview.selectionRevision = instance->selectionRevision_UI;
+			preview.magnification = instance->minZoom_UI;
+			preview.imageDenoise = instance->imageDenoise_UI;
+			preview.imageSharpen = instance->imageSharpen_UI;
+			preview.fishEyeStrength = instance->fishEyeStrength_UI;
+			preview.fishEyePower = instance->fishEyePower_UI;
+			preview.edgeRefractionStrength = instance->edgeRefractionStrength_UI;
+			preview.edgeRefractionWidth = instance->edgeRefractionWidth_UI;
+			preview.edgeChromaticAberration = instance->edgeChromaticAberration_UI;
+			preview.reticleMagnification = instance->reticleMagnification_UI;
+			preview.reticleSize = instance->ReticleSize_UI;
+			preview.reticleOffsetX = instance->reticle_Offset[0];
+			preview.reticleOffsetY = instance->reticle_Offset[1];
+			preview.eyeBoxRadius = instance->radius_UI;
+			preview.vignetteReach = instance->relativeFogRadius_UI;
+			preview.vignetteSharpness = instance->scopeSwayAmount_UI;
+			preview.eyeBoxMaxTravel = instance->maxTravel_UI;
+			preview.sceneParallaxStrength = instance->sceneParallaxStrength_UI;
+			preview.opticalLagStrength = instance->opticalLagStrength_UI;
+			preview.reticleShadowStrength = instance->reticleShadowStrength_UI;
+			preview.reticleParallaxStrength = instance->reticleParallaxStrength_UI;
+			preview.sceneDepth = instance->sceneDepth_UI;
+			preview.shadowDepth = instance->shadowDepth_UI;
+			preview.imageStillness = instance->imageStillness_UI;
+			preview.axialBreathing = instance->axialBreathing_UI;
+			preview.recenterSpeed = instance->recenterSpeed_UI;
+			preview.strafeLag = instance->strafeLag_UI;
+			preview.tubeDepth = instance->tubeDepth_UI;
+			preview.lensOffsetX = instance->lensOffset_UI[0];
+			preview.lensOffsetY = instance->lensOffset_UI[1];
+			preview.lensScale = instance->lensScale_UI;
+			preview.breathing = ScopeData::Breathing{
 				instance->breathRate_UI,
 				instance->breathSway_UI,
 				instance->breathDrift_UI,
 				instance->breathFigure_UI,
 				instance->breathHold_UI,
-				instance->breathPupilFollow_UI },
-			instance->apertureSurface_UI,
-			instance->reticleSurface_UI);
+				instance->breathPupilFollow_UI
+			};
+			preview.apertureSurface = instance->apertureSurface_UI;
+			preview.reticleSurface = instance->reticleSurface_UI;
+			PublishEditorPreview(preview);
+		}
 
 		ImGui::PopItemWidth();
 	}

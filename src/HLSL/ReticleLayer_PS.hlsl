@@ -20,6 +20,47 @@ struct ReticleCompositeOutput
     float4 destinationTransmittance : SV_Target1;
 };
 
+// The user's own reticle, at t6.
+//
+// Anchored on the LENS centre rather than the authored reticle centre: a custom
+// reticle has to work on scopes that have no authored reticle node at all, and
+// SCOPE_AIM_CENTER is only meaningful when one was captured. The lens centre and
+// radius are published by the aperture solve, which is what actually defines
+// where the sight picture is.
+//
+// Emits the same dual-source operator the capture path produces: B is the
+// premultiplied colour, T the destination transmittance, so the ONE/SRC1_COLOR
+// blend evaluates B + destination*T either way and nothing downstream has to
+// know which source it came from.
+ReticleCompositeOutput SampleCustomReticle(
+    float2 outputPixel,
+    float2 lensCenterPixel,
+    float projectedRadius)
+{
+    ReticleCompositeOutput output;
+
+    const float radius = max(
+        projectedRadius * clamp(SCOPE_CUSTOM_RETICLE_SCALE, 0.05f, 8.0f),
+        1.0f);
+    const float2 local = (outputPixel - lensCenterPixel) / radius;
+    const float2 uv = local * 0.5f + 0.5f;
+
+    if (any(uv < 0.0f) || any(uv > 1.0f)) {
+        // Outside the reticle quad the composite must be a no-op, which for
+        // this operator means contributing nothing and passing the destination
+        // through unchanged.
+        output.sourceContribution = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        output.destinationTransmittance = float4(1.0f, 1.0f, 1.0f, 1.0f);
+        return output;
+    }
+
+    const float4 texel = CustomReticleTex.SampleLevel(gSamLinear, uv, 0.0f);
+    const float alpha = saturate(texel.a);
+    output.sourceContribution = float4(texel.rgb * alpha, alpha);
+    output.destinationTransmittance = float4(1.0f - alpha, 1.0f - alpha, 1.0f - alpha, 1.0f - alpha);
+    return output;
+}
+
 ReticleCompositeOutput SampleAuthoredReticle(float2 uv)
 {
     // The layer holds the reticle at the coordinates of the viewport it was
@@ -61,10 +102,22 @@ ReticleCompositeOutput main(VertexPosHTex input)
         reticleCenterPixel.y <= BUFFER_HEIGHT &&
         SCOPE_LENS_RADIUS_X > 0.0f &&
         SCOPE_LENS_RADIUS_Y > 0.0f;
+    const bool useCustomReticle = SCOPE_CUSTOM_RETICLE_INDEX >= 0.0f;
+
     if (!reticleCenterValid) {
         // Projection publication can be unavailable for one frame after an
         // equip, load, or device reset. Preserve the authored reticle rather
         // than scaling or clipping it against uninitialized zero constants.
+        //
+        // A custom reticle has nothing meaningful to draw without the lens
+        // solve, so it contributes nothing for that frame rather than guessing
+        // a position.
+        if (useCustomReticle) {
+            ReticleCompositeOutput empty;
+            empty.sourceContribution = float4(0.0f, 0.0f, 0.0f, 0.0f);
+            empty.destinationTransmittance = float4(1.0f, 1.0f, 1.0f, 1.0f);
+            return empty;
+        }
         return SampleAuthoredReticle(input.tex);
     }
     // The physical ScopeFade center is published independently from the
@@ -158,12 +211,23 @@ ReticleCompositeOutput main(VertexPosHTex input)
     const float2 sourceUv = sourcePixel * pixelSize;
 
     // Never let the clamp sampler smear a reticle touching a render-target
-    // edge across the opposite side of the private layer.
-    if (any(sourceUv < 0.0f) || any(sourceUv > 1.0f)) {
+    // edge across the opposite side of the private layer. Only the captured
+    // path samples that layer, so only it needs this guard; the custom path
+    // handles its own bounds and must not discard, because discarding would
+    // skip the exit-pupil shadow it still has to receive.
+    if (!useCustomReticle &&
+        (any(sourceUv < 0.0f) || any(sourceUv > 1.0f))) {
         discard;
     }
 
-    ReticleCompositeOutput reticle = SampleAuthoredReticle(sourceUv);
+    // if/else rather than a ternary: HLSL will not select between struct
+    // values.
+    ReticleCompositeOutput reticle;
+    if (useCustomReticle) {
+        reticle = SampleCustomReticle(outputPixel, lensCenterPixel, shadowRadius);
+    } else {
+        reticle = SampleAuthoredReticle(sourceUv);
+    }
 
     // Match the magnified lens's exit pupil at this output pixel. The late
     // reticle uses dual-source blending (B + destination*T), so fading it

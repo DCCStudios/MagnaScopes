@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 namespace MagnaScope
 {
 	// Plugin-wide options persisted in MagnaScope.ini next to the DLL.
@@ -40,6 +42,13 @@ namespace MagnaScope
 		// Stage 2 is split so a bad camera offset cannot be confused with the
 		// FOV lifecycle. Stage 4 always permits camera overrides.
 		bool verificationCameraOverride = false;
+		// Animation-graph events fired at the player when the secondary-sight
+		// zoom pointer swaps, semicolon separated. Experimental knob: the
+		// engine samples ZoomData at aim-in, and the open question is which
+		// graph event (if any) makes it re-sample without leaving the sighted
+		// state. Unknown event names are ignored by the graph, so guessing is
+		// safe. Empty disables the experiment.
+		std::string sightSwapGraphEvents = "GunUp";
 		// Stage 3 is split by render anchor. The default Stage 3 path uses
 		// F4SE Menu Framework's verified before-render callback. This sub-gate
 		// adds only the guarded OG TAA vtable callback.

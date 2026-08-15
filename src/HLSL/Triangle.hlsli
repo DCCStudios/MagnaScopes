@@ -97,6 +97,18 @@ cbuffer ResolutionConstantData : register(b4){
 	// assuming 0.5 planted each wedge's fabricated apex on a circle around
 	// the true centre rather than one point.
 	float SCOPE_APERTURE_INNER_RATIO;
+
+	// Custom reticle. Negative selects the authored 3D reticle captured into
+	// the private layer; zero or above selects the bound texture at t6. The
+	// scale is in aperture radii.
+	//
+	// This row, ConstBufferData in hooking.h, and the static_assert beside it
+	// are three hand-maintained copies of one layout. The assert only checks
+	// the C++ side, so drift here is silent constant corruption.
+	float SCOPE_CUSTOM_RETICLE_INDEX;
+	float SCOPE_CUSTOM_RETICLE_SCALE;
+	float SCOPE_RESERVED_RETICLE_0;
+	float SCOPE_RESERVED_RETICLE_1;
 };
 
 // Breathing displacement in aperture radii, shared so the magnified scene and
@@ -216,6 +228,10 @@ SamplerState gSamLinear : register(s0);
 SamplerState gSamReticle : register(s1);
 Texture2D tBACKBUFFER : register(t4);
 Texture2D ReticleTex : register(t5);
+// User-supplied reticle texture for the reticle composite. Unbound samples
+// transparent black in D3D11, and SCOPE_CUSTOM_RETICLE_INDEX is held negative
+// until a texture is actually resident, so an unbound slot is never read.
+Texture2D CustomReticleTex : register(t6);
 
 
 float GetAspectRatio() { return BUFFER_WIDTH * rcp(BUFFER_HEIGHT); }

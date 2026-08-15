@@ -231,7 +231,33 @@ namespace ImGuiImpl
 		std::string apertureSurface;
 		// Pinned aiming-mark shape name, empty for automatic. Same reasoning.
 		std::string reticleSurface;
+		// Scales the aperture activation. The secondary-sight blend fades the
+		// whole optical composite out through the constant the scene replay and
+		// the reticle layer already share, so the two cannot desynchronise.
+		float apertureActivationScale = 1.0F;
+		// Live secondary-sight eye shift, in ZoomData offset space and already
+		// blend-scaled. The engine samples cameraOffset only at aim-in, so the
+		// game thread converts this through the Camera node's frame and shifts
+		// the first-person weapon each frame instead. Zero when no sight is up.
+		float sightShiftX = 0.0F;
+		float sightShiftY = 0.0F;
+		float sightShiftZ = 0.0F;
+		// Custom reticle: index into the discovered list, -1 for the authored
+		// mesh, and the size of a texture reticle in aperture radii.
+		int customReticleIndex = -1;
+		float customReticleScale = 1.0F;
 		bool active = false;
+
+		// One clamp path for every producer.
+		void Clamp();
+
+		// Builds an unclamped-then-clamped snapshot straight from profile data.
+		// This is what lets the variant resolver publish on the same channel the
+		// editor uses without restating every range.
+		[[nodiscard]] static EditorPreviewSnapshot FromProfile(
+			const ScopeData::ShaderData& shaderData,
+			const ScopeData::ZoomDataOverwrite& zoomOverride,
+			std::uint64_t selectionRevision);
 	};
 
 	// One aperture shape the equipped scope offers, discovered on the game
@@ -310,8 +336,36 @@ namespace ImGuiImpl
 		// Removes this scope's preset file and drops the cached in-memory
 		// profile, so the next time the scope is selected it is synthesized
 		// from defaults again.
-		kDeletePreset
+		kDeletePreset,
+		// Re-walks the reticle folders. Explicit rather than automatic: a
+		// recursive directory read on every weapon swap, under MO2's virtual
+		// file system, is not a bounded operation, and users add reticle files
+		// between sessions rather than mid-firefight.
+		kRescanReticles
 	};
+
+	// Reticle texture file names available to the selected scope, discovered on
+	// the game thread and copied here for the editor and the hotkey cycler.
+	void PublishDiscoveredReticles(const std::vector<std::string>& reticles);
+	// Which variant the player is currently looking through, published by the
+	// game thread. The editor reads this instead of the session map, which the
+	// game thread owns and inserts into. -1 when no variant set is active.
+	void PublishActiveVariantIndex(int index);
+	[[nodiscard]] int ActiveVariantIndexForEditor();
+	[[nodiscard]] std::vector<std::string> GetDiscoveredReticles();
+
+	// Live occlusion preview: while the editor is open, the game thread builds
+	// the sphere cull from these unsaved values instead of the profile's saved
+	// ones, so the sphere can be tuned against what is on the sliders. The
+	// editor publishes on every occlusion edit; closing the editor clears it.
+	void PublishOcclusionPreview(
+		const ScopeData::OcclusionSettings& settings, bool active);
+	// False when no preview is active (editor closed or section untouched).
+	[[nodiscard]] bool GetOcclusionPreview(ScopeData::OcclusionSettings& out);
+	// Shape names under the scope's own subtree, published by the game thread
+	// for the editor's exclude checklist. Optical surfaces are pre-filtered.
+	void PublishOcclusionShapes(const std::vector<std::string>& names);
+	[[nodiscard]] std::vector<std::string> GetOcclusionShapes();
 
 	bool RegisterMenu();
 	void __stdcall RenderMenu();
@@ -331,42 +385,7 @@ namespace ImGuiImpl
 	[[nodiscard]] AuthoredZoomSnapshot GetAuthoredZoomSnapshot();
 	void PublishApertureGeometry(const ApertureGeometrySnapshot& geometry);
 	[[nodiscard]] ApertureGeometrySnapshot GetApertureGeometry();
-	void PublishEditorPreview(
-		const ScopeData::ZoomDataOverwrite& zoomOverride,
-		std::uint64_t selectionRevision,
-		float magnification,
-		float imageDenoise,
-		float imageSharpen,
-		float fishEyeStrength,
-		float fishEyePower,
-		float edgeRefractionStrength,
-		float edgeRefractionWidth,
-		float edgeChromaticAberration,
-		float reticleMagnification,
-		float reticleSize,
-		float reticleOffsetX,
-		float reticleOffsetY,
-		float eyeBoxRadius,
-		float vignetteReach,
-		float vignetteSharpness,
-		float eyeBoxMaxTravel,
-		float sceneParallaxStrength,
-		float opticalLagStrength,
-		float reticleShadowStrength,
-		float reticleParallaxStrength,
-		float sceneDepth,
-		float shadowDepth,
-		float imageStillness,
-		float axialBreathing,
-		float recenterSpeed,
-		float strafeLag,
-		float tubeDepth,
-		float lensOffsetX,
-		float lensOffsetY,
-		float lensScale,
-		const ScopeData::Breathing& breathing,
-		const std::string& apertureSurface,
-		const std::string& reticleSurface);
+	void PublishEditorPreview(const EditorPreviewSnapshot& snapshot);
 	[[nodiscard]] EditorPreviewSnapshot GetEditorPreviewSnapshot();
 	void ClearEditorPreview();
 	void RequestProfileAction(ProfileRequest request);
@@ -395,6 +414,16 @@ namespace ImGuiImpl
 		// edit session, so the two cannot capture different sets of values.
 		[[nodiscard]] ScopeData::ScopeProfile BuildEditedProfile(
 			const ScopeData::ScopeProfile& base);
+
+		// Just the shader half of the above, for capturing the sliders into a
+		// variant. Implemented in terms of BuildEditedProfile so there is one
+		// place that knows how a slider maps to a field.
+		[[nodiscard]] ScopeData::ShaderData BuildEditedShaderData(
+			const ScopeData::ShaderData& base);
+
+		// Captures the sliders into whichever variant is being edited, so
+		// switching variants or adding one does not discard the current values.
+		void StoreUIIntoEditedVariant();
 
 		ScopeData::ZoomDataOverwrite Imgui_ZDO;
 		ScopeData::ZoomDataOverwrite ori_ZDO;
@@ -449,6 +478,39 @@ namespace ImGuiImpl
 		float breathPupilFollow_UI = 1.0F;
 		std::uint64_t selectionRevision_UI = 0;
 
+		// --- variants, secondary sights, reticles -------------------------
+		// Editing copies rather than the live profile: the profile is owned by
+		// the game thread and this runs on the renderer thread.
+		bool variantsEnabled_UI = false;
+		bool variantsContinuous_UI = false;
+		float variantStepSeconds_UI = 0.12F;
+		std::vector<ScopeData::ProfileVariant> variants_UI;
+		std::uint32_t variantsNextId_UI = 1;
+		std::uint32_t variantDefaultId_UI = 0;
+		// Which variant the sliders are currently editing. Zero means the base
+		// profile, which is also what a disabled variant set edits.
+		//
+		// This is why the editor is a composition with the resolver rather than
+		// an override of it: without it, every variant after the first would be
+		// authored while looking through variant zero.
+		std::uint32_t editedVariantId_UI = 0;
+		std::vector<ScopeData::SecondarySight> secondarySights_UI;
+		int editedSecondarySight_UI = 0;
+		// Live-preview the selected secondary sight's zoom data on the weapon so
+		// it can be aligned with the same controls as the primary optic. Off by
+		// default: it moves the camera to the secondary sight while the editor is
+		// open, which is not what someone tuning the main optic wants.
+		bool showSecondarySightZoom_UI = false;
+		std::string defaultReticleFile_UI;
+		float customReticleScale_UI = 1.0F;
+		int opticsKeyIndex_UI = 0;
+		// Sphere occlusion of the scope's own front geometry; edited whole and
+		// published as a live preview while the editor is open.
+		ScopeData::OcclusionSettings occlusion_UI;
+		// One-shot: the section publishes the loaded values on its first
+		// render so the preview channel never serves a stale profile.
+		bool occlusionPreviewPublished_UI = false;
+
 		// True once ResetUIData has copied the selected profile into the _UI
 		// members above. They have no constructor, so before that they hold
 		// whatever was in the allocation, and anything that writes them back
@@ -490,6 +552,10 @@ namespace ImGuiImpl
 		void MainMenuSection();
 		void ShaderDataSection();
 		void ParallaxDataSection();
+		void VariantSection();
+		void SecondarySightSection();
+		void ReticleSection();
+		void OcclusionSection();
 
 		void UpdateWeaponInstance(RE::TESObjectWEAP::InstanceData*);
 		void UpdateImGuiData();

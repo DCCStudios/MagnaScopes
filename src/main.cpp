@@ -1,6 +1,10 @@
 #include "ScopeProfile.h"
 #include "EyeBoxRecentering.h"
 #include "ImGuiImpl.h"
+#include "ScopeResolver.h"
+#include "ScopeCoSave.h"
+#define MAGNASCOPE_INTERNAL
+#include "MagnaScopeAPI.h"
 #include "Settings.h"
 #include "WorldOnlyScopeRenderer.h"
 #include <hooking.h>
@@ -93,6 +97,24 @@ namespace MagnaScope
 				L"CameraOverride",
 				0,
 				path.c_str()) != 0;
+		{
+			// Experimental: graph events fired on a secondary-sight zoom
+			// pointer swap, so the re-sample trigger can be hunted from the
+			// INI without rebuilding. Unknown names are no-ops to the graph.
+			wchar_t wide[256]{};
+			GetPrivateProfileStringW(
+				L"Sights",
+				L"SightSwapGraphEvents",
+				L"GunUp",
+				wide,
+				static_cast<DWORD>(std::size(wide)),
+				path.c_str());
+			sightSwapGraphEvents.clear();
+			for (const wchar_t* cursor = wide; *cursor != L'\0'; ++cursor) {
+				sightSwapGraphEvents.push_back(
+					static_cast<char>(*cursor & 0x7F));
+			}
+		}
 		verificationTaaCapture =
 			GetPrivateProfileIntW(
 				L"Diagnostics",
@@ -1345,6 +1367,15 @@ RE::NiAVObject* FindObjectByPrefixNoCase(
 [[nodiscard]] const std::string& GetSelectedApertureSurfaceName()
 {
 	static std::string selected;
+	// An API consumer's override outranks everything, including the editor.
+	// It is the mechanism a double-pip optic uses to say "this frame, the
+	// aperture is that other shape", and a scope-authoring UI has no business
+	// contradicting it while it is set.
+	if (auto apiOverride = MagnaScopeAPI::GetApertureOverride();
+		!apiOverride.empty()) {
+		selected = std::move(apiOverride);
+		return selected;
+	}
 	const auto preview = ImGuiImpl::GetEditorPreviewSnapshot();
 	if (preview.active) {
 		selected = preview.apertureSurface;
@@ -1360,6 +1391,11 @@ RE::NiAVObject* FindObjectByPrefixNoCase(
 [[nodiscard]] const std::string& GetSelectedReticleSurfaceName()
 {
 	static std::string selected;
+	if (auto apiOverride = MagnaScopeAPI::GetReticleOverride();
+		!apiOverride.empty()) {
+		selected = std::move(apiOverride);
+		return selected;
+	}
 	const auto preview = ImGuiImpl::GetEditorPreviewSnapshot();
 	if (preview.active) {
 		selected = preview.reticleSurface;
@@ -2486,8 +2522,22 @@ RE::BSTSmartPointer<RE::TBO_InstanceData> originalZoomInstanceOwner;
 // The authored or generated zoom object used by the selected instance.
 // Keep this pointer stable because aim and animation systems may cache it.
 RE::BGSZoomData* originalZoomForm = nullptr;
+// Defined with the runtime sight-zoom machinery below; needed by the session
+// teardown above it.
+void RestoreSightZoomPointer();
 bool hasOriginalZoomData = false;
 bool selectedZoomOverrideApplied = false;
+// True between kPreSaveGame and kPostSaveGame. DetachIsolatedZoomForSave lifts
+// MagnaScope's values out of the shared zoom form so they are not written into
+// the save; anything that writes them back per tick -- the variant resolver
+// above all -- must stand down for that window or it would undo the detach one
+// frame later and serialise the override anyway.
+bool savingInProgress = false;
+
+// Defined below, next to the rest of the reticle-discovery cache; declared here
+// because profile selection needs them and runs earlier in the file.
+[[nodiscard]] const std::vector<std::string>& ReticlesForSelectedScope();
+void RediscoverReticles();
 bool selectedCameraOverrideApplied = false;
 bool zoomOverrideSuspendedForSave = false;
 std::uint64_t zoomSelectionRevision = 0;
@@ -2864,6 +2914,10 @@ std::string GetEquippedAttachmentKey(const RE::PlayerCharacter* actor)
 
 void ClearIsolatedZoomSession()
 {
+	// The pointer swap must be undone while the instance is still known to be
+	// alive; the field restores below then operate on the authored form the
+	// engine is once again reading.
+	RestoreSightZoomPointer();
 	if (originalZoomForm && hasOriginalZoomData) {
 		// MagnaScope owns only these fields. Reticle overlay and image-space
 		// modifier state may be changed by the game or another plugin while the
@@ -2902,6 +2956,158 @@ void ClearIsolatedZoomSession()
 	       originalZoomForm &&
 	       originalZoomInstance->zoomData == originalZoomForm &&
 	       hasOriginalZoomData;
+}
+
+// --- runtime secondary-sight zoom forms ------------------------------------
+//
+// One runtime BGSZoomData per sight slot, created through the engine's own
+// form factory and reused across profiles (their contents are rewritten on
+// every activation). While a secondary sight is up, the weapon INSTANCE's
+// zoomData pointer is swapped to the slot's form -- instance-scoped, so the
+// shared authored zoom form and every other user of it stay untouched. The
+// pointer is restored on swap-back, unequip, and around saves so a runtime
+// FormID can never leak into a save.
+RE::BGSZoomData* AcquireRuntimeSightZoom(std::size_t index)
+{
+	static std::vector<RE::BGSZoomData*> pool;
+	while (pool.size() <= index) {
+		auto factories = RE::IFormFactory::GetFormFactories();
+		auto* factory =
+			factories[std::to_underlying(RE::ENUM_FORM_ID::kZOOM)];
+		auto* created = factory ?
+			static_cast<RE::BGSZoomData*>(factory->DoCreate()) :
+			nullptr;
+		if (!created) {
+			logger::warn(
+				"Runtime BGSZoomData creation failed; secondary-sight zoom "
+				"pointer swaps are unavailable this session");
+			return nullptr;
+		}
+		pool.push_back(created);
+	}
+	return pool[index];
+}
+
+// The runtime form currently installed on the instance, null when the
+// authored form is in place. Game thread only.
+RE::BGSZoomData* installedSightZoom = nullptr;
+
+// Fires the configured animation-graph events at the player after a pointer
+// swap. This is the experiment: the engine samples ZoomData at aim-in, and
+// one of these events may make it re-run that sampling without leaving the
+// sighted state. Configured via [Sights] SightSwapGraphEvents in
+// MagnaScope.ini (semicolon separated); unknown event names are ignored by
+// the graph.
+//
+// The key is re-read from the INI on EVERY firing, deliberately: the whole
+// point is iterating candidate event names, and a swap is a rare user action,
+// so a file read here buys edit-INI -> swap -> observe with no restart and no
+// save reload.
+void FireSightSwapGraphEvents()
+{
+	if (!player) {
+		return;
+	}
+	std::string events;
+	{
+		wchar_t wide[256]{};
+		GetPrivateProfileStringW(
+			L"Sights",
+			L"SightSwapGraphEvents",
+			L"GunUp",
+			wide,
+			static_cast<DWORD>(std::size(wide)),
+			(GetPluginDirectory() / L"MagnaScope.ini").c_str());
+		for (const wchar_t* cursor = wide; *cursor != L'\0'; ++cursor) {
+			events.push_back(static_cast<char>(*cursor & 0x7F));
+		}
+	}
+	std::size_t begin = 0U;
+	while (begin < events.size()) {
+		auto end = events.find(';', begin);
+		if (end == std::string::npos) {
+			end = events.size();
+		}
+		const auto token = events.substr(begin, end - begin);
+		begin = end + 1U;
+		if (token.empty()) {
+			continue;
+		}
+		const bool handled = player->NotifyAnimationGraphImpl(
+			RE::BSFixedString(token.c_str()));
+		logger::info(
+			"[sight] graph event '{}' fired (handled={})",
+			token,
+			handled);
+	}
+}
+
+// Keeps the instance's zoom pointer in step with the selected sight. Runs
+// once per game tick; a no-op every tick nothing changed. Declarative on
+// purpose: scroll swaps, co-save restores, and profile reselects all funnel
+// through the same comparison, so there is no path that can miss a restore.
+void ReconcileSightZoomPointer()
+{
+	if (!settings.AllowsOverrides() || zoomOverrideSuspendedForSave ||
+		!currentData || !originalZoomInstanceOwner || !originalZoomInstance ||
+		originalZoomInstanceOwner.get() != originalZoomInstance ||
+		!originalZoomForm || !hasOriginalZoomData) {
+		return;
+	}
+	// Hands off if a third party re-pointed the instance somewhere we have
+	// never seen; fighting over the pointer helps nobody.
+	if (originalZoomInstance->zoomData != originalZoomForm &&
+		originalZoomInstance->zoomData != installedSightZoom) {
+		return;
+	}
+
+	auto& state = MagnaScope::SessionStateFor(*currentData);
+	RE::BGSZoomData* desired = originalZoomForm;
+	if (state.secondaryIndex >= 0 &&
+		state.secondaryIndex <
+			static_cast<int>(currentData->secondarySights.size())) {
+		auto* runtime = AcquireRuntimeSightZoom(
+			static_cast<std::size_t>(state.secondaryIndex));
+		if (runtime) {
+			const auto& sight = currentData->secondarySights[
+				static_cast<std::size_t>(state.secondaryIndex)];
+			// Start from the authored data so the imagespace modifier and
+			// overlay carry over; only the fields a sight owns are replaced.
+			runtime->zoomData = originalZoomData;
+			runtime->isMod = originalZoomForm->isMod;
+			runtime->zoomData.fovMult = sight.zoomData.fovMul;
+			runtime->zoomData.cameraOffset = {
+				sight.zoomData.x,
+				sight.zoomData.y,
+				sight.zoomData.z
+			};
+			desired = runtime;
+		}
+	}
+
+	if (originalZoomInstance->zoomData != desired) {
+		originalZoomInstance->zoomData = desired;
+		installedSightZoom =
+			desired == originalZoomForm ? nullptr : desired;
+		logger::info(
+			"[sight] instance zoom pointer -> {} (sight index {})",
+			desired == originalZoomForm ? "authored form" : "runtime form",
+			state.secondaryIndex);
+		FireSightSwapGraphEvents();
+	}
+}
+
+// Restores the authored pointer immediately. For paths that end the zoom
+// session or serialize state and cannot wait for the next reconcile tick.
+void RestoreSightZoomPointer()
+{
+	if (originalZoomInstance && originalZoomForm && installedSightZoom &&
+		originalZoomInstance->zoomData == installedSightZoom) {
+		originalZoomInstance->zoomData = originalZoomForm;
+		logger::info(
+			"[sight] instance zoom pointer restored to the authored form");
+	}
+	installedSightZoom = nullptr;
 }
 
 void WriteSelectedZoomOverride(const ScopeData::ZoomDataOverwrite& overrideData)
@@ -2988,6 +3194,11 @@ void ApplySelectedEditorPreview(
 
 void DetachIsolatedZoomForSave()
 {
+	// Order matters: while a runtime sight form is installed the session check
+	// below reports false (the instance points away from the authored form),
+	// so the pointer restore has to happen first or a runtime FormID would
+	// ride the instance straight into the save.
+	RestoreSightZoomPointer();
 	if (!HasSelectedZoomSession()) {
 		return;
 	}
@@ -3124,11 +3335,480 @@ inline void InitCurrentScopeData()
 			settings.defaultMagnification,
 			settings.zoomSpread);
 		selectProfile(profile);
+		// Publish this scope's reticle list for the editor and the hotkey
+		// cycler. Reads the cache built at data load, not the disk.
+		ImGuiImpl::PublishDiscoveredReticles(ReticlesForSelectedScope());
 		logger::info("Selected automatic STS profile {}", profile->keywordName);
 		return;
 	}
 
 	clearSelection();
+}
+
+// --- optics hotkey state -------------------------------------------------
+// The key is polled on the game thread (PollOpticsKey) while the wheel arrives
+// on the input thread (MagnaScopeInputCallback): the poll writes these flags,
+// the wheel reads/writes them, so they are atomic. The press timestamp is only
+// touched inside the poll.
+std::atomic<bool> opticsKeyHeld{ false };
+std::atomic<bool> opticsKeyConsumedByScroll{ false };
+std::chrono::steady_clock::time_point opticsKeyPressTime{};
+
+// Live secondary-sight eye shift, ZoomData offset space, blend-scaled by the
+// resolver. Game thread only: written by the preview consumer, applied to the
+// first-person weapon each frame in the scope block. The engine samples the
+// zoom form's cameraOffset at aim-in only, so this is what actually moves the
+// eye mid-ADS.
+float sightShiftOffset[3] = { 0.0F, 0.0F, 0.0F };
+// Longer than a deliberate tap ever is, shorter than a hold ever is.
+constexpr float kOpticsTapSeconds = 0.25F;
+
+// Reticle files for the selected scope, discovered once at data load and on
+// explicit rescan rather than per weapon swap: a recursive directory read under
+// MO2's virtual file system is not a bounded operation, and a hitch on every
+// equip is exactly what gets a mod blamed for stutter.
+std::map<
+	std::tuple<std::string, std::uint32_t, std::string>,
+	std::vector<std::string>>
+	discoveredReticlesByScope;
+
+// Walks every profile's reticles folder once and caches the result.
+//
+// Deliberately not per-selection: profile selection runs inside HookedUpdate on
+// the main thread, and a cold-cache recursive directory read there -- under
+// MO2's USVFS, which adds real latency to directory walks -- is an unbounded
+// stall on every weapon swap.
+void RediscoverReticles()
+{
+	discoveredReticlesByScope.clear();
+
+	const std::filesystem::path root(
+		"Data\\F4SE\\Plugins\\MagnaScope\\Auto");
+	std::error_code error;
+	if (!std::filesystem::exists(root, error)) {
+		return;
+	}
+
+	std::size_t total = 0U;
+	for (const auto& profile : sdh->AllAutoProfiles()) {
+		if (!profile) {
+			continue;
+		}
+		const auto directory = profile->ReticleDirectory();
+		if (directory.empty() ||
+			!std::filesystem::exists(directory, error)) {
+			continue;
+		}
+
+		std::vector<std::string> reticles;
+		for (const auto& entry :
+			std::filesystem::directory_iterator(
+				directory,
+				std::filesystem::directory_options::skip_permission_denied,
+				error)) {
+			if (!entry.is_regular_file(error)) {
+				continue;
+			}
+			auto extension = entry.path().extension().string();
+			std::ranges::transform(
+				extension,
+				extension.begin(),
+				[](unsigned char value) {
+					return static_cast<char>(std::tolower(value));
+				});
+			if (extension != ".dds" && extension != ".png") {
+				continue;
+			}
+			reticles.push_back(entry.path().filename().string());
+		}
+
+		if (reticles.empty()) {
+			continue;
+		}
+		std::ranges::sort(reticles);
+		total += reticles.size();
+		discoveredReticlesByScope.emplace(
+			MagnaScope::MakeSessionKey(*profile),
+			std::move(reticles));
+	}
+
+	logger::info(
+		"Discovered {} reticle textures across {} scope profiles",
+		total,
+		discoveredReticlesByScope.size());
+}
+
+[[nodiscard]] const std::vector<std::string>& ReticlesForSelectedScope()
+{
+	static const std::vector<std::string> empty;
+	if (!currentData) {
+		return empty;
+	}
+	const auto entry =
+		discoveredReticlesByScope.find(MagnaScope::MakeSessionKey(*currentData));
+	return entry == discoveredReticlesByScope.end() ? empty : entry->second;
+}
+
+// Input arrives on Fallout's input thread, not the game thread. The session
+// state it wants to change lives in a std::map that the game thread inserts
+// into and holds references into, so touching it from here would be a genuine
+// data race -- an insert can rehash while the resolver is mid-read.
+//
+// So input only ever accumulates a delta, and the game thread applies it. Same
+// discipline as the API command queue, for the same reason.
+std::atomic<int> pendingVariantScroll{ 0 };
+std::atomic<int> pendingSightScroll{ 0 };
+std::atomic<int> pendingReticleCycle{ 0 };
+
+// True when the wheel belongs to variant selection, so the caller must not also
+// apply free zoom. Reads the profile only for the enabled flag, which the game
+// thread does not mutate during play.
+// +1 for wheel up, -1 for wheel down, 0 for anything else.
+//
+// Different local input paths expose the wheel as a raw mouse ID (8/9), an
+// already-unified ID (0x108/0x109), or a BS_BUTTON_CODE. MagnaScope only ever
+// tested the raw pair, so on any setup reporting the unified form the wheel was
+// never seen at all -- exactly the "scrolling does nothing" symptom. Taken from
+// ScrollWheelWeaponSelect, which handles all three deliberately.
+[[nodiscard]] int WheelDirectionOf(std::uint32_t idCode) noexcept
+{
+	switch (idCode) {
+	case 8U:
+	case 0x108U:
+	case static_cast<std::uint32_t>(RE::BS_BUTTON_CODE::kWheelUp):
+		return 1;
+	case 9U:
+	case 0x109U:
+	case static_cast<std::uint32_t>(RE::BS_BUTTON_CODE::kWheelDown):
+		return -1;
+	default:
+		return 0;
+	}
+}
+
+// Optics hotkey, registered with F4SE Menu Framework.
+//
+// The framework owns binding, persistence (its own PluginHotkeys.ini, so our
+// updates never clobber a rebind) and conflict warnings. Critically it works in
+// DIK scan codes, which is also what Fallout's ButtonEvent reports for the
+// keyboard -- MagnaScope's editor was binding from a Virtual-Key table, so the
+// bound code and the reported code were in different code spaces and simply
+// never compared equal. No amount of gating was ever going to fix that.
+constexpr const char* kOpticsHotkeyId = "MagnaScope.Optics";
+// DIK_X. Only a default; the framework's persisted binding wins.
+constexpr unsigned int kOpticsHotkeyDefault = 0x2D;
+
+[[nodiscard]] bool RouteVariantScroll(int direction)
+{
+	if (!currentData) {
+		return false;
+	}
+	if (!currentData->variants.enabled ||
+		currentData->variants.variants.size() < 2U) {
+		// Rate-limited: this runs per wheel notch, and a silent decline here is
+		// indistinguishable in game from the wheel not being read at all.
+		static std::uint64_t lastReport = 0U;
+		const auto now = static_cast<std::uint64_t>(
+			std::chrono::duration_cast<std::chrono::seconds>(
+				std::chrono::steady_clock::now().time_since_epoch())
+				.count());
+		if (now != lastReport) {
+			lastReport = now;
+			logger::info(
+				"Wheel not routed to variants: enabled={}, variantCount={}. "
+				"Free-scroll zoom is handling it instead.",
+				currentData->variants.enabled,
+				currentData->variants.variants.size());
+		}
+		return false;
+	}
+	pendingVariantScroll.fetch_add(direction, std::memory_order_relaxed);
+	return true;
+}
+
+void RouteSecondarySightScroll(int direction)
+{
+	if (!currentData || currentData->secondarySights.empty()) {
+		return;
+	}
+	pendingSightScroll.fetch_add(direction, std::memory_order_relaxed);
+}
+
+void RouteReticleCycle(int direction)
+{
+	if (!currentData) {
+		return;
+	}
+	pendingReticleCycle.fetch_add(direction, std::memory_order_relaxed);
+}
+
+// NOTE deliberately absent: there is NO re-aim dip on a sight swap. An
+// earlier build dropped and re-raised the sighted state to force the engine
+// to re-sample ZoomData; in game that opened a not-sighted window that
+// ScrollWheelWeaponSelect acted on (weapon switch mid-swap) and could wedge
+// the engine's aim state machine (no ADS, no wheel, fire still working). The
+// camera offset in ZoomData applies live from the form while sighted, so the
+// resolver's per-tick lerp is the whole transition.
+
+// Drains the accumulated input on the game thread, where the session map is
+// safe to mutate.
+void ApplyPendingSightInput()
+{
+	if (!currentData) {
+		// Discard rather than carry across a weapon change: a notch aimed at
+		// the previous scope must not land on the next one.
+		pendingVariantScroll.store(0, std::memory_order_relaxed);
+		pendingSightScroll.store(0, std::memory_order_relaxed);
+		pendingReticleCycle.store(0, std::memory_order_relaxed);
+		return;
+	}
+
+	const int variantDelta =
+		pendingVariantScroll.exchange(0, std::memory_order_relaxed);
+	const int sightDelta =
+		pendingSightScroll.exchange(0, std::memory_order_relaxed);
+	const int reticleDelta =
+		pendingReticleCycle.exchange(0, std::memory_order_relaxed);
+	if (variantDelta == 0 && sightDelta == 0 && reticleDelta == 0) {
+		return;
+	}
+
+	auto& state = MagnaScope::SessionStateFor(*currentData);
+	if (variantDelta != 0) {
+		const float before = state.variantTarget;
+		const bool applied =
+			MagnaScope::AdjustVariantSelection(*currentData, state, variantDelta);
+		// One line per applied notch: proves the game thread saw the scroll and
+		// moved the target. If this appears but the magnification does not
+		// change on screen, the stall is downstream (resolver/consumer/render).
+		logger::info(
+			"[variant] delta={} applied={} target {:.2f}->{:.2f} pos={:.2f}",
+			variantDelta,
+			applied,
+			before,
+			state.variantTarget,
+			state.variantPosition);
+	}
+	if (sightDelta != 0 &&
+		MagnaScope::CycleSecondarySight(*currentData, state, sightDelta)) {
+		// The resolver lerps the form's zoom data toward the new sight from
+		// here on; the player stays sighted throughout.
+		logger::info(
+			"[sight] switched to index {} (lerp, no state change)",
+			state.secondaryIndex);
+	}
+	if (reticleDelta != 0) {
+		MagnaScope::CycleReticle(
+			*currentData,
+			state,
+			static_cast<int>(ReticlesForSelectedScope().size()),
+			reticleDelta);
+	}
+}
+
+// DIK scan code -> Windows virtual key, for polling the bound key with
+// GetAsyncKeyState. The reverse of the editor capture's VK->DIK. Extended keys
+// (0x80+) don't round-trip through MapVirtualKeyA, hence the explicit table.
+[[nodiscard]] int VirtualKeyFromDik(unsigned int dik)
+{
+	switch (dik) {
+	case 0xC8U: return VK_UP;
+	case 0xD0U: return VK_DOWN;
+	case 0xCBU: return VK_LEFT;
+	case 0xCDU: return VK_RIGHT;
+	case 0xC7U: return VK_HOME;
+	case 0xCFU: return VK_END;
+	case 0xC9U: return VK_PRIOR;
+	case 0xD1U: return VK_NEXT;
+	case 0xD2U: return VK_INSERT;
+	case 0xD3U: return VK_DELETE;
+	case 0x9DU: return VK_RCONTROL;
+	case 0xB8U: return VK_RMENU;
+	default:
+		return static_cast<int>(MapVirtualKeyA(dik, MAPVK_VSC_TO_VK));
+	}
+}
+
+// Optics-key held/tap detection, polled on the game thread.
+//
+// History worth keeping: MagnaScope's [input] logs proved that F4SE Menu
+// Framework's AddInputEvent callback delivered mouse events but NOT keyboard
+// events (wheel arrived every notch, key presses never did) -- the framework
+// was hooking PlayerControls' PerformInputProcessing, a mouse-only slice of the
+// queue. The framework was then fixed to hook PlayerCamera's full-queue
+// receiver instead, so the callback now does deliver keyboard.
+//
+// The poll is kept anyway. GetAsyncKeyState reads the physical key regardless
+// of framework version or how the game routes input, and it sidesteps the
+// DIK-vs-VK ambiguity of the raw keyboard event entirely (the binding is DIK;
+// convert once to VK here). The wheel stays on the callback, which has always
+// worked for mouse.
+void PollOpticsKey()
+{
+	static bool wasDown = false;
+
+	const auto boundCode =
+		F4SEMenuFramework::Hotkeys::GetBinding(kOpticsHotkeyId);
+	const int vk = boundCode != 0U ? VirtualKeyFromDik(boundCode) : 0;
+	if (vk == 0) {
+		wasDown = false;
+		opticsKeyHeld.store(false, std::memory_order_relaxed);
+		return;
+	}
+
+	const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+
+	// Menu open: swallow the key but keep tracking state, so closing a menu
+	// with the key held cannot read as a fresh press.
+	if (F4SEMenuFramework::IsAnyBlockingWindowOpened()) {
+		wasDown = down;
+		opticsKeyHeld.store(false, std::memory_order_relaxed);
+		opticsKeyConsumedByScroll.store(false, std::memory_order_relaxed);
+		return;
+	}
+
+	if (down && !wasDown) {
+		opticsKeyHeld.store(true, std::memory_order_relaxed);
+		opticsKeyConsumedByScroll.store(false, std::memory_order_relaxed);
+		opticsKeyPressTime = std::chrono::steady_clock::now();
+		logger::info("[input] optics key DOWN (poll, scan 0x{:02X})", boundCode);
+	} else if (!down && wasDown) {
+		// Reticle cycling fires on release: that distinguishes a tap from a
+		// hold without delaying the tap, and a hold that consumed a scroll
+		// notch is suppressed so switching sights cannot also swap reticles.
+		const auto heldSeconds =
+			std::chrono::duration<float>(
+				std::chrono::steady_clock::now() - opticsKeyPressTime)
+				.count();
+		if (opticsKeyHeld.load(std::memory_order_relaxed) &&
+			!opticsKeyConsumedByScroll.load(std::memory_order_relaxed) &&
+			heldSeconds < kOpticsTapSeconds) {
+			RouteReticleCycle(1);
+		}
+		opticsKeyHeld.store(false, std::memory_order_relaxed);
+		opticsKeyConsumedByScroll.store(false, std::memory_order_relaxed);
+		logger::info("[input] optics key UP (poll, held {:.2f}s)", heldSeconds);
+	}
+	wasDown = down;
+}
+
+// Optics key AND mouse wheel, both handled through F4SE Menu Framework's
+// AddInputEvent callback (single-path, re-enabled per request). PollOpticsKey
+// and the own-hook wheel routing are disabled so this is the sole input path.
+//
+// Runs on the input thread. It publishes nothing directly into the session map
+// (game-thread-owned); it only accumulates atomic deltas the game thread
+// drains. Returns false always -- MagnaScope observes input, never consumes it.
+bool __stdcall MagnaScopeInputCallback(RE::InputEvent* rawEvent)
+{
+	// This CommonLibF4 revision has no AsButtonEvent; check eventType and cast,
+	// matching the receiver hook below.
+	if (!rawEvent || rawEvent->eventType != INPUT_EVENT_TYPE::kButton) {
+		return false;
+	}
+	auto* button = static_cast<ButtonEvent*>(rawEvent);
+	const auto id = static_cast<std::uint32_t>(button->idCode);
+
+	if (button->device == INPUT_DEVICE::kMouse) {
+		const int direction = WheelDirectionOf(id);
+		// The framework already suppresses this callback while a blocking
+		// window is open; the explicit guard also covers MagnaScope's own
+		// editor, so scrolling to adjust a slider never switches variants.
+		if (direction != 0 && button->QJustPressed() &&
+			!F4SEMenuFramework::IsAnyBlockingWindowOpened()) {
+			const bool held = opticsKeyHeld.load(std::memory_order_relaxed);
+			// One line that localises a "hold+scroll does nothing" report:
+			// held=0 means the keyboard optics key never registered as down
+			// (input never reached this callback, or the wrong code); held=1
+			// with sights=0 means no secondary sight is configured on the live
+			// scope; held=1 with sights>0 means the wheel routed correctly and
+			// the fault is downstream in the resolver. Rate-limited to one per
+			// second so a scroll burst does not flood the log.
+			static std::uint64_t lastWheelLog = 0U;
+			const auto nowSec = static_cast<std::uint64_t>(
+				std::chrono::duration_cast<std::chrono::seconds>(
+					std::chrono::steady_clock::now().time_since_epoch())
+					.count());
+			if (nowSec != lastWheelLog) {
+				lastWheelLog = nowSec;
+				logger::info(
+					"[input] wheel dir={} opticsHeld={} sights={}",
+					direction,
+					held ? 1 : 0,
+					currentData ? currentData->secondarySights.size() : 0U);
+			}
+			if (held) {
+				opticsKeyConsumedByScroll.store(
+					true, std::memory_order_relaxed);
+				RouteSecondarySightScroll(direction);
+			} else if (!RouteVariantScroll(direction)) {
+				if (hookIns && hookIns->GetRenderState()) {
+					hookIns->AdjustZoomDelta(0.1F * direction);
+				}
+			}
+		}
+		return false;
+	}
+
+	if (button->device != INPUT_DEVICE::kKeyboard) {
+		return false;
+	}
+
+	// DIAGNOSTIC: log every fresh keyboard press's idCode reaching this
+	// callback, to reveal whether the dispatched keyboard code is DIK (matches
+	// the 0x15 binding) or VK (e.g. 0x59 for Y) or something else. The framework
+	// confirms keyboard events DO reach here (btn kbd=1); this shows their code.
+	if (button->QJustPressed()) {
+		logger::info(
+			"[input] kbd press reached callback: scan 0x{:02X} (optics bound 0x{:02X})",
+			id,
+			F4SEMenuFramework::Hotkeys::GetBinding(kOpticsHotkeyId));
+	}
+
+	// Optics key detected HERE on the AddInputEvent callback (single-path per
+	// request; PollOpticsKey is disabled in the tick). The framework dispatches
+	// the raw queue with a DIK keyboard idCode, the same space the Hotkeys
+	// binding uses, so it compares directly. Under investigation with the
+	// framework's [InputQueueHook] diagnostic (this callback was not dispatching
+	// while MagnaScope's own PlayerCamera hook was also installed).
+	// PROVEN BY LOG (2026-08-14 17:23): this receiver reports VK codes, not
+	// DIK -- pressing the bound Y arrived as 0x59 (VK 'Y'), Escape as 0x1B,
+	// Left Alt as 0xA4, while the framework binding is DIK 0x15. Matches
+	// MeleeAndThrow's documentation of this receiver ("keyboard idCode is a
+	// Windows virtual-key code; its default 0xA4 is VK_LMENU"); the framework
+	// guide's "idCode is a DIK scan code" is wrong for PlayerCamera's queue.
+	// So convert the DIK binding to VK once and compare in VK space.
+	const auto boundCode =
+		F4SEMenuFramework::Hotkeys::GetBinding(kOpticsHotkeyId);
+	const auto boundVk = boundCode != 0U ?
+	                         static_cast<std::uint32_t>(
+								 VirtualKeyFromDik(boundCode)) :
+	                         0U;
+	if (boundVk == 0U || id != boundVk) {
+		return false;
+	}
+
+	if (button->QJustPressed()) {
+		opticsKeyHeld.store(true, std::memory_order_relaxed);
+		opticsKeyConsumedByScroll.store(false, std::memory_order_relaxed);
+		opticsKeyPressTime = std::chrono::steady_clock::now();
+		logger::info("[input] optics key DOWN (callback, scan 0x{:02X})", id);
+	} else if (button->value == 0.0F) {
+		const auto heldSeconds =
+			std::chrono::duration<float>(
+				std::chrono::steady_clock::now() - opticsKeyPressTime)
+				.count();
+		if (opticsKeyHeld.load(std::memory_order_relaxed) &&
+			!opticsKeyConsumedByScroll.load(std::memory_order_relaxed) &&
+			heldSeconds < kOpticsTapSeconds) {
+			RouteReticleCycle(1);
+		}
+		opticsKeyHeld.store(false, std::memory_order_relaxed);
+		opticsKeyConsumedByScroll.store(false, std::memory_order_relaxed);
+		logger::info("[input] optics key UP (callback, held {:.2f}s)", heldSeconds);
+	}
+
+	return false;
 }
 
 /// <summary>
@@ -3148,16 +3828,11 @@ public:
 
 		uint32_t id = evn->idCode;
 		if (evn->device == INPUT_DEVICE::kMouse) {
-			if (hookIns && hookIns->GetRenderState() && evn->QJustPressed() &&
-				!F4SEMenuFramework::IsAnyBlockingWindowOpened()) {
-				// Fallout exposes wheel up and wheel down as mouse button
-				// IDs 8 and 9 in the input event stream.
-				if (id == 8) {
-					hookIns->AdjustZoomDelta(0.1F);
-				} else if (id == 9) {
-					hookIns->AdjustZoomDelta(-0.1F);
-				}
-			}
+			// Wheel routing lives on the framework's AddInputEvent callback
+			// (MagnaScopeInputCallback), which delivers mouse reliably. This
+			// receiver hook keeps only the legacy NVG key -- confirmed with the
+			// framework author that the callback and this hook compose cleanly
+			// on PlayerCamera+0x38, so there is no reason to route here too.
 			id += 0x100;
 		}
 		if (evn->device == INPUT_DEVICE::kGamepad)
@@ -3169,6 +3844,12 @@ public:
 		//}
 
 		if (evn->device == INPUT_DEVICE::kKeyboard) {
+			// The optics key is NOT handled here -- it lives in
+			// MagnaScopeInputCallback, where the framework dispatches the raw
+			// queue with DIK keyboard codes that match the Hotkeys binding
+			// directly. Only the legacy STS night-vision key remains on this
+			// receiver.
+
 			if (currentData) {
 				if (sdh->comboNVKey == -1) {
 					if (id == (uint32_t)sdh->nvKey && evn->QJustPressed()) {
@@ -3255,6 +3936,347 @@ void SetNodeVisibility(NiNode* normal, NiNode* aiming, bool isScopeActive)
 		normal->SetAppCulled(!isScopeActive);
 		aiming->SetAppCulled(isScopeActive);
 	}
+}
+
+// --- sphere occlusion: game-thread producer --------------------------------
+//
+// Builds the holed index arrays for every occludable scope mesh and hands them
+// to the render side. Everything runs here, on the game thread, from the
+// engine's own CPU geometry copies (the same access the aperture vertex probe
+// proved safe); the render side only creates buffers and swaps them at draw
+// time.
+//
+// Recomputed only when its inputs change. The scope's meshes are rigid
+// relative to the glass, so the in-sphere triangle set is a function of the
+// settings and the equipped scope, not of the frame.
+std::uint64_t occlusionInputHash = 0U;
+
+[[nodiscard]] std::uint64_t HashOcclusionInputs(
+	const ScopeData::OcclusionSettings& occlusionSettings,
+	bool wanted,
+	const void* scopeAiming,
+	const void* glassNode)
+{
+	std::uint64_t hash = 1469598103934665603ULL;
+	const auto mix = [&hash](const void* data, std::size_t size) {
+		const auto* bytes = static_cast<const std::uint8_t*>(data);
+		for (std::size_t index = 0; index < size; ++index) {
+			hash ^= bytes[index];
+			hash *= 1099511628211ULL;
+		}
+	};
+	mix(&wanted, sizeof(wanted));
+	mix(&scopeAiming, sizeof(scopeAiming));
+	mix(&glassNode, sizeof(glassNode));
+	mix(&occlusionSettings.enabled, sizeof(occlusionSettings.enabled));
+	mix(&occlusionSettings.sphereRadius, sizeof(occlusionSettings.sphereRadius));
+	mix(occlusionSettings.sphereOffset, sizeof(occlusionSettings.sphereOffset));
+	mix(&occlusionSettings.frontOnly, sizeof(occlusionSettings.frontOnly));
+	mix(&occlusionSettings.flipFront, sizeof(occlusionSettings.flipFront));
+	for (const auto& name : occlusionSettings.excludedShapes) {
+		mix(name.data(), name.size());
+		mix("|", 1);
+	}
+	return hash;
+}
+
+// True for shapes the sphere must never cut regardless of settings: the
+// optical surfaces themselves. These never even appear in the editor's
+// exclude checklist -- there is nothing to decide about them.
+[[nodiscard]] bool IsOcclusionAlwaysProtected(const std::string& name)
+{
+	const auto containsToken = [&name](const char* token) {
+		const auto it = std::search(
+			name.begin(), name.end(),
+			token, token + std::strlen(token),
+			[](char a, char b) {
+				return std::tolower(static_cast<unsigned char>(a)) ==
+			           std::tolower(static_cast<unsigned char>(b));
+			});
+		return it != name.end();
+	};
+	if (containsToken("ScopeFade") || containsToken("TextureLoader") ||
+		containsToken("Reticle") || containsToken("Dot:") ||
+		containsToken("Glass") || containsToken("Paralax") ||
+		containsToken("Parallax")) {
+		return true;
+	}
+	if (currentData) {
+		if (name == currentData->shaderData.apertureSurface ||
+			name == currentData->shaderData.reticleSurface) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// User opt-outs. Separate from the always-protected set because these names
+// must still be listed in the editor (an excluded shape has to stay visible
+// to be un-excludable).
+[[nodiscard]] bool IsOcclusionUserExcluded(
+	const std::string& name,
+	const ScopeData::OcclusionSettings& occlusionSettings)
+{
+	for (const auto& excluded : occlusionSettings.excludedShapes) {
+		if (_stricmp(name.c_str(), excluded.c_str()) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void UpdateScopeOcclusion(RE::NiAVObject* firstPersonRoot, RE::NiAVObject* glassNode)
+{
+	// Editor preview wins while the editor is open, so the sphere can be
+	// tuned live against unsaved values; otherwise the saved/session profile.
+	ScopeData::OcclusionSettings preview;
+	const bool editing =
+		hookIns && hookIns->bEnableEditMode.load(std::memory_order_acquire);
+	const ScopeData::OcclusionSettings* occlusionSettings = nullptr;
+	if (editing && ImGuiImpl::GetOcclusionPreview(preview)) {
+		occlusionSettings = &preview;
+	} else if (currentData) {
+		occlusionSettings = &currentData->occlusion;
+	}
+
+	auto* scopeAiming = firstPersonRoot ?
+		FindObjectByPrefixNoCase(firstPersonRoot, "ScopeAiming") :
+		nullptr;
+	const bool wanted =
+		occlusionSettings && occlusionSettings->enabled && bEnableScope &&
+		glassNode && scopeAiming && currentData && currentData->autoProfile;
+
+	static const ScopeData::OcclusionSettings disabledSettings{};
+	const auto& hashed = occlusionSettings ? *occlusionSettings : disabledSettings;
+	// The node pointers are hashed even when occlusion is off, so an equip
+	// change still re-runs this and republishes the editor's shape checklist.
+	const auto hash = HashOcclusionInputs(
+		hashed,
+		wanted,
+		static_cast<const void*>(scopeAiming),
+		static_cast<const void*>(glassNode));
+	if (hash == occlusionInputHash) {
+		return;
+	}
+	occlusionInputHash = hash;
+
+	if (!wanted) {
+		// Names still flow to the editor when a scope is selected but the
+		// cull is off; that is how the checklist has content before the user
+		// first enables the feature.
+		if (scopeAiming) {
+			std::vector<std::string> names;
+			const std::function<void(RE::NiAVObject*)> collect =
+				[&](RE::NiAVObject* object) {
+					if (!object) {
+						return;
+					}
+					if (object->IsTriShape()) {
+						const std::string name(
+							object->name.c_str() ? object->name.c_str() : "");
+						if (!IsOcclusionAlwaysProtected(name)) {
+							names.push_back(name);
+						}
+						return;
+					}
+					if (auto* node = object->IsNode()) {
+						for (const auto& child : node->children) {
+							collect(child.get());
+						}
+					}
+				};
+			collect(scopeAiming);
+			ImGuiImpl::PublishOcclusionShapes(names);
+		}
+		Hook::D3D::PublishScopeOcclusion({});
+		return;
+	}
+
+	// Sphere and front plane in world space, from the glass node. The offset
+	// is authored in the glass's local axes; Transpose(rotate) maps a local
+	// direction into world, matching the camera-space idiom used elsewhere.
+	const auto& glassWorld = glassNode->world;
+	const RE::NiPoint3 offsetLocal{
+		occlusionSettings->sphereOffset[0],
+		occlusionSettings->sphereOffset[1],
+		occlusionSettings->sphereOffset[2]
+	};
+	const RE::NiPoint3 sphereCenterWorld =
+		glassWorld.translate + glassWorld.rotate.Transpose() * offsetLocal;
+	RE::NiPoint3 frontNormalWorld =
+		glassWorld.rotate.Transpose() *
+		RE::NiPoint3{ 0.0F, occlusionSettings->flipFront ? -1.0F : 1.0F, 0.0F };
+	const RE::NiPoint3 planePointWorld = glassWorld.translate;
+
+	std::vector<Hook::D3D::OcclusionEntry> entries;
+	std::size_t consideredShapes = 0U;
+	// Every candidate name goes to the editor's exclude checklist, whether or
+	// not it ends up culled this rebuild.
+	std::vector<std::string> shapeNames;
+
+	const std::function<void(RE::NiAVObject*)> walk =
+		[&](RE::NiAVObject* object) {
+			if (!object) {
+				return;
+			}
+			if (auto* shape = object->IsTriShape()) {
+				++consideredShapes;
+				const std::string name(
+					object->name.c_str() ? object->name.c_str() : "");
+				if (IsOcclusionAlwaysProtected(name)) {
+					return;
+				}
+				shapeNames.push_back(name);
+				if (IsOcclusionUserExcluded(name, *occlusionSettings)) {
+					return;
+				}
+				if (shape->numVertices == 0U ||
+					shape->numVertices > 65535U ||
+					shape->numTriangles == 0U) {
+					return;
+				}
+				auto* rendererShape = shape->rendererData ?
+					static_cast<RE::BSGraphics::TriShape*>(
+						shape->rendererData) :
+					nullptr;
+				auto* vertexBuffer =
+					rendererShape ? rendererShape->vertexBuffer : nullptr;
+				auto* indexBuffer =
+					rendererShape ? rendererShape->indexBuffer : nullptr;
+				if (!vertexBuffer || !indexBuffer ||
+					!vertexBuffer->data || vertexBuffer->invalidCpuData ||
+					!indexBuffer->data || indexBuffer->invalidCpuData ||
+					!indexBuffer->buffer) {
+					return;
+				}
+				const std::uint32_t stride = shape->vertexDesc.GetSize();
+				const bool fullPrecision = shape->vertexDesc.HasFlag(
+					RE::BSGraphics::Vertex::Flags::VF_FULLPREC);
+				const std::uint32_t indexCount = shape->numTriangles * 3U;
+				const std::uint64_t vertexSpan =
+					static_cast<std::uint64_t>(shape->numVertices) * stride;
+				const std::uint64_t indexSpan =
+					static_cast<std::uint64_t>(indexCount) *
+					sizeof(std::uint16_t);
+				if (stride < 8U ||
+					vertexSpan > std::max(
+						vertexBuffer->maxDataSize, vertexBuffer->dataSize) ||
+					indexSpan > std::max(
+						indexBuffer->maxDataSize, indexBuffer->dataSize)) {
+					return;
+				}
+
+				// Sphere and plane in this mesh's local space; the local frame
+				// is where the CPU vertex copy lives.
+				const auto& meshWorld = object->world;
+				const float scale =
+					meshWorld.scale > 1e-6F ? meshWorld.scale : 1.0F;
+				const RE::NiPoint3 centerLocal =
+					(meshWorld.rotate *
+						(sphereCenterWorld - meshWorld.translate)) *
+					(1.0F / scale);
+				const float radiusLocal = occlusionSettings->sphereRadius / scale;
+				const RE::NiPoint3 planePointLocal =
+					(meshWorld.rotate *
+						(planePointWorld - meshWorld.translate)) *
+					(1.0F / scale);
+				const RE::NiPoint3 normalLocal =
+					meshWorld.rotate * frontNormalWorld;
+
+				const auto* base =
+					static_cast<const std::uint8_t*>(vertexBuffer->data);
+				const auto readPosition = [&](std::uint32_t index) {
+					const auto* vertex = base +
+						static_cast<std::size_t>(index) * stride;
+					if (fullPrecision) {
+						float components[3]{};
+						std::memcpy(components, vertex, sizeof(components));
+						return RE::NiPoint3{
+							components[0], components[1], components[2]
+						};
+					}
+					std::uint16_t components[3]{};
+					std::memcpy(components, vertex, sizeof(components));
+					return RE::NiPoint3{
+						DecodeHalfFloat(components[0]),
+						DecodeHalfFloat(components[1]),
+						DecodeHalfFloat(components[2])
+					};
+				};
+				const auto inside = [&](const RE::NiPoint3& position) {
+					const RE::NiPoint3 toCenter = position - centerLocal;
+					if (toCenter.x * toCenter.x + toCenter.y * toCenter.y +
+							toCenter.z * toCenter.z >
+						radiusLocal * radiusLocal) {
+						return false;
+					}
+					if (occlusionSettings->frontOnly) {
+						const RE::NiPoint3 fromPlane =
+							position - planePointLocal;
+						if (fromPlane.x * normalLocal.x +
+								fromPlane.y * normalLocal.y +
+								fromPlane.z * normalLocal.z <=
+							0.0F) {
+							return false;
+						}
+					}
+					return true;
+				};
+
+				const auto* sourceIndices =
+					static_cast<const std::uint16_t*>(indexBuffer->data);
+				std::vector<std::uint16_t> indices(
+					sourceIndices, sourceIndices + indexCount);
+				std::uint32_t culled = 0U;
+				for (std::uint32_t triangle = 0U;
+					 triangle < shape->numTriangles;
+					 ++triangle) {
+					const std::uint32_t at = triangle * 3U;
+					const std::uint16_t i0 = indices[at];
+					const std::uint16_t i1 = indices[at + 1U];
+					const std::uint16_t i2 = indices[at + 2U];
+					if (i0 >= shape->numVertices ||
+						i1 >= shape->numVertices ||
+						i2 >= shape->numVertices) {
+						continue;
+					}
+					if (inside(readPosition(i0)) &&
+						inside(readPosition(i1)) &&
+						inside(readPosition(i2))) {
+						indices[at + 1U] = i0;
+						indices[at + 2U] = i0;
+						++culled;
+					}
+				}
+
+				if (culled > 0U) {
+					entries.push_back(Hook::D3D::OcclusionEntry{
+						reinterpret_cast<std::uintptr_t>(indexBuffer->buffer),
+						indexBuffer->dataOffset,
+						indexCount,
+						std::move(indices),
+						culled });
+				}
+				return;
+			}
+			if (auto* node = object->IsNode()) {
+				for (const auto& child : node->children) {
+					walk(child.get());
+				}
+			}
+		};
+	walk(scopeAiming);
+
+	ImGuiImpl::PublishOcclusionShapes(shapeNames);
+	logger::info(
+		"[occlusion] rebuilt: {} shape(s) considered, {} substituted, "
+		"radius={:.2f} frontOnly={} excludes={}",
+		consideredShapes,
+		entries.size(),
+		occlusionSettings->sphereRadius,
+		occlusionSettings->frontOnly,
+		occlusionSettings->excludedShapes.size());
+	Hook::D3D::PublishScopeOcclusion(std::move(entries));
 }
 
 void HandleScopeNode()
@@ -3420,6 +4442,15 @@ void HookedUpdate()
 		// Reload/reselection requests likewise execute here so profile
 		// mutation, instance rebinding, and BGSZoomData restoration never run
 		// from the D3D callback.
+		// Queued API work, drained on the game thread exactly like the editor
+		// requests beside it. Callers may be on any thread; nothing they queue
+		// touches an engine object until here.
+		MagnaScopeAPI::DrainCommands();
+		// Rebuild what the API getters serve, on this thread, so an external
+		// caller never walks live engine state from its own.
+		MagnaScopeAPI::RefreshSnapshots(
+			static_cast<int>(ReticlesForSelectedScope().size()));
+
 		const auto profileRequest = ImGuiImpl::ConsumeProfileAction();
 		if (profileRequest != ImGuiImpl::ProfileRequest::kNone) {
 			if (profileRequest == ImGuiImpl::ProfileRequest::kReload &&
@@ -3427,6 +4458,12 @@ void HookedUpdate()
 				(!currentData->autoProfile ||
 					std::filesystem::exists(currentData->path))) {
 				sdh->ReloadScopeProfile(currentData);
+			}
+			if (profileRequest ==
+				ImGuiImpl::ProfileRequest::kRescanReticles) {
+				RediscoverReticles();
+				ImGuiImpl::PublishDiscoveredReticles(
+					ReticlesForSelectedScope());
 			}
 			if (profileRequest ==
 					ImGuiImpl::ProfileRequest::kDeletePreset &&
@@ -3467,6 +4504,90 @@ void HookedUpdate()
 		if (currentData) {
 			const bool editing =
 				hookIns->bEnableEditMode.load(std::memory_order_acquire);
+
+			// The variant resolver is the second producer on the live-overlay
+			// channel; the editor is the first. It publishes here, after profile
+			// selection has already run this tick, because it stamps the current
+			// selection revision onto the snapshot and a snapshot carrying a
+			// stale revision is dropped by the consumer below -- which for the
+			// resolver would mean one frame of base-profile values at the wrong
+			// magnification, a visible flash on a 1x-to-8x variant set.
+			//
+			// While the editor is open it owns the channel: the resolver still
+			// advances its eases (so a magnification step in progress does not
+			// freeze) but does not publish over the unsaved edits.
+			// Drain input regardless of edit mode.
+			//
+			// This used to sit inside the !editing branch below, which meant
+			// that with the editor open -- exactly when someone has just
+			// finished setting variants up and wants to try them -- every
+			// queued notch accumulated and was never applied. The wheel looked
+			// completely dead, and the accumulated deltas then fired all at once
+			// on closing the editor.
+			//
+			// Draining here also keeps the queue from growing without bound
+			// during a long edit session.
+			//
+			// PollOpticsKey maintains the optics-key held/tap state from the
+			// physical key (GetAsyncKeyState): version-independent, no
+			// DIK/VK ambiguity; see the function for the full history. It also
+			// handles the menu-open case (clears the held flag) so a key
+			// held across a menu can't leave the wheel stuck on the sight.
+			/* PollOpticsKey() disabled: optics key is on the AddInputEvent callback (single-path, re-enabled per request). Resync below still clears held flags while a menu is open. */
+			if (F4SEMenuFramework::IsAnyBlockingWindowOpened()) {
+				opticsKeyHeld.store(false, std::memory_order_relaxed);
+				opticsKeyConsumedByScroll.store(false, std::memory_order_relaxed);
+			}
+			ApplyPendingSightInput();
+			// After input has moved the sight selection: swap or restore the
+			// instance's zoom pointer to match, and fire the configured graph
+			// events on a change. No-op on every tick nothing changed.
+			if (!savingInProgress) {
+				ReconcileSightZoomPointer();
+			}
+			// Also fire the experiment events on every ADS ENTRY (rising edge),
+			// so a candidate event name can be tested by simply re-aiming:
+			// edit the INI (re-read on every firing), aim, observe. Firing on
+			// entry costs nothing when the list is empty.
+			{
+				static bool wasInADS = false;
+				const bool inADS = player && IsInADS(player);
+				if (inADS && !wasInADS) {
+					FireSightSwapGraphEvents();
+				}
+				wasInADS = inADS;
+			}
+
+			if (!editing) {
+				static auto lastResolveTime =
+					std::chrono::steady_clock::now();
+				const auto resolveNow = std::chrono::steady_clock::now();
+				const float deltaSeconds = std::clamp(
+					std::chrono::duration<float>(
+						resolveNow - lastResolveTime)
+						.count(),
+					0.0F,
+					0.25F);
+				lastResolveTime = resolveNow;
+
+				auto& sessionState =
+					MagnaScope::SessionStateFor(*currentData);
+				ImGuiImpl::EditorPreviewSnapshot resolved;
+				if (MagnaScope::ResolveOverlay(
+						*currentData,
+						sessionState,
+						deltaSeconds,
+						zoomSelectionRevision,
+						resolved)) {
+					ImGuiImpl::PublishEditorPreview(resolved);
+				}
+				// The editor needs to know which variant to point its sliders
+				// at. Published rather than read from the session map, which
+				// only this thread may touch.
+				ImGuiImpl::PublishActiveVariantIndex(
+					MagnaScope::ActiveVariantIndex(*currentData, sessionState));
+			}
+
 			const auto editorPreview =
 				ImGuiImpl::GetEditorPreviewSnapshot();
 			// Live editor values reach the shader only through this preview,
@@ -3494,10 +4615,83 @@ void HookedUpdate()
 						zoomSelectionRevision);
 				}
 			}
-			if (editing &&
-				editorPreview.active &&
+			// Both producers land here. The editor's snapshot and the resolver's
+			// go through the same struct, the same Clamp(), and the same
+			// revision gate, so there is exactly one path from a value to the
+			// shader whether it came from a slider or from a variant.
+			if (editorPreview.active &&
 				editorPreview.selectionRevision == zoomSelectionRevision) {
-				ApplySelectedEditorPreview(editorPreview.zoomOverride);
+				// Between kPreSaveGame and kPostSaveGame MagnaScope's values are
+				// deliberately out of the zoom form so they are not serialised.
+				// Writing them back inside that window would put them straight
+				// into the save, which is the whole thing
+				// DetachIsolatedZoomForSave exists to prevent.
+				if (!savingInProgress) {
+					ApplySelectedEditorPreview(editorPreview.zoomOverride);
+				}
+				Hook::D3D::scopeApertureActivationScale.store(
+					std::clamp(
+						editorPreview.apertureActivationScale, 0.0F, 1.0F),
+					std::memory_order_release);
+				sightShiftOffset[0] = editorPreview.sightShiftX;
+				sightShiftOffset[1] = editorPreview.sightShiftY;
+				sightShiftOffset[2] = editorPreview.sightShiftZ;
+				// Negative means "not pinned", which restores the free-scroll
+				// bounds. Only a live variant set pins it.
+				const float pinnedStore =
+					(!editing && currentData->variants.enabled &&
+						!currentData->variants.variants.empty()) ?
+						std::clamp(editorPreview.magnification, 1.0F, 15.0F) :
+						-1.0F;
+				Hook::D3D::scopeVariantPinnedZoom.store(
+					pinnedStore,
+					std::memory_order_release);
+				// Probe: log only when the stored pin changes, so the log shows
+				// the exact tick the consumer handed a new magnification to the
+				// render side. If [variant] delta lines appear but this never
+				// moves, the resolver/publish leg is the stall; if this moves
+				// and the screen does not, the stall is render-side.
+				{
+					static float lastLoggedPin = -999.0F;
+					if (std::abs(pinnedStore - lastLoggedPin) > 0.01F) {
+						lastLoggedPin = pinnedStore;
+						logger::info(
+							"[variant] consumer stored pinned={:.2f} "
+							"(previewMag={:.2f}, editing={})",
+							pinnedStore,
+							editorPreview.magnification,
+							editing);
+					}
+				}
+				Hook::D3D::scopeCustomReticleIndex.store(
+					editorPreview.customReticleIndex,
+					std::memory_order_release);
+				{
+					// Resolve the index to a path here, on the game thread, and
+					// hand the render thread a string rather than an index into
+					// a list it cannot see. The load itself happens in
+					// UpdateScene, which is the only place a device call is
+					// safe.
+					const auto& reticles = ReticlesForSelectedScope();
+					const int reticleIndex = editorPreview.customReticleIndex;
+					std::string reticlePath;
+					if (reticleIndex >= 0 &&
+						static_cast<std::size_t>(reticleIndex) < reticles.size() &&
+						currentData) {
+						const auto directory = currentData->ReticleDirectory();
+						if (!directory.empty()) {
+							reticlePath =
+								(std::filesystem::path(directory) /
+									reticles[static_cast<std::size_t>(
+										reticleIndex)])
+									.string();
+						}
+					}
+					hookIns->RequestCustomReticleTexture(reticlePath);
+				}
+				Hook::D3D::scopeCustomReticleScale.store(
+					std::clamp(editorPreview.customReticleScale, 0.05F, 8.0F),
+					std::memory_order_release);
 				Hook::D3D::scopeFadeMagnification.store(
 					std::clamp(
 						editorPreview.magnification,
@@ -3618,6 +4812,9 @@ void HookedUpdate()
 					ApplySelectedZoomOverride(currentData);
 					editorPreviewApplied = false;
 				}
+				sightShiftOffset[0] = 0.0F;
+				sightShiftOffset[1] = 0.0F;
+				sightShiftOffset[2] = 0.0F;
 				Hook::D3D::scopeFadeMagnification.store(
 					std::clamp(
 						currentData->shaderData.minZoom,
@@ -3903,6 +5100,15 @@ void HookedUpdate()
 				Hook::HangDiag::updatePhase.store(
 					1,
 					std::memory_order_relaxed);
+				// NOTE deliberately absent: no first-person weapon shift here.
+				// Shifting the weapon subtree mid-frame to emulate a live
+				// cameraOffset change tore the scope render apart in game --
+				// skinned arms, the capture fingerprints, and the optical
+				// projections all disagreed about the pose. A sight swap
+				// writes the form's zoom data instead and the engine applies
+				// it on the next aim-in. The engine-cooperative alternative is
+				// MSF's UpdateAnimGraph refresh, which needs its 1.10.163
+				// address (absent from the partial MSF source drop).
 				const auto aperture = FindSTSAperture(firstPersonRoot);
 				Hook::HangDiag::updatePhase.store(
 					2,
@@ -3946,6 +5152,9 @@ void HookedUpdate()
 						nullptr,
 					aperture.reticleSurfaces,
 					aperture.extentReference);
+				// Hash-gated: a no-op every frame the sphere settings, the
+				// selection, and the scope-active state are unchanged.
+				UpdateScopeOcclusion(firstPersonRoot, scopeNode);
 				scopeProjectionPoint = aperture.worldCenter;
 				previousScopeProjectionPoint =
 					aperture.previousWorldCenter;
@@ -4427,6 +5636,31 @@ void HookedUpdate()
 				editorPreviewApplied = false;
 			}
 			ImGuiImpl::ClearEditorPreview();
+			// These three are latched by the overlay consumer above, which only
+			// runs while a scope is selected. Without resetting them here, an
+			// unequip taken while a secondary sight was up would leave the
+			// aperture faded to zero permanently, and the next scope would be
+			// invisible with nothing in the log to say why. The reticle pair is
+			// reset for the same reason.
+			Hook::D3D::scopeApertureActivationScale.store(
+				1.0F,
+				std::memory_order_release);
+			Hook::D3D::scopeVariantPinnedZoom.store(
+				-1.0F,
+				std::memory_order_release);
+			Hook::D3D::scopeCustomReticleIndex.store(
+				-1,
+				std::memory_order_release);
+			hookIns->RequestCustomReticleTexture(std::string{});
+			// Drop every occlusion substitution with the scope. A holed
+			// housing must never survive onto the hip weapon or the next
+			// scope; publishing empty is the fail-open state.
+			UpdateScopeOcclusion(nullptr, nullptr);
+			// A sight shift must not survive either -- it moves the
+			// first-person weapon every frame it is nonzero.
+			sightShiftOffset[0] = 0.0F;
+			sightShiftOffset[1] = 0.0F;
+			sightShiftOffset[2] = 0.0F;
 			Hook::D3D::scopeFadeMagnification.store(
 				1.0F,
 				std::memory_order_release);
@@ -4726,6 +5960,8 @@ void InitializePlugin()
 	hookIns->QueryChangeReticleTexture();
 	sdh->ReadCustomScopeDataFiles(customPath);
 	sdh->ReadDefaultScopeDataFile();
+	// One directory walk, here, rather than one per weapon swap.
+	RediscoverReticles();
 }
 
 void ResetScopeStatus()
@@ -4848,6 +6084,11 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 		logger::warn("succ.");
 	}
 
+	// Scope selections live in the co-save so they fork with the save. A
+	// failure here is not fatal: the plugin runs, selections just do not
+	// persist, and RegisterCoSave has already said so in the log.
+	(void)MagnaScope::RegisterCoSave();
+
 	const F4SE::MessagingInterface* message = F4SE::GetMessagingInterface();
 	if (!message) {
 		logger::critical("Messaging interface is unavailable");
@@ -4859,6 +6100,45 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 			}
 			if (msg->type == F4SE::MessagingInterface::kPostLoad) {
 				ImGuiImpl::RegisterMenu();
+				// Broadcast the plugin interface. kPostLoad is the point every
+				// other F4SE plugin has loaded and registered its listener, so
+				// this reaches consumers regardless of load order.
+				// Three-way split of optics input, by what actually works in
+				// game (confirmed via the [input] logs):
+				//   * BINDING lives in the framework's hotkey registry (DIK scan
+				//     codes, persisted in PluginHotkeys.ini, conflict warnings,
+				//     rebind UI). Its press-only callback is intentionally empty.
+				//   * The WHEEL is detected by the AddInputEvent callback below,
+				//     which (v3.4+) does deliver MOUSE events reliably.
+				//   * The KEY is polled (PollOpticsKey). The framework
+				//     callback historically delivered no keyboard (mouse-only
+				//     PlayerControls receiver) and now does (PlayerCamera full-queue
+				//     fix), but the poll is kept: version-free, no DIK/VK ambiguity.
+				// The InputEvent handle is leaked for process lifetime.
+				F4SEMenuFramework::Hotkeys::Register(
+					kOpticsHotkeyId,
+					kOpticsHotkeyDefault,
+					[]() {
+						// Registration only; PollOpticsKey does the tap/hold
+						// semantics.
+					});
+				static F4SEMenuFramework::Model::InputEvent* opticsInput =
+					F4SEMenuFramework::AddInputEvent(MagnaScopeInputCallback);  /* Re-enabled per request: the callback is the input path (wheel + key). Keep registered -- do not disable again unless explicitly told. The framework added an [InputQueueHook] diagnostic to localise why this callback was not dispatching. */
+				(void)opticsInput;
+				logger::info(
+					"Registered optics hotkey '{}' with F4SE Menu Framework "
+					"(current binding scan code {})",
+					kOpticsHotkeyId,
+					F4SEMenuFramework::Hotkeys::GetBinding(kOpticsHotkeyId));
+
+				if (const auto* messaging = F4SE::GetMessagingInterface()) {
+					messaging->Dispatch(
+						MagnaScopeAPI::kInterfaceMessage,
+						MagnaScopeAPI::GetInterface(),
+						sizeof(void*),
+						nullptr);
+					logger::info("Dispatched the MagnaScope plugin interface (v1)");
+				}
 			} else if (msg->type == F4SE::MessagingInterface::kGameDataReady) {
 				InitializePlugin();
 
@@ -4873,11 +6153,13 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 				lastAttachmentKey.clear();
 				hasScopeSelectionSnapshot = false;
 			} else if (msg->type == F4SE::MessagingInterface::kPreSaveGame) {
+				savingInProgress = true;
 				DetachIsolatedZoomForSave();
 			} else if (msg->type == F4SE::MessagingInterface::kNewGame) {
 				ResetScopeStatus();
 			} else if (msg->type == F4SE::MessagingInterface::kPostSaveGame) {
 				ReattachIsolatedZoomAfterSave();
+				savingInProgress = false;
 			} else if (msg->type == F4SE::MessagingInterface::kGameLoaded) {
 				//reshadeImpl->SetRenderEffect(false);
 			}

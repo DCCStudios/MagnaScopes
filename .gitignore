@@ -29,5 +29,14 @@
 
 /tests/**/bin/
 /tests/**/obj/
+/tests/**/build/
+/tests/**/.xmake/
+/src/.xmake/
+
+# Conversion test inputs/outputs: extracted third-party weapon-mod meshes,
+# materials, and textures plus the converted candidates built from them.
+# Same policy as /_reference/ -- comparison-only binary trees stay out of
+# history. The loose reference NIFs directly under meshes/ remain tracked.
+/tests/NifInspector/meshes/Conversion/
 
 __pycache__/
