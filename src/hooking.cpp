@@ -797,6 +797,14 @@ namespace
 		Microsoft::WRL::ComPtr<ID3D11Buffer> buffer;
 	};
 	std::vector<BuiltOcclusionEntry> occlusionBuilt;
+
+	// Occlusion-sphere gizmo handoff: the game thread publishes fade-local
+	// vertices, the in-scene draw consumes them. Same crossing discipline as
+	// the occlusion entries above; the generation lets the render thread
+	// re-upload the dynamic vertex buffer only when the payload changed.
+	std::mutex occlusionSphereGeoMutex;
+	Hook::D3D::OcclusionSphereGeo occlusionSphereGeoPending;
+	std::uint64_t occlusionSphereGeoGeneration = 0U;
 }
 // Retained so Present can compare what we hooked against what is in the vtable
 // now. An upscaler proxy or another integration replacing the entry after us
@@ -2290,6 +2298,8 @@ namespace Hook
 			result.center.z <= 0.001F) {
 			return result;
 		}
+		result.sourceWidth = static_cast<float>(windowWidth);
+		result.sourceHeight = static_cast<float>(windowHeight);
 
 		const float aspect =
 			static_cast<float>(windowWidth) / static_cast<float>(windowHeight);
@@ -4968,25 +4978,105 @@ namespace Hook
 			}
 		}
 
-		const std::vector<VSConstantBufferSlot> noVertexConstants;
-		UINT stride = sizeof(::Vertex);
-		UINT offset = 0U;
+		// The composite rasterizes the REPLAYED ScopeFade geometry -- the same
+		// captured draw the scene magnification stands on -- with the fill
+		// geometry shader bound, so ReticleLayer_PS receives the identical
+		// noperspective lens coordinate the scene's exit-pupil mask evaluates
+		// in. It used to be a fullscreen triangle whose shader rebuilt a frame
+		// from the published centre and basis; the magnify shader's own
+		// commentary forbids exactly that (the basis foreshortens as the optic
+		// turns and the rebuilt disc collapses into a slit), and the slit was
+		// observed in game eating the reticle's edges during look-around while
+		// the scene behind stayed lit. A side effect is that the reticle now
+		// crops at the fade geometry's rim -- which is where the sight picture
+		// itself ends, so the two boundaries coincide by construction.
+		//
+		// The geometry comes from the AUTOMATIC replay bundle
+		// (mAutomaticSTSScopeFadeReplay), not the legacy fingerprint capture
+		// (targetVS and friends): the automatic dispatch path returns before
+		// the legacy fingerprint block ever runs, so standing on targetVS
+		// left this composite with empty state on automatic profiles -- and a
+		// composite that bails after the capture has already diverted the
+		// authored draw erases the reticle outright.
+		ComPtr<ID3D11VertexShader> fadeVertexShader;
+		ComPtr<ID3D11InputLayout> fadeInputLayout;
+		ComPtr<ID3D11Buffer> fadeVertexBuffer;
+		ComPtr<ID3D11Buffer> fadeIndexBuffer;
+		ComPtr<ID3D11Buffer> fadeVertexConstants[3];
+		UINT fadeVertexStride = 0U;
+		UINT fadeVertexOffset = 0U;
+		UINT fadeIndexOffset = 0U;
+		DXGI_FORMAT fadeIndexFormat = DXGI_FORMAT_UNKNOWN;
+		D3D11_PRIMITIVE_TOPOLOGY fadeTopology =
+			D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+		UINT fadeIndexCount = 0U;
+		UINT fadeStartIndexLocation = 0U;
+		INT fadeBaseVertexLocation = 0;
+		{
+			// Copy the bundle under its own lock and draw after releasing it:
+			// this function already holds the reticle-layer mutex, and holding
+			// two mutexes across a draw invites an ordering deadlock.
+			HangDiag::TrackedGeometryLock geometryLock(
+				mScopeFadeGeometryMutex, 6);
+			const auto& fade = mAutomaticSTSScopeFadeReplay;
+			// Deliberately NOT gated on fade.ready: the scene replay consumes
+			// that flag when it draws, and this composite runs after it in
+			// the same frame. The generation match is the same-frame
+			// guarantee.
+			if (fade.generation == 0U ||
+				fade.generation !=
+					automaticSTSReplayFrameGeneration.load(
+						std::memory_order_acquire) ||
+				!fade.vertexShader.Get() || !fade.inputLayout.Get() ||
+				!fade.vertexBuffer.Get() || !fade.indexBuffer.Get() ||
+				fade.indexCount == 0U) {
+				return false;
+			}
+			fadeVertexShader = fade.vertexShader;
+			fadeInputLayout = fade.inputLayout;
+			fadeVertexBuffer = fade.vertexBuffer;
+			fadeIndexBuffer = fade.indexBuffer;
+			fadeVertexConstants[0] = fade.vertexConstantBuffers[0];
+			fadeVertexConstants[1] = fade.vertexConstantBuffers[1];
+			fadeVertexConstants[2] = fade.vertexConstantBuffers[2];
+			fadeVertexStride = fade.vertexStride;
+			fadeVertexOffset = fade.vertexOffset;
+			fadeIndexOffset = fade.indexOffset;
+			fadeIndexFormat = fade.indexFormat;
+			fadeTopology = fade.topology;
+			fadeIndexCount = fade.indexCount;
+			fadeStartIndexLocation = fade.startIndexLocation;
+			fadeBaseVertexLocation = fade.baseVertexLocation;
+		}
+		if (!m_pGeometryShader_STSGeometryFill.Get()) {
+			return false;
+		}
+		ID3D11Buffer* fadeConstant0 = fadeVertexConstants[0].Get();
+		ID3D11Buffer* fadeConstant1 = fadeVertexConstants[1].Get();
+		ID3D11Buffer* fadeConstant2 = fadeVertexConstants[2].Get();
+		const std::vector<VSConstantBufferSlot> capturedConstants = {
+			{ 1, 1, &fadeConstant0 },
+			{ 2, 1, &fadeConstant1 },
+			{ 12, 1, &fadeConstant2 }
+		};
+		ID3D11Buffer* fadeVertexBufferRaw = fadeVertexBuffer.Get();
 		SetupCommonRenderState(
-			m_pVertexShader_Legacy.Get(),
+			fadeVertexShader.Get(),
 			nullptr,
 			0U,
 			m_pPixelShader_STSReticleLayer.Get(),
-			gdc_pVertexLayout,
+			fadeInputLayout.Get(),
 			mAutomaticSTSReticleLayerCompositeBlend.Get(),
-			noVertexConstants,
-			gdc_pIndexBuffer,
-			DXGI_FORMAT_R32_UINT,
-			0U,
-			&gdc_pVertexBuffer,
-			&stride,
-			&offset,
+			capturedConstants,
+			fadeIndexBuffer.Get(),
+			fadeIndexFormat,
+			fadeIndexOffset,
+			&fadeVertexBufferRaw,
+			&fadeVertexStride,
+			&fadeVertexOffset,
 			1U,
 			compositeTarget);
+		g_Context->IASetPrimitiveTopology(fadeTopology);
 
 		ID3D11ShaderResourceView* layerSources[2]{
 			mAutomaticSTSReticleLayerSRV.Get(),
@@ -5012,9 +5102,19 @@ namespace Hook
 		if (scopeEffectBuffer) {
 			g_Context->PSSetConstantBuffers(5U, 1U, &scopeEffectBuffer);
 		}
+		// The fill GS derives every wedge's lens coordinate from the primitive
+		// id plus the measured inner-ring ratio in b4, exactly as it does for
+		// the scene draw.
+		g_Context->GSSetShader(
+			m_pGeometryShader_STSGeometryFill.Get(), nullptr, 0U);
+		g_Context->GSSetConstantBuffers(4U, 1U, &resolutionBuffer);
 		bSelfDraw = true;
-		g_Context->DrawIndexed(3U, 0U, 0);
+		g_Context->DrawIndexed(
+			fadeIndexCount,
+			fadeStartIndexLocation,
+			fadeBaseVertexLocation);
 		bSelfDraw = false;
+		g_Context->GSSetShader(nullptr, nullptr, 0U);
 		ID3D11ShaderResourceView* nullSources[2]{ nullptr, nullptr };
 		g_Context->PSSetShaderResources(4U, 2U, nullSources);
 		mAutomaticSTSReticleLayerReady = false;
@@ -5368,6 +5468,19 @@ namespace Hook
 		++occlusionGeneration;
 	}
 
+	void D3D::PublishOcclusionSphereGeo(OcclusionSphereGeo geo)
+	{
+		std::scoped_lock lock(occlusionSphereGeoMutex);
+		occlusionSphereGeoPending = std::move(geo);
+		++occlusionSphereGeoGeneration;
+	}
+
+	void D3D::GetRenderViewportSize(int& width, int& height) const
+	{
+		width = windowWidth;
+		height = windowHeight;
+	}
+
 	void D3D::LoadCustomReticleTexture(const std::string& path)
 	{
 		mCustomReticleSRV.Reset();
@@ -5672,6 +5785,206 @@ namespace Hook
 
 		g_Context->OMSetRenderTargets(2, tempRt, tempSV);
 	}
+
+	void D3D::DrawOcclusionSphereInScene(ID3D11DeviceContext* context)
+	{
+		if (!context) {
+			return;
+		}
+		bool active = false;
+		float color[4]{};
+		{
+			std::scoped_lock lock(occlusionSphereGeoMutex);
+			const auto& geo = occlusionSphereGeoPending;
+			active = geo.active && geo.vertexCount > 0U &&
+				geo.fadeLocalVertices.size() ==
+					static_cast<std::size_t>(geo.vertexCount) * 20U;
+			if (active) {
+				std::memcpy(color, geo.color, sizeof(color));
+			}
+		}
+		if (!active) {
+			return;
+		}
+
+		// The sphere mesh capacity, fixed by the topology the game thread's
+		// vertex table and this side's index buffer both replicate.
+		constexpr UINT kStacks = 16U;
+		constexpr UINT kSlices = 24U;
+		constexpr UINT kVertexCapacity = (kStacks + 1U) * (kSlices + 1U);
+		constexpr UINT kVertexStride = 20U;
+
+		// Lazy one-time creation: the gizmo is an editor aid and must never
+		// gate InitEffect. A failed creation stays failed for the session
+		// rather than retrying every frame.
+		if (!mOcclusionSphereIndexBuffer.Get() ||
+			!m_pPixelShader_OcclusionSphereFlat.Get() ||
+			!mOcclusionSphereVertexBuffer.Get()) {
+			static bool creationAttempted = false;
+			if (creationAttempted) {
+				return;
+			}
+			creationAttempted = true;
+
+			ComPtr<ID3DBlob> blob;
+			if (FAILED(CreateShaderFromFile(
+					L"Data\\Shaders\\MagnaScope\\OcclusionSphereFlat_PS.cso",
+					L"src\\HLSL\\OcclusionSphereFlat_PS.hlsl",
+					"main", "ps_5_0", blob.ReleaseAndGetAddressOf())) ||
+				!blob.Get() ||
+				FAILED(g_Device->CreatePixelShader(
+					blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+					m_pPixelShader_OcclusionSphereFlat.GetAddressOf()))) {
+				logger::warn("Occlusion sphere gizmo flat PS failed to load");
+				return;
+			}
+
+			std::vector<std::uint16_t> indices;
+			indices.reserve(kStacks * kSlices * 6U);
+			for (UINT stack = 0U; stack < kStacks; ++stack) {
+				for (UINT slice = 0U; slice < kSlices; ++slice) {
+					const auto a = static_cast<std::uint16_t>(
+						stack * (kSlices + 1U) + slice);
+					const auto b = static_cast<std::uint16_t>(a + kSlices + 1U);
+					indices.insert(indices.end(), {
+						a, b, static_cast<std::uint16_t>(a + 1U),
+						static_cast<std::uint16_t>(a + 1U), b,
+						static_cast<std::uint16_t>(b + 1U) });
+				}
+			}
+			CreateIndexBuffer(
+				g_Device.Get(),
+				mOcclusionSphereIndexBuffer.ReleaseAndGetAddressOf(),
+				indices.data(),
+				static_cast<UINT>(indices.size()));
+			mOcclusionSphereIndexCount = static_cast<UINT>(indices.size());
+
+			D3D11_BUFFER_DESC vertexDescription{};
+			vertexDescription.Usage = D3D11_USAGE_DYNAMIC;
+			vertexDescription.ByteWidth = kVertexCapacity * kVertexStride;
+			vertexDescription.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+			vertexDescription.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+			if (FAILED(g_Device->CreateBuffer(
+					&vertexDescription, nullptr,
+					mOcclusionSphereVertexBuffer.ReleaseAndGetAddressOf()))) {
+				logger::warn("Occlusion sphere gizmo vertex buffer failed");
+				return;
+			}
+			CreateConstantBuffer(
+				g_Device.Get(),
+				mOcclusionSphereConstantBuffer.ReleaseAndGetAddressOf(),
+				sizeof(float) * 4U);
+			mOcclusionSphereUploadedGeneration = 0U;
+			logger::info(
+				"Occlusion sphere gizmo resources created (game-pipeline "
+				"in-scene variant)");
+		}
+		if (!mOcclusionSphereVertexBuffer.Get() ||
+			mOcclusionSphereIndexCount == 0U) {
+			return;
+		}
+
+		// Refill the dynamic vertex buffer only when the published payload
+		// changed; sway does not change it, because the sphere and the fade
+		// node ride the same rig and the payload is fade-LOCAL.
+		{
+			std::scoped_lock lock(occlusionSphereGeoMutex);
+			const auto& geo = occlusionSphereGeoPending;
+			if (occlusionSphereGeoGeneration !=
+					mOcclusionSphereUploadedGeneration &&
+				geo.vertexCount == kVertexCapacity) {
+				D3D11_MAPPED_SUBRESOURCE mapped{};
+				if (SUCCEEDED(context->Map(
+						mOcclusionSphereVertexBuffer.Get(), 0U,
+						D3D11_MAP_WRITE_DISCARD, 0U, &mapped))) {
+					std::memcpy(
+						mapped.pData,
+						geo.fadeLocalVertices.data(),
+						geo.fadeLocalVertices.size());
+					context->Unmap(mOcclusionSphereVertexBuffer.Get(), 0U);
+					mOcclusionSphereUploadedGeneration =
+						occlusionSphereGeoGeneration;
+					logger::info(
+						"[sphere-gizmo] fade-local vertices uploaded "
+						"(generation {})",
+						occlusionSphereGeoGeneration);
+				}
+			}
+		}
+		if (mOcclusionSphereUploadedGeneration == 0U) {
+			return;
+		}
+
+		struct ColorConstants
+		{
+			float color[4];
+		} constants{};
+		std::memcpy(constants.color, color, sizeof(constants.color));
+		UpdateConstantBuffer(mOcclusionSphereConstantBuffer, constants);
+
+		if (!mOcclusionSphereWireRasterizer.Get()) {
+			D3D11_RASTERIZER_DESC wireDescription{};
+			wireDescription.FillMode = D3D11_FILL_WIREFRAME;
+			wireDescription.CullMode = D3D11_CULL_NONE;
+			wireDescription.DepthClipEnable = TRUE;
+			wireDescription.ScissorEnable = FALSE;
+			g_Device->CreateRasterizerState(
+				&wireDescription,
+				mOcclusionSphereWireRasterizer.GetAddressOf());
+		}
+		static ComPtr<ID3D11RasterizerState> solidRasterizer;
+		if (!solidRasterizer.Get()) {
+			D3D11_RASTERIZER_DESC solidDescription{};
+			solidDescription.FillMode = D3D11_FILL_SOLID;
+			solidDescription.CullMode = D3D11_CULL_NONE;
+			solidDescription.DepthClipEnable = TRUE;
+			solidDescription.ScissorEnable = FALSE;
+			g_Device->CreateRasterizerState(
+				&solidDescription,
+				solidRasterizer.GetAddressOf());
+		}
+		if (!solidRasterizer.Get()) {
+			return;
+		}
+
+		// Inherit EVERYTHING the fade draw just configured -- vertex shader,
+		// input layout, vertex-stage constants, depth state, depth view,
+		// viewport -- and swap only what the gizmo owns: its buffers, its
+		// flat pixel shader, alpha blending, and two-sided rasterization.
+		// The game's own transform then produces clip position and depth,
+		// so the housing occludes the sphere exactly as it occludes the
+		// scene. ScopedContextState returns every touched binding.
+		ScopedContextState restoreScene(context);
+		ID3D11Buffer* vertexBuffer = mOcclusionSphereVertexBuffer.Get();
+		UINT stride = kVertexStride;
+		UINT offset = 0U;
+		context->IASetVertexBuffers(0U, 1U, &vertexBuffer, &stride, &offset);
+		context->IASetIndexBuffer(
+			mOcclusionSphereIndexBuffer.Get(), DXGI_FORMAT_R16_UINT, 0U);
+		context->IASetPrimitiveTopology(
+			D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		context->PSSetShader(
+			m_pPixelShader_OcclusionSphereFlat.Get(), nullptr, 0U);
+		context->PSSetConstantBuffers(
+			0U, 1U, mOcclusionSphereConstantBuffer.GetAddressOf());
+		context->OMSetBlendState(BSTransparent.Get(), nullptr, 0xFFFFFFFFU);
+		context->RSSetState(solidRasterizer.Get());
+		bSelfDraw = true;
+		context->DrawIndexed(mOcclusionSphereIndexCount, 0U, 0);
+		bSelfDraw = false;
+
+		// Second pass: wireframe, brighter, so the volume reads from inside
+		// and out and the triangle grid marks it as real geometry.
+		if (mOcclusionSphereWireRasterizer.Get()) {
+			constants.color[3] = std::min(1.0F, constants.color[3] * 1.6F);
+			UpdateConstantBuffer(mOcclusionSphereConstantBuffer, constants);
+			context->RSSetState(mOcclusionSphereWireRasterizer.Get());
+			bSelfDraw = true;
+			context->DrawIndexed(mOcclusionSphereIndexCount, 0U, 0);
+			bSelfDraw = false;
+		}
+	}
+
 
 	// 完整的公共渲染状态设置
 	void D3D::SetupCommonRenderState(
@@ -6205,10 +6518,19 @@ namespace Hook
 		// in-sphere triangles are degenerate -- and everything else about the
 		// draw is untouched. Identity is (buffer pointer, pooled byte offset,
 		// index count), recorded from the same rendererData the game binds
-		// from; StartIndexLocation must be zero because the holed buffer
-		// replicates exactly the entry's range. No match means no
-		// substitution, so the fail-open path is the default path.
-		if (!occlusionBuilt.empty() && StartIndexLocation == 0U &&
+		// from.
+		//
+		// The pooled byte offset can arrive in EITHER encoding: baked into the
+		// IASetIndexBuffer offset with StartIndexLocation zero, or as a
+		// StartIndexLocation against a zero bind offset. The synthesized-
+		// aperture placement matcher below accepts both for exactly this
+		// reason, and it is in-game proven; the first cut of this matcher
+		// demanded the bind-offset encoding alone, which silently skipped
+		// every draw the engine issued the other way -- in game that read as
+		// the sphere culling almost nothing. The holed buffer replicates the
+		// entry's exact range, so the substituted draw always starts at zero.
+		// No match means no substitution: fail-open is the default path.
+		if (!occlusionBuilt.empty() &&
 			pContext->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE) {
 			Microsoft::WRL::ComPtr<ID3D11Buffer> currentIndexBuffer;
 			DXGI_FORMAT currentFormat = DXGI_FORMAT_UNKNOWN;
@@ -6220,10 +6542,19 @@ namespace Hook
 			if (currentIndexBuffer && currentFormat == DXGI_FORMAT_R16_UINT) {
 				const auto identity =
 					reinterpret_cast<std::uintptr_t>(currentIndexBuffer.Get());
+				const std::uint64_t effectiveOffset =
+					static_cast<std::uint64_t>(currentOffset) +
+					static_cast<std::uint64_t>(StartIndexLocation) *
+						sizeof(std::uint16_t);
+				// One comparison covers both encodings: with StartIndexLocation
+				// zero the effective offset IS the bind offset. Comparing the
+				// bind offset alone as an alternative would wrongly substitute
+				// a subrange draw (bind offset at the shape's start, nonzero
+				// StartIndexLocation into it) with the full holed range.
 				for (const auto& built : occlusionBuilt) {
 					if (built.sourceIndexBuffer == identity &&
-						built.sourceIndexOffset == currentOffset &&
-						built.indexCount == IndexCount) {
+						built.indexCount == IndexCount &&
+						built.sourceIndexOffset == effectiveOffset) {
 						pContext->IASetIndexBuffer(
 							built.buffer.Get(), DXGI_FORMAT_R16_UINT, 0U);
 						original(pContext, IndexCount, 0U, BaseVertexLocation);
@@ -6583,6 +6914,12 @@ namespace Hook
 				}
 
 				if (exactGeometryMatch && exactSuballocationMatch) {
+					// Editor gizmo first, while the scene is still real: the
+					// game's depth buffer holds the housing's depth and the
+					// first-person viewport is bound, so the sphere is
+					// occluded by the scope mesh like any other object --
+					// which no post-frame overlay can reproduce.
+					D3DInstance->DrawOcclusionSphereInScene(pContext);
 					const bool magnificationStage =
 						verification.AllowsGeometryMagnification();
 					// The retired pre-first-person world snapshot used to gate
@@ -7923,6 +8260,9 @@ namespace Hook
 						targetVertexConstBufferOutPut &&
 						targetIndexCount > 0;
 				}
+				// (The occlusion-sphere gizmo used to draw here, over the
+				// finished composite. It now draws IN-SCENE at the matched
+				// ScopeFade draw so the housing depth-occludes it.)
 				// A failed automatic STS call remains eligible for a later verified
 				// frame anchor.
 				renderPassHandledThisFrame =

@@ -17,6 +17,7 @@ public static class BatchCommand
         string? materialsRoot = null;
         string? reticleTexture = null;
         string? reticlePreset = null;
+        var keepReticleMaterial = false;
         var inputs = new List<string>();
 
         for (var i = 0; i < args.Length; ++i)
@@ -45,6 +46,7 @@ public static class BatchCommand
                         : throw new StsConversionException(
                             "--reticle-preset needs a value.");
                     break;
+                case "--keep-reticle-material": keepReticleMaterial = true; break;
                 case "--force": force = true; break;
                 case "--overwrite": overwrite = true; break;
                 case "--recurse": recurse = true; break;
@@ -135,6 +137,7 @@ public static class BatchCommand
                     MaterialsRoot = materialsRoot,
                     ReticleTexture = reticleTexture,
                     ReticlePreset = reticlePreset,
+                    KeepReticleMaterial = keepReticleMaterial,
                 });
 
                 if (outcome.Passed)

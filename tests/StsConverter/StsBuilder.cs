@@ -1,6 +1,8 @@
 using System.Numerics;
 using NiflySharp;
+using NiflySharp.Bitfields;
 using NiflySharp.Blocks;
+using NiflySharp.Enums;
 using NiflySharp.Interfaces;
 using NiflySharp.Structs;
 
@@ -18,7 +20,11 @@ public sealed class ConvertOptions
     public string ScopeNormalName { get; init; } = "ScopeNormal";
     public string ScopeAimingName { get; init; } = "ScopeAiming";
     public string ScopeViewPartsName { get; init; } = "ScopeViewParts";
-    public string ReticleHolderName { get; init; } = "Adjustments";
+    // "ReticleNode" is what all 122 reticle-bearing meshes in the shipped STS
+    // corpus parent Reticle:0/Dot:0 under; "Adjustments" came from a
+    // third-party STS-style weapon pack and appears nowhere in 3dscopes' own
+    // files.
+    public string ReticleHolderName { get; init; } = "ReticleNode";
     public string FadeName { get; init; } = "ScopeFade:0";
     public string ReticleName { get; init; } = "Reticle:0";
     public string DotName { get; init; } = "Dot:0";
@@ -233,7 +239,8 @@ public static class StsBuilder
         var scopeNormalIndex = AddNode(nif, options.ScopeNormalName, 0x0000000E);
         var scopeAimingIndex = AddNode(nif, options.ScopeAimingName, 0x0000000F);
         var viewPartsIndex = AddNode(nif, options.ScopeViewPartsName, 0x0000000E);
-        var holderIndex = AddNode(nif, options.ReticleHolderName, 0x0008000E);
+        // 0xE, like every ReticleNode in the shipped corpus (123/123).
+        var holderIndex = AddNode(nif, options.ReticleHolderName, 0x0000000E);
 
         fixedLocal[scopeNormalIndex] = Transform.Identity;
         fixedLocal[scopeAimingIndex] = Transform.Identity;
@@ -332,6 +339,26 @@ public static class StsBuilder
         if (dotIndex >= 0 && nif.Blocks[dotIndex] is BSTriShape dotShapeFlags)
         {
             dotShapeFlags.Flags_ui = 0x0000000E;
+        }
+
+        // Whenever the reticle's material is repointed (preset or custom
+        // route), its render state must be repointed with it. The source mod's
+        // shader property was authored against the source mod's own material;
+        // surveyed against the 127 STS trees in the shipped corpus, one test
+        // mesh arrived with baseColor=(0.93,0.37,0.37,0.77) -- a translucent
+        // red -- where every shipped reticle is black, which is a red quad in
+        // game the moment the original material stops driving the shader.
+        // Keep-material conversions render with their own material and are
+        // left untouched.
+        if (!options.KeepReticleMaterial)
+        {
+            NormalizeReticleRenderState(nif, reticleIndex, isDot: false);
+            if (dotIndex >= 0)
+                NormalizeReticleRenderState(nif, dotIndex, isDot: true);
+            notes.Add(
+                "Reticle/dot shader render state normalised to the shipped STS " +
+                "corpus convention (flags1=0xA0000000, black reticle / red dot " +
+                "base colour, corpus falloffs, alpha 0x12ED/48 and 0x10ED/32).");
         }
         holderChildren.Add(reticleIndex);
 
@@ -469,6 +496,70 @@ public static class StsBuilder
             "these files because they contain block types it cannot parse " +
             "(BSConnectPoint::Children), so this is a targeted move rather " +
             "than a full sort.");
+    }
+
+    /// <summary>
+    /// Rewrites a repointed reticle or dot's effect shader and alpha property
+    /// to the shipped STS corpus convention. The values are unanimous (or
+    /// near-unanimous) across the 122 reticles and 127 dots surveyed in
+    /// 3dscopes' own meshes: a source mod's shader was tuned for the material
+    /// being replaced, and inheriting it is how a converted reticle ends up as
+    /// a translucent red quad instead of a black crosshair.
+    /// </summary>
+    private static void NormalizeReticleRenderState(
+        NifFile nif, int shapeIndex, bool isDot)
+    {
+        if (nif.Blocks[shapeIndex] is not BSTriShape shape)
+            return;
+
+        var shaderRef = shape.ShaderPropertyRef?.Index ?? -1;
+        if (shaderRef >= 0 &&
+            nif.Blocks[shaderRef] is BSEffectShaderProperty shader)
+        {
+            // 0xA0000000: ZBuffer_Test | External_Emittance. The reticle also
+            // writes depth (flags2 bit 0); the dot does not.
+            shader.ShaderFlags_F4SPF1 =
+                Fallout4ShaderPropertyFlags1.ZBuffer_Test |
+                Fallout4ShaderPropertyFlags1.External_Emittance;
+            shader.ShaderFlags_F4SPF2 = isDot
+                ? default
+                : (Fallout4ShaderPropertyFlags2)0x00000001;
+            BlockReflection.SetField(
+                shader,
+                "_baseColor",
+                isDot
+                    ? new Color4(1.0f, 0.012f, 0.0f, 1.0f)
+                    : new Color4(0.0f, 0.0f, 0.0f, 1.0f));
+            BlockReflection.SetField(shader, "_baseColorScale", 1.0f);
+            BlockReflection.SetField(shader, "_lightingInfluence", (byte)127);
+            BlockReflection.SetField(shader, "_textureClampMode", (byte)3);
+            BlockReflection.SetField(shader, "_softFalloffDepth", 100.0f);
+            BlockReflection.SetField(
+                shader, "_falloffStartAngle", isDot ? 1.0f : 0.99651f);
+            BlockReflection.SetField(
+                shader, "_falloffStopAngle", isDot ? 0.9905f : 0.99649f);
+            BlockReflection.SetField(shader, "_falloffStartOpacity", 1.0f);
+            BlockReflection.SetField(shader, "_falloffStopOpacity", 0.0f);
+        }
+
+        var alphaFlags = (ushort)(isDot ? 0x10ED : 0x12ED);
+        var threshold = (byte)(isDot ? 32 : 48);
+        var alphaRef = shape.AlphaPropertyRef?.Index ?? -1;
+        if (alphaRef >= 0 && nif.Blocks[alphaRef] is NiAlphaProperty alpha)
+        {
+            alpha.Flags = new AlphaFlags(alphaFlags);
+            alpha.Threshold = threshold;
+        }
+        else
+        {
+            var created = new NiAlphaProperty
+            {
+                Flags = new AlphaFlags(alphaFlags),
+                Threshold = threshold,
+            };
+            shape.AlphaPropertyRef =
+                new NiBlockRef<NiAlphaProperty>(nif.AddBlock(created));
+        }
     }
 
     private static bool ShouldHide(NifTree tree, int index, ConvertOptions options)

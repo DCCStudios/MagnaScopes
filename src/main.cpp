@@ -4089,6 +4089,108 @@ std::uint64_t occlusionInputHash = 0U;
 	return false;
 }
 
+// IEEE binary16 encode, round toward zero. The occlusion-sphere gizmo
+// vertices span tens of units, where a half ULP is far below a pixel;
+// denormals flush to signed zero.
+[[nodiscard]] std::uint16_t FloatToHalfBits(float value)
+{
+	std::uint32_t bits = 0U;
+	std::memcpy(&bits, &value, sizeof(bits));
+	const std::uint32_t sign = (bits >> 16U) & 0x8000U;
+	const std::uint32_t mantissa = bits & 0x007FFFFFU;
+	const std::int32_t exponent =
+		static_cast<std::int32_t>((bits >> 23U) & 0xFFU) - 127 + 15;
+	if (exponent >= 31) {
+		return static_cast<std::uint16_t>(sign | 0x7C00U);
+	}
+	if (exponent <= 0) {
+		return static_cast<std::uint16_t>(sign);
+	}
+	return static_cast<std::uint16_t>(
+		sign | (static_cast<std::uint32_t>(exponent) << 10U) |
+		(mantissa >> 13U));
+}
+
+// Unit-sphere direction table for the gizmo, in exactly the topology the
+// render side's index buffer expects (16 stacks x 24 slices, +Z pole
+// first). The two sides must never drift apart.
+[[nodiscard]] const std::vector<RE::NiPoint3>& OcclusionSphereUnitTable()
+{
+	static std::vector<RE::NiPoint3> table = [] {
+		constexpr std::uint32_t stacks = 16U;
+		constexpr std::uint32_t slices = 24U;
+		std::vector<RE::NiPoint3> directions;
+		directions.reserve((stacks + 1U) * (slices + 1U));
+		for (std::uint32_t stack = 0U; stack <= stacks; ++stack) {
+			const float phi = 3.14159265F *
+				static_cast<float>(stack) / stacks;
+			for (std::uint32_t slice = 0U; slice <= slices; ++slice) {
+				const float theta = 6.2831853F *
+					static_cast<float>(slice) / slices;
+				directions.push_back(RE::NiPoint3{
+					std::sin(phi) * std::cos(theta),
+					std::sin(phi) * std::sin(theta),
+					std::cos(phi) });
+			}
+		}
+		return directions;
+	}();
+	return table;
+}
+
+// Closest point on triangle ABC to P (Ericson, Real-Time Collision
+// Detection 5.1.5). Drives the sphere cull: a low-poly housing has
+// triangles far larger than the sphere, and the original all-three-
+// vertices-inside rule let such a triangle pass straight through the
+// volume untouched -- in game that read as the sphere hiding almost
+// nothing no matter where it was placed.
+[[nodiscard]] RE::NiPoint3 ClosestPointOnTriangle(
+	const RE::NiPoint3& p,
+	const RE::NiPoint3& a,
+	const RE::NiPoint3& b,
+	const RE::NiPoint3& c)
+{
+	const RE::NiPoint3 ab = b - a;
+	const RE::NiPoint3 ac = c - a;
+	const RE::NiPoint3 ap = p - a;
+	const float d1 = ab.Dot(ap);
+	const float d2 = ac.Dot(ap);
+	if (d1 <= 0.0F && d2 <= 0.0F) {
+		return a;
+	}
+	const RE::NiPoint3 bp = p - b;
+	const float d3 = ab.Dot(bp);
+	const float d4 = ac.Dot(bp);
+	if (d3 >= 0.0F && d4 <= d3) {
+		return b;
+	}
+	const float vc = d1 * d4 - d3 * d2;
+	if (vc <= 0.0F && d1 >= 0.0F && d3 <= 0.0F) {
+		return a + ab * (d1 / (d1 - d3));
+	}
+	const RE::NiPoint3 cp = p - c;
+	const float d5 = ab.Dot(cp);
+	const float d6 = ac.Dot(cp);
+	if (d6 >= 0.0F && d5 <= d6) {
+		return c;
+	}
+	const float vb = d5 * d2 - d1 * d6;
+	if (vb <= 0.0F && d2 >= 0.0F && d6 <= 0.0F) {
+		return a + ac * (d2 / (d2 - d6));
+	}
+	const float va = d3 * d6 - d5 * d4;
+	if (va <= 0.0F && (d4 - d3) >= 0.0F && (d5 - d6) >= 0.0F) {
+		return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+	}
+	const float denom = va + vb + vc;
+	if (std::abs(denom) < 1e-12F) {
+		return a;
+	}
+	const float v = vb / denom;
+	const float w = vc / denom;
+	return a + ab * v + ac * w;
+}
+
 void UpdateScopeOcclusion(RE::NiAVObject* firstPersonRoot, RE::NiAVObject* glassNode)
 {
 	// Editor preview wins while the editor is open, so the sphere can be
@@ -4106,8 +4208,23 @@ void UpdateScopeOcclusion(RE::NiAVObject* firstPersonRoot, RE::NiAVObject* glass
 	auto* scopeAiming = firstPersonRoot ?
 		FindObjectByPrefixNoCase(firstPersonRoot, "ScopeAiming") :
 		nullptr;
+	// The sphere is tuned against the primary optic's eye line; from a
+	// canted or top-mounted secondary sight the same volume cuts visible
+	// housing. Suspension covers the blend too, so holes never pop while
+	// the eye is still travelling. This flag feeds the input hash below,
+	// which is what makes selecting a sight rebuild (to empty) and
+	// selecting the optic rebuild the holes again.
+	bool secondarySightActive = false;
+	if (currentData) {
+		const auto& sightState = MagnaScope::SessionStateFor(*currentData);
+		secondarySightActive = sightState.secondaryIndex >= 0 ||
+			sightState.sightBlend > 0.0001F;
+	}
 	const bool wanted =
-		occlusionSettings && occlusionSettings->enabled && bEnableScope &&
+		occlusionSettings && occlusionSettings->enabled &&
+		!(occlusionSettings->disableOnSecondarySight &&
+			secondarySightActive) &&
+		bEnableScope &&
 		glassNode && scopeAiming && currentData && currentData->autoProfile;
 
 	static const ScopeData::OcclusionSettings disabledSettings{};
@@ -4267,24 +4384,37 @@ void UpdateScopeOcclusion(RE::NiAVObject* firstPersonRoot, RE::NiAVObject* glass
 						DecodeHalfFloat(components[2])
 					};
 				};
-				const auto inside = [&](const RE::NiPoint3& position) {
-					const RE::NiPoint3 toCenter = position - centerLocal;
-					if (toCenter.x * toCenter.x + toCenter.y * toCenter.y +
-							toCenter.z * toCenter.z >
-						radiusLocal * radiusLocal) {
+				// The sphere culls any triangle it TOUCHES (closest-point
+				// distance), not only triangles wholly inside: housing
+				// triangles are routinely larger than the sphere, and the
+				// wholly-inside rule let them pass straight through the volume
+				// uncut. The front-plane gate stays per-vertex and strict --
+				// every vertex must sit on the objective side -- so a triangle
+				// spanning the glass plane can never cut into the eyepiece
+				// side.
+				const auto frontSide = [&](const RE::NiPoint3& position) {
+					if (!occlusionSettings->frontOnly) {
+						return true;
+					}
+					const RE::NiPoint3 fromPlane = position - planePointLocal;
+					return fromPlane.x * normalLocal.x +
+							fromPlane.y * normalLocal.y +
+							fromPlane.z * normalLocal.z >
+						0.0F;
+				};
+				const auto triangleCulled = [&](
+											 const RE::NiPoint3& p0,
+											 const RE::NiPoint3& p1,
+											 const RE::NiPoint3& p2) {
+					if (!frontSide(p0) || !frontSide(p1) || !frontSide(p2)) {
 						return false;
 					}
-					if (occlusionSettings->frontOnly) {
-						const RE::NiPoint3 fromPlane =
-							position - planePointLocal;
-						if (fromPlane.x * normalLocal.x +
-								fromPlane.y * normalLocal.y +
-								fromPlane.z * normalLocal.z <=
-							0.0F) {
-							return false;
-						}
-					}
-					return true;
+					const RE::NiPoint3 closest =
+						ClosestPointOnTriangle(centerLocal, p0, p1, p2);
+					const RE::NiPoint3 toCenter = closest - centerLocal;
+					return toCenter.x * toCenter.x + toCenter.y * toCenter.y +
+							toCenter.z * toCenter.z <=
+						radiusLocal * radiusLocal;
 				};
 
 				const auto* sourceIndices =
@@ -4304,9 +4434,10 @@ void UpdateScopeOcclusion(RE::NiAVObject* firstPersonRoot, RE::NiAVObject* glass
 						i2 >= shape->numVertices) {
 						continue;
 					}
-					if (inside(readPosition(i0)) &&
-						inside(readPosition(i1)) &&
-						inside(readPosition(i2))) {
+					if (triangleCulled(
+							readPosition(i0),
+							readPosition(i1),
+							readPosition(i2))) {
 						indices[at + 1U] = i0;
 						indices[at + 2U] = i0;
 						++culled;
@@ -5377,6 +5508,106 @@ void HookedUpdate()
 						scopeProjectionPoint,
 						firstPersonFov);
 				}
+				// Editor gizmo: the occlusion sphere's vertices, expressed in
+				// the fade mesh's LOCAL space and encoded in the game's own
+				// 20-byte vertex format. The render thread draws them through
+				// the game's live ScopeFade pipeline, so clip position and
+				// depth come from the exact shader and constants that placed
+				// the housing -- correctness inherited, not reconstructed.
+				// Fade-local coordinates are sway-invariant (the sphere and
+				// the fade node ride one rig), so the payload only changes
+				// when the sliders move, and equality is the republish gate.
+				{
+					static RE::NiPoint3 lastCenterLocal{};
+					static float lastRadiusLocal = -1.0F;
+					static bool lastActive = false;
+					ScopeData::OcclusionSettings occlusionPreview;
+					const bool sphereWanted =
+						hookIns->bEnableEditMode.load(
+							std::memory_order_acquire) &&
+						ImGuiImpl::OcclusionSphereGeoWanted() &&
+						ImGuiImpl::GetOcclusionPreview(occlusionPreview);
+					if (sphereWanted) {
+						const auto& glassWorld = scopeNode->world;
+						const float glassScale =
+							glassWorld.scale > 1e-6F ? glassWorld.scale : 1.0F;
+						const RE::NiPoint3 offsetLocal{
+							occlusionPreview.sphereOffset[0],
+							occlusionPreview.sphereOffset[1],
+							occlusionPreview.sphereOffset[2]
+						};
+						const RE::NiPoint3 sphereWorld =
+							glassWorld.translate +
+							glassWorld.rotate.Transpose() * offsetLocal;
+						const RE::NiPoint3 centerLocal =
+							(glassWorld.rotate *
+								(sphereWorld - glassWorld.translate)) *
+							(1.0F / glassScale);
+						const float radiusLocal =
+							occlusionPreview.sphereRadius / glassScale;
+						// The periodic force heals desyncs the detector cannot
+						// see, e.g. the no-scope reset publishing inactive while
+						// these statics still say "published".
+						static std::uint32_t republishTick = 0U;
+						const bool changed = !lastActive ||
+							(++republishTick % 120U == 0U) ||
+							std::abs(centerLocal.x - lastCenterLocal.x) > 1e-4F ||
+							std::abs(centerLocal.y - lastCenterLocal.y) > 1e-4F ||
+							std::abs(centerLocal.z - lastCenterLocal.z) > 1e-4F ||
+							std::abs(radiusLocal - lastRadiusLocal) > 1e-4F;
+						if (changed) {
+							const auto& unitTable = OcclusionSphereUnitTable();
+							Hook::D3D::OcclusionSphereGeo sphereGeo{};
+							sphereGeo.vertexCount =
+								static_cast<std::uint32_t>(unitTable.size());
+							sphereGeo.fadeLocalVertices.assign(
+								static_cast<std::size_t>(sphereGeo.vertexCount) *
+									20U,
+								0U);
+							std::uint8_t* cursor =
+								sphereGeo.fadeLocalVertices.data();
+							for (const auto& direction : unitTable) {
+								const std::uint16_t encoded[4] = {
+									FloatToHalfBits(
+										centerLocal.x +
+										direction.x * radiusLocal),
+									FloatToHalfBits(
+										centerLocal.y +
+										direction.y * radiusLocal),
+									FloatToHalfBits(
+										centerLocal.z +
+										direction.z * radiusLocal),
+									FloatToHalfBits(1.0F)
+								};
+								std::memcpy(cursor, encoded, sizeof(encoded));
+								cursor += 20U;
+							}
+							sphereGeo.color[0] = 1.0F;
+							sphereGeo.color[1] = 0.3F;
+							sphereGeo.color[2] = 0.25F;
+							sphereGeo.color[3] = 0.35F;
+							sphereGeo.active = true;
+							Hook::D3D::PublishOcclusionSphereGeo(
+								std::move(sphereGeo));
+							logger::info(
+								"[sphere-gizmo] published fade-local sphere: "
+								"center=({:.2f}, {:.2f}, {:.2f}) radius={:.2f} "
+								"(glass scale {:.3f})",
+								centerLocal.x,
+								centerLocal.y,
+								centerLocal.z,
+								radiusLocal,
+								glassScale);
+							lastCenterLocal = centerLocal;
+							lastRadiusLocal = radiusLocal;
+							lastActive = true;
+						}
+					} else if (lastActive) {
+						lastActive = false;
+						lastRadiusLocal = -1.0F;
+						Hook::D3D::PublishOcclusionSphereGeo({});
+					}
+				}
 				// Player position is public CommonLibF4 state. The inherited
 				// implementation followed two unverified Havok offsets
 				// (+0x470 and +0x40) merely to estimate translation delta.
@@ -5724,6 +5955,7 @@ void HookedUpdate()
 			// housing must never survive onto the hip weapon or the next
 			// scope; publishing empty is the fail-open state.
 			UpdateScopeOcclusion(nullptr, nullptr);
+			Hook::D3D::PublishOcclusionSphereGeo({});
 			// A sight shift must not survive either -- it moves the
 			// first-person weapon every frame it is nonzero.
 			sightShiftOffset[0] = 0.0F;

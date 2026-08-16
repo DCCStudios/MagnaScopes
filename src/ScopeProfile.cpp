@@ -305,7 +305,8 @@ namespace ScopeData
 			 ++index) {
 			o.sphereOffset[index] = offset[index];
 		}
-		o.frontOnly = j.value("FrontOnly", true);
+		o.frontOnly = j.value("FrontOnly", false);
+		o.disableOnSecondarySight = j.value("DisableOnSecondarySight", true);
 		o.flipFront = j.value("FlipFront", false);
 		o.excludedShapes =
 			j.value("ExcludedShapes", std::vector<std::string>());
@@ -485,6 +486,7 @@ namespace ScopeData
 				std::vector<float>{
 					o.sphereOffset[0], o.sphereOffset[1], o.sphereOffset[2] } },
 			{ "FrontOnly", o.frontOnly },
+			{ "DisableOnSecondarySight", o.disableOnSecondarySight },
 			{ "FlipFront", o.flipFront },
 			{ "ExcludedShapes", o.excludedShapes }
 		};

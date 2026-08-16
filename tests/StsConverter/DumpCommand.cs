@@ -219,10 +219,14 @@ public static class DumpCommand
                 $"{indent}  envMaskTexture=\"" +
                 $"{BlockReflection.GetNiString4(effect, "_envMaskTexture")}\"");
             Console.WriteLine(
-                $"{indent}  flags1={effect.ShaderFlags_F4SPF1} " +
-                $"flags2={effect.ShaderFlags_F4SPF2}");
+                $"{indent}  flags1=0x{Convert.ToUInt32(effect.ShaderFlags_F4SPF1):X8} " +
+                $"flags2=0x{Convert.ToUInt32(effect.ShaderFlags_F4SPF2):X8}");
+            var baseColor = BlockReflection.GetField(effect, "_baseColor");
+            var colorText = baseColor is NiflySharp.Structs.Color4 rgba
+                ? $"({rgba.R:F3},{rgba.G:F3},{rgba.B:F3},{rgba.A:F3})"
+                : baseColor?.ToString();
             Console.WriteLine(
-                $"{indent}  baseColor={BlockReflection.GetField(effect, "_baseColor")} " +
+                $"{indent}  baseColor={colorText} " +
                 $"baseColorScale={BlockReflection.GetField(effect, "_baseColorScale")} " +
                 $"lightingInfluence={BlockReflection.GetField(effect, "_lightingInfluence")} " +
                 $"textureClampMode={BlockReflection.GetField(effect, "_textureClampMode")} " +
@@ -236,8 +240,8 @@ public static class DumpCommand
         {
             Console.WriteLine(
                 $"{indent}  shaderType={lighting.ShaderType_SK_FO4} " +
-                $"flags1={lighting.ShaderFlags_F4SPF1} " +
-                $"flags2={lighting.ShaderFlags_F4SPF2}");
+                $"flags1=0x{Convert.ToUInt32(lighting.ShaderFlags_F4SPF1):X8} " +
+                $"flags2=0x{Convert.ToUInt32(lighting.ShaderFlags_F4SPF2):X8}");
             var textureSetRef = BlockReflection.GetField(lighting, "_textureSet");
             Console.WriteLine($"{indent}  textureSetRef={textureSetRef}");
         }
@@ -249,8 +253,13 @@ public static class DumpCommand
             return;
         if (nif.Blocks[index] is not NiAlphaProperty alpha)
             return;
+        // AlphaFlags is a bitfield struct; its default ToString is the type
+        // name, which is how the alpha flags -- the difference between a
+        // blended reticle and an opaque square -- went unprinted for a while.
+        var rawFlags = alpha.Flags.GetType()
+            .GetProperty("Value")?.GetValue(alpha.Flags) ?? alpha.Flags;
         Console.WriteLine(
-            $"{indent}alpha[{index}] flags=0x{alpha.Flags:X4} " +
+            $"{indent}alpha[{index}] flags=0x{Convert.ToUInt32(rawFlags):X4} " +
             $"threshold={alpha.Threshold}");
     }
 

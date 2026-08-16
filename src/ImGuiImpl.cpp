@@ -206,6 +206,13 @@ namespace ImGuiImpl
 		return occlusionShapeNames;
 	}
 
+	bool OcclusionSphereGeoWanted()
+	{
+		const auto* instance = ImGuiImplClass::GetSington();
+		return instance &&
+			instance->occlusionShowSphere_UI.load(std::memory_order_acquire);
+	}
+
 	std::atomic<int> activeVariantIndex{ -1 };
 
 	// --- Optics-key rebind capture -------------------------------------
@@ -1167,6 +1174,19 @@ namespace ImGuiImpl
 				"%.2f");
 			Tip("Moves the sphere centre away from the glass centre, in the "
 				"glass's own axes: X right, Y along the optical axis, Z up.");
+			bool showSphere =
+				occlusionShowSphere_UI.load(std::memory_order_relaxed);
+			if (ImGui::Checkbox("Show Sphere Overlay", &showSphere)) {
+				// Session-only draw aid, so deliberately NOT part of
+				// `changed`: it publishes no occlusion preview and is never
+				// saved into the profile.
+				occlusionShowSphere_UI.store(
+					showSphere, std::memory_order_relaxed);
+			}
+			Tip("Draws the cull sphere as a translucent ball of real "
+				"geometry in the scene while the editor is open, so you can "
+				"see exactly where the volume sits as you move it. Shown "
+				"while aiming through the scope. Not saved with the profile.");
 			changed |= ImGui::Checkbox(
 				"Front Of Glass Only", &occlusion_UI.frontOnly);
 			Tip("Restricts culling to the objective side of the glass plane, "
@@ -1178,6 +1198,13 @@ namespace ImGuiImpl
 				Tip("Swap which side counts as 'front' for meshes whose "
 					"authored glass normal points backwards.");
 			}
+			changed |= ImGui::Checkbox(
+				"Disable On Secondary Sight",
+				&occlusion_UI.disableOnSecondarySight);
+			Tip("Suspend the cull while a secondary sight is selected. The "
+				"sphere is tuned against the primary optic's eye line, and "
+				"from a canted or top-mounted sight the same sphere can cut "
+				"visible housing. On by default.");
 
 			const auto shapes = GetOcclusionShapes();
 			if (!shapes.empty() &&
@@ -2793,10 +2820,11 @@ namespace ImGuiImpl
 
 		void __stdcall RenderScopeHudOverlays()
 		{
-			// Two independent overlays behind one registration. The alignment
+			// Independent overlays behind one registration. The alignment
 			// crosshair is a user-facing tool on its own toggle; the probe
 			// below is a development diagnostic gated by the INI. Neither may
-			// gate the other.
+			// gate the other. (The occlusion sphere is real geometry drawn at
+			// the composite anchor in hooking.cpp, not an overlay here.)
 			DrawSightAlignmentCrosshair();
 
 			const auto& settings = MagnaScope::GetSettings();

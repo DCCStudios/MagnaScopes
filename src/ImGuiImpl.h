@@ -367,6 +367,12 @@ namespace ImGuiImpl
 	void PublishOcclusionShapes(const std::vector<std::string>& names);
 	[[nodiscard]] std::vector<std::string> GetOcclusionShapes();
 
+	// True while the editor's Show Sphere checkbox is on. The sphere itself
+	// is real translucent geometry drawn at the composite anchor
+	// (Hook::D3D::DrawOcclusionSphereGeo); the game thread reads this to
+	// decide whether to publish the matrices each tick.
+	[[nodiscard]] bool OcclusionSphereGeoWanted();
+
 	bool RegisterMenu();
 	void __stdcall RenderMenu();
 	void __stdcall RenderPopout();
@@ -510,6 +516,12 @@ namespace ImGuiImpl
 		// One-shot: the section publishes the loaded values on its first
 		// render so the preview channel never serves a stale profile.
 		bool occlusionPreviewPublished_UI = false;
+		// Draws the cull sphere's outline over the game while tuning it.
+		// Session-only editor aid, deliberately not part of ScopeProfile; both
+		// the checkbox and the overlay run on the framework's render thread.
+		// Atomic to match alignmentCrosshair_UI: the editor window and the HUD
+		// overlay are separate Menu Framework callbacks.
+		std::atomic_bool occlusionShowSphere_UI{ false };
 
 		// True once ResetUIData has copied the selected profile into the _UI
 		// members above. They have no constructor, so before that they hold

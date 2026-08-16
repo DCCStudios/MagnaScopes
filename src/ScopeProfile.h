@@ -271,10 +271,14 @@ namespace ScopeData
 		float sphereOffset[3] = { 0.0F, 0.0F, 0.0F };
 		// Restrict culling to triangles on the objective side of the glass
 		// plane, so the eyepiece side can never be cut into.
-		bool frontOnly = true;
+		bool frontOnly = false;
 		// Flip which side of the glass counts as "front" for NIFs whose
 		// authored plane normal points the other way.
 		bool flipFront = false;
+		// Suspend the cull while a secondary sight is selected (or blending).
+		// The sphere is tuned against the primary optic's eye line; from a
+		// canted or top-mounted sight the same sphere cuts visible housing.
+		bool disableOnSecondarySight = true;
 		// Shape names never culled. The reticle, dot, aperture, and ScopeFade
 		// surfaces are always protected regardless of this list.
 		std::vector<std::string> excludedShapes;

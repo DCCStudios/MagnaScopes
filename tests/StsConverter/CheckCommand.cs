@@ -103,14 +103,22 @@ public static class CheckCommand
             "ScopeViewParts",
             $"index={viewParts}, underScopeAiming={viewParts >= 0 && IsUnder(tree, viewParts, scopeAiming)}");
 
-        var holder = tree.FindByName("Adjustments");
+        // "ReticleNode" is the shipped-corpus holder name (122/122);
+        // "Adjustments" is accepted for conversions made before that survey.
+        var holder = tree.FindByName("ReticleNode");
+        if (holder < 0)
+            holder = tree.FindByName("Adjustments");
+        // The holder's POSITION among ScopeViewParts' children is free: the
+        // shipped corpus has ReticleNode first (49 files), last, and anywhere
+        // between. The STS docs' "reticle node last" is not a corpus invariant,
+        // so only membership is asserted.
         var viewChildren = viewParts >= 0 ? tree.Children(viewParts) : new List<int>();
         Assert(
-            holder >= 0 && viewChildren.Count > 0 && viewChildren[^1] == holder,
-            "reticle holder is LAST child of ScopeViewParts",
-            holder >= 0 && viewChildren.Count > 0
-                ? $"lastChild=[{viewChildren[^1]}] \"{tree.NameOf(viewChildren[^1])}\", holder=[{holder}]"
-                : "holder or ScopeViewParts children missing");
+            holder >= 0 && viewChildren.Contains(holder),
+            "reticle holder is a child of ScopeViewParts",
+            holder >= 0
+                ? $"holder=[{holder}] \"{tree.NameOf(holder)}\" listed={viewChildren.Contains(holder)}"
+                : "holder missing");
 
         // --- locate loader / reticle / dot --------------------------------
         var loader = tree.FindByName("TextureLoader:0");
@@ -173,15 +181,29 @@ public static class CheckCommand
                 $"0x{dotObject.Flags_ui:X8} (reference value 0x0000000E)");
         }
 
+        // --- 4b. repointed reticle/dot render state matches the corpus -----
+        // Surveyed across the 127 STS trees in 3dscopes' own meshes: reticle
+        // alpha 0x12ED/48, dot alpha 0x10ED/32, effect flags1 0xA0000000,
+        // reticle writes depth (flags2 bit 0) while the dot does not, reticle
+        // base colour black, dot base colour red. A repointed material stops
+        // driving the shader the way the source mod's material did, so these
+        // NIF-side fields become load-bearing; inheriting the source mod's
+        // values is how a reticle renders as a translucent red quad.
+        CheckRenderState(nif, tree, reticle, isDot: false, Assert);
+        CheckRenderState(nif, tree, dot, isDot: true, Assert);
+
         // --- 5. loader shader flags2 empty --------------------------------
         if (loader >= 0 && nif.Blocks[loader] is BSTriShape loaderShape &&
             loaderShape.HasShaderProperty &&
             nif.Blocks[loaderShape.ShaderPropertyRef.Index] is BSEffectShaderProperty loaderShader)
         {
+            // The shipped corpus splits 18 loaders with flags2=0 and 17 with
+            // ZBuffer_Write, so both are known-working; anything else is not.
+            var loaderFlags2 = Convert.ToUInt64(loaderShader.ShaderFlags_F4SPF2);
             Assert(
-                Convert.ToUInt64(loaderShader.ShaderFlags_F4SPF2) == 0UL,
+                loaderFlags2 == 0UL || loaderFlags2 == 1UL,
                 "loader shader flags2",
-                $"{loaderShader.ShaderFlags_F4SPF2} (reference value: none)");
+                $"0x{loaderFlags2:X8} (corpus values 0 or ZBuffer_Write)");
         }
 
         // --- 6. hip branch carries no reticle/dot -------------------------
@@ -284,6 +306,91 @@ public static class CheckCommand
         }
 
         return failures;
+    }
+
+    /// <summary>
+    /// Asserts the shipped-corpus render state on a reticle or dot whose
+    /// material has been repointed into <c>Materials\Scope\</c>. Shapes that
+    /// kept their original mod's material render with that material and are
+    /// deliberately not held to the corpus values.
+    /// </summary>
+    private static void CheckRenderState(
+        NifFile nif,
+        NifTree tree,
+        int shapeIndex,
+        bool isDot,
+        Action<bool, string, string> assert)
+    {
+        if (shapeIndex < 0 ||
+            nif.Blocks[shapeIndex] is not BSTriShape shape ||
+            !shape.HasShaderProperty ||
+            nif.Blocks[shape.ShaderPropertyRef.Index]
+                is not BSEffectShaderProperty shader)
+        {
+            return;
+        }
+
+        var material = (shader as NiObjectNET)?.Name?.String ?? "";
+        var repointed = material.StartsWith(
+            @"Materials\Scope\", StringComparison.OrdinalIgnoreCase);
+        if (!repointed)
+            return;
+
+        var role = isDot ? "dot" : "reticle";
+        var flags1 = Convert.ToUInt32(shader.ShaderFlags_F4SPF1);
+        var flags2 = Convert.ToUInt32(shader.ShaderFlags_F4SPF2);
+        assert(
+            flags1 == 0xA0000000u,
+            $"{role} effect flags1",
+            $"0x{flags1:X8} (corpus value 0xA0000000)");
+        assert(
+            flags2 == (isDot ? 0u : 1u),
+            $"{role} effect flags2",
+            $"0x{flags2:X8} (corpus value 0x{(isDot ? 0u : 1u):X8})");
+
+        var baseColor = BlockReflection.GetField(shader, "_baseColor");
+        var colorOk = false;
+        var colorText = baseColor?.ToString() ?? "<missing>";
+        if (baseColor is NiflySharp.Structs.Color4 rgba)
+        {
+            colorText = $"({rgba.R:F3},{rgba.G:F3},{rgba.B:F3},{rgba.A:F3})";
+            // Dot colours legitimately vary in the corpus (red 114, green 5,
+            // cyan 2) -- what is invariant is a fully saturated, fully opaque
+            // colour. The reticle is black and opaque in all 122. The failure
+            // mode being screened out is an inherited translucent tint.
+            colorOk = isDot
+                ? MathF.Max(rgba.R, MathF.Max(rgba.G, rgba.B)) > 0.9f &&
+                  MathF.Abs(rgba.A - 1.0f) < 1e-3f
+                : rgba.R < 1e-3f && rgba.G < 1e-3f && rgba.B < 1e-3f &&
+                  MathF.Abs(rgba.A - 1.0f) < 1e-3f;
+        }
+
+        assert(
+            colorOk,
+            $"{role} base colour",
+            $"{colorText} (corpus: {(isDot ? "saturated, opaque" : "black, opaque")})");
+
+        var expectedFlags = isDot ? 0x10EDu : 0x12EDu;
+        var expectedThreshold = isDot ? (byte)32 : (byte)48;
+        if (shape.HasAlphaProperty &&
+            nif.Blocks[shape.AlphaPropertyRef.Index] is NiAlphaProperty alpha)
+        {
+            var raw = Convert.ToUInt32(
+                alpha.Flags.GetType().GetProperty("Value")
+                    ?.GetValue(alpha.Flags) ?? 0u);
+            assert(
+                raw == expectedFlags && alpha.Threshold == expectedThreshold,
+                $"{role} alpha property",
+                $"flags=0x{raw:X4} threshold={alpha.Threshold} " +
+                $"(corpus 0x{expectedFlags:X4}/{expectedThreshold})");
+        }
+        else
+        {
+            assert(
+                false,
+                $"{role} alpha property",
+                "missing (corpus: always present on repointed reticles/dots)");
+        }
     }
 
     private static bool IsUnder(NifTree tree, int index, int ancestor)

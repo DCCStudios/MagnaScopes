@@ -83,7 +83,22 @@ ReticleCompositeOutput SampleAuthoredReticle(float2 uv)
     return output;
 }
 
-ReticleCompositeOutput main(VertexPosHTex input)
+// Rasterized on the replayed ScopeFade geometry -- the same draw the scene
+// magnification runs on -- so the exit-pupil mask can be evaluated in the
+// coordinate the geometry shader publishes on the ScopeFade vertices
+// themselves. The magnify shader's commentary forbids substituting a frame
+// rebuilt from the published centre and basis: that basis foreshortens as
+// the optic turns, the rebuilt disc collapses into a slit, and the slit
+// eats the reticle's edges while the scene behind stays lit -- which was
+// exactly the reported symptom. Matching the scene means standing on the
+// same geometry and the same interpolated coordinate.
+struct ScopeGeometryPixel
+{
+    float4 posH : SV_Position;
+    noperspective float3 lensProjective : TEXCOORD0;
+};
+
+ReticleCompositeOutput main(ScopeGeometryPixel input)
 {
     const float2 pixelSize = PixelSize;
     const float2 outputPixel = input.posH.xy;
@@ -118,7 +133,7 @@ ReticleCompositeOutput main(VertexPosHTex input)
             empty.destinationTransmittance = float4(1.0f, 1.0f, 1.0f, 1.0f);
             return empty;
         }
-        return SampleAuthoredReticle(input.tex);
+        return SampleAuthoredReticle(input.posH.xy * pixelSize);
     }
     // The physical ScopeFade center is published independently from the
     // authored reticle pivot. Reconstructing it from a reticle offset and a
@@ -249,8 +264,18 @@ ReticleCompositeOutput main(VertexPosHTex input)
     // reticle keeps its own independent Reticle Offset, so this is applied only
     // to the shadow coordinate: the reticle must pass behind the same crescent
     // the scene shows, without being dragged off its own alignment.
+    // The ScopeFade geometry's own lens coordinate, recovered exactly as
+    // the magnify shader recovers it: the noperspective homogeneous XY
+    // divided by the interpolated reciprocal clip W. Circular by
+    // construction, exact under perspective, identical at every pixel to
+    // the frame the scene's mask uses.
+    const float reciprocalClipW = input.lensProjective.z;
+    const float safeReciprocalClipW =
+        abs(reciprocalClipW) > 0.000001f ? reciprocalClipW : 1.0f;
+    const float2 normalizedLensPosition =
+        input.lensProjective.xy / safeReciprocalClipW;
     const float2 shadowLensCoordinates =
-        (outputPixel - lensCenterPixel) / shadowRadius -
+        normalizedLensPosition -
         float2(SCOPE_LENS_OFFSET_X, SCOPE_LENS_OFFSET_Y);
     // Published travel is already normalized in aperture radii, so in that same
     // isotropic frame it needs no conversion at all.

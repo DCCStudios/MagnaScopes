@@ -406,6 +406,12 @@ namespace Hook
 			RE::NiPoint3 center{};
 			float radiusX = 0.0F;
 			float radiusY = 0.0F;
+			// The render viewport the pixel coordinates above are measured in.
+			// Overlays draw in the DISPLAYED viewport, which differs under an
+			// upscaler or frame-generation proxy; carrying the source size lets
+			// the consumer rescale instead of guessing.
+			float sourceWidth = 0.0F;
+			float sourceHeight = 0.0F;
 			bool valid = false;
 		};
 
@@ -580,6 +586,38 @@ namespace Hook
 		// with nothing published every draw passes through untouched, so
 		// clearing is the fail-open path.
 		static void PublishScopeOcclusion(std::vector<OcclusionEntry> entries);
+
+		// Editor gizmo: the occlusion sphere as a real translucent mesh drawn
+		// INTO THE SCENE at the matched ScopeFade draw -- through the game's
+		// OWN vertex pipeline. The game thread expresses the sphere's
+		// vertices in the ScopeFade mesh's local space and encodes them in
+		// the game's 20-byte vertex format; the render thread swaps only the
+		// vertex/index buffers, pixel shader, blend, and cull state on the
+		// already-configured fade draw, so clip position and depth come from
+		// the exact shader and constants that placed the scope housing.
+		// Correctness is inherited, not reconstructed: two prior attempts to
+		// rebuild the transform (hand-rolled projection; engine camera-state
+		// reads) each failed on a convention this approach never touches.
+		// Inactive clears the draw.
+		struct OcclusionSphereGeo
+		{
+			// numVertices entries of the fade draw's own vertex layout
+			// (half4 position at offset 0, stride 20; remaining attributes
+			// zeroed -- the flat pixel shader reads none of them).
+			std::vector<std::uint8_t> fadeLocalVertices;
+			std::uint32_t vertexCount = 0;
+			float color[4] = {};
+			bool active = false;
+		};
+		static void PublishOcclusionSphereGeo(OcclusionSphereGeo geo);
+		// Renders the published sphere on the game's live fade-draw pipeline.
+		// Called from the matched ScopeFade draw; a cheap no-op while nothing
+		// is published.
+		void DrawOcclusionSphereInScene(ID3D11DeviceContext* context);
+		// The live render viewport, for building projection matrices on the
+		// game thread. Zero until the renderer has produced a frame.
+		void GetRenderViewportSize(int& width, int& height) const;
+
 		void SetZoom(float zoom);
 		void ScreenTextureMod();
 		// Returns true only when this call accounts for a visible composite.
@@ -1071,6 +1109,22 @@ namespace Hook
 		ComPtr<ID3D11InputLayout> mApertureSynthInputLayout;
 		ComPtr<ID3D11Buffer> mApertureSynthVertexBuffer;
 		ComPtr<ID3D11Buffer> mApertureSynthIndexBuffer;
+		// The occlusion-sphere gizmo's device children. The sphere is drawn
+		// on the game's LIVE ScopeFade pipeline (its vertex shader, layout,
+		// constants, depth state and viewport are all inherited at the
+		// matched draw), so the gizmo owns only: a DYNAMIC vertex buffer
+		// refilled from the published fade-local vertices (game vertex
+		// format, half4 position, stride 20), the fixed sphere index
+		// topology, the flat pixel shader that reads only SV_Position, its
+		// colour constant buffer, and the wireframe rasterizer for the
+		// second pass. Everything else comes from the game.
+		ComPtr<ID3D11PixelShader> m_pPixelShader_OcclusionSphereFlat;
+		ComPtr<ID3D11Buffer> mOcclusionSphereVertexBuffer;
+		ComPtr<ID3D11Buffer> mOcclusionSphereIndexBuffer;
+		ComPtr<ID3D11Buffer> mOcclusionSphereConstantBuffer;
+		std::uint64_t mOcclusionSphereUploadedGeneration = 0;
+		ComPtr<ID3D11RasterizerState> mOcclusionSphereWireRasterizer;
+		UINT mOcclusionSphereIndexCount = 0;
 		// The composite pass's rasterizer state, built once instead of per
 		// draw. The device it was created on is retained alongside it so an
 		// upscaler or frame-generation proxy swapping the device rebuilds it

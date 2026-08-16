@@ -3,6 +3,21 @@
 Converts a non-STS Fallout 4 scope NIF into the See Through Scopes node layout,
 so it can be used by STS and by the MagnaScope F4SE plugin.
 
+## Reticle route status (in-game verdicts, 2026-08-15)
+
+- **`--keep-reticle-material` — CONFIRMED WORKING.** The reticle keeps the
+  source mod's own BGEM and renders exactly as it did before conversion. This
+  is the recommended route. STS's built-in reticle swap stays inert on these
+  scopes; MagnaScope's own reticle switching covers that feature instead.
+- **Custom missing-material route (`--reticle-texture` / `--materials`) —
+  BROKEN in game.** Renders a solid black square: the missing-material
+  fallback applies STS-style alpha blending to a texture that was authored
+  against the mod's own BGEM blend recipe. Fixing it means parsing the BGEM's
+  blend/alpha fields (blendState/blendFunc1/blendFunc2/alphaTest, NiAlpha
+  enum values) and replicating them on the NIF shader.
+- **`--reticle-preset` (STS Defaults materials) — untested in game.** Passes
+  every structural check; renders STS's own crosshair rather than the mod's.
+
 Built on NiflySharp (NuGet `Nifly` 1.0.0), targeting `net8.0`. It is a separate
 project from `tests\NifInspector`, which is untouched.
 
