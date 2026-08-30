@@ -13,6 +13,7 @@
 #include <limits>
 #include <vector>
 
+#include "ActorHeatTag.h"
 #include "ImGuiImpl.h"
 #include "Settings.h"
 #include "ReticleVertexScaling.h"
@@ -3876,6 +3877,11 @@ namespace Hook
 		// so they could not catch it.
 		ID3D11Buffer* scopeEffectBuffer = m_pScopeEffectBuffer.Get();
 		g_Context->PSSetShaderResources(4, 1, &source);
+		// Heat mask (Stage 2) at t7 for the thermal/NV shader to sample.
+		{
+			ID3D11ShaderResourceView* maskSRV = mHeatMaskSRV.Get();
+			g_Context->PSSetShaderResources(7, 1, &maskSRV);
+		}
 		g_Context->PSSetSamplers(0, 1, &sampler);
 		g_Context->PSSetConstantBuffers(4, 1, &resolutionBuffer);
 		// The fill geometry shader reads the aperture's measured inner-rim
@@ -4138,6 +4144,11 @@ namespace Hook
 			ID3D11Buffer* resolutionBuffer = mScopeFadeResolutionBuffer.Get();
 			ID3D11Buffer* scopeEffectBuffer = m_pScopeEffectBuffer.Get();
 			g_Context->PSSetShaderResources(4, 1, &source);
+		// Heat mask (Stage 2) at t7 for the thermal/NV shader to sample.
+		{
+			ID3D11ShaderResourceView* maskSRV = mHeatMaskSRV.Get();
+			g_Context->PSSetShaderResources(7, 1, &maskSRV);
+		}
 			g_Context->PSSetSamplers(0, 1, &sampler);
 			g_Context->PSSetConstantBuffers(4, 1, &resolutionBuffer);
 		// The fill geometry shader reads the aperture's measured inner-rim
@@ -4279,6 +4290,11 @@ namespace Hook
 		ID3D11Buffer* resolutionBuffer = mScopeFadeResolutionBuffer.Get();
 		ID3D11Buffer* scopeEffectBuffer = m_pScopeEffectBuffer.Get();
 		g_Context->PSSetShaderResources(4, 1, &source);
+		// Heat mask (Stage 2) at t7 for the thermal/NV shader to sample.
+		{
+			ID3D11ShaderResourceView* maskSRV = mHeatMaskSRV.Get();
+			g_Context->PSSetShaderResources(7, 1, &maskSRV);
+		}
 		g_Context->PSSetSamplers(0, 1, &sampler);
 		g_Context->PSSetConstantBuffers(4, 1, &resolutionBuffer);
 		// The fill geometry shader reads the aperture's measured inner-rim
@@ -5475,6 +5491,39 @@ namespace Hook
 		sampDesc.MaxLOD = D3D11_FLOAT32_MAX;
 		HR(g_Device->CreateSamplerState(&sampDesc, m_pSamplerState.GetAddressOf()));
 
+		// Heat-mask fill shader + depth state (Stage 2). Non-fatal: without the
+		// shader the mask stays empty and thermal keeps the blob fallback.
+		{
+			ComPtr<ID3DBlob> maskBlob;
+			if (SUCCEEDED(CreateShaderFromFile(
+					L"Data\\Shaders\\MagnaScope\\HeatMaskFill_PS.cso",
+					L"src\\HLSL\\HeatMaskFill_PS.hlsl", "main", "ps_5_0",
+					maskBlob.ReleaseAndGetAddressOf())) &&
+				maskBlob.Get()) {
+				g_Device->CreatePixelShader(
+					maskBlob->GetBufferPointer(), maskBlob->GetBufferSize(),
+					nullptr, mHeatMaskFillPS.ReleaseAndGetAddressOf());
+			}
+			if (!mHeatMaskFillPS.Get()) {
+				logger::warn(
+					"[heatmask] fill pixel shader missing; actor silhouette "
+					"mask disabled");
+			}
+			// Depth-test the actor against the live scene depth, no writes:
+			// occluded parts fail LESS_EQUAL (FO4 depth is near=0/far=1,
+			// non-reversed) and never mark the mask.
+			D3D11_DEPTH_STENCIL_DESC dsd = {};
+			dsd.DepthEnable = TRUE;
+			dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+			dsd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+			dsd.StencilEnable = FALSE;
+			g_Device->CreateDepthStencilState(
+				&dsd, mHeatMaskDepthState.ReleaseAndGetAddressOf());
+			// The command-buffer tag route needs the device to mint its 1x1
+			// identity SRV; dormant until this call.
+			MagnaScope::ActorHeatTag::SetTagDevice(g_Device.Get());
+		}
+
 		CreateBlender();
 		return true;
 	}
@@ -5564,6 +5613,35 @@ namespace Hook
 			mRTRenderTargetView.GetAddressOf(),
 			mRTShaderResourceView.GetAddressOf());
 
+		// Heat mask (Stage 2): FULL-SCREEN R8 matching the scene/backbuffer the
+		// actor draws are re-issued from, so screen UVs line up with what the
+		// magnify shader samples. Populated by re-issued character draws.
+		CreateTextureAndViews(
+			g_Device.Get(),
+			windowWidth, windowHeight, DXGI_FORMAT_R8_UNORM,
+			mHeatMaskTexture.GetAddressOf(),
+			mHeatMaskRTV.GetAddressOf(),
+			mHeatMaskSRV.GetAddressOf());
+		// b0 for the fill PS: rcp mask dimensions, so the shader can turn its
+		// SV_Position into a normalized screen UV for the depth-occlusion
+		// sample. Immutable; rebuilt with the mask on resize.
+		{
+			const float maskParams[4] = {
+				windowWidth > 0 ? 1.0F / static_cast<float>(windowWidth) : 0.0F,
+				windowHeight > 0 ? 1.0F / static_cast<float>(windowHeight) : 0.0F,
+				0.0F,
+				0.0F
+			};
+			D3D11_BUFFER_DESC cbDesc{};
+			cbDesc.ByteWidth = sizeof(maskParams);
+			cbDesc.Usage = D3D11_USAGE_IMMUTABLE;
+			cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+			D3D11_SUBRESOURCE_DATA cbInit{};
+			cbInit.pSysMem = maskParams;
+			g_Device->CreateBuffer(
+				&cbDesc, &cbInit, mHeatMaskParamsCB.ReleaseAndGetAddressOf());
+		}
+
 		//------------------------------
 		// 4. 创建目标纹理及SRV（仅绑定到着色器资源）
 		//------------------------------
@@ -5588,6 +5666,10 @@ namespace Hook
 		mShaderResourceView.Reset();
 		mScopeFadeSceneSRV.Reset();
 		mScopeFadeSceneTexture.Reset();
+		mHeatMaskSRV.Reset();
+		mHeatMaskRTV.Reset();
+		mHeatMaskTexture.Reset();
+		mHeatMaskParamsCB.Reset();
 		{
 			std::scoped_lock lock(mAutomaticSTSReticleLayerMutex);
 			mAutomaticSTSReticleLayerWhiteSRV.Reset();
@@ -6774,6 +6856,96 @@ namespace Hook
 				IndexCount,
 				StartIndexLocation,
 				BaseVertexLocation);
+		}
+		// Heat mask (Stage 2): if the actor-tagging hooks flagged this draw as
+		// character geometry, re-issue it into the R8 mask with a flat pixel
+		// shader and the live scene depth (tested, not written) so the mask holds
+		// the actor's true, depth-occluded silhouette. Full state is saved and
+		// restored; the game's VS/IA are kept so the silhouette is pixel-exact.
+		if (D3DInstance && D3DInstance->mHeatMaskRTV.Get() &&
+			D3DInstance->mHeatMaskFillPS.Get() &&
+			D3DInstance->mHeatMaskDepthState.Get() &&
+			MagnaScope::ActorHeatTag::CurrentDrawIsActor(pContext)) {
+			// Lazy per-frame clear: wipe the mask on the first tagged draw of a
+			// new present cycle. Render-thread only, so a plain static is fine.
+			static std::uint64_t s_lastMaskClearTick = ~0ULL;
+			const auto presentTick =
+				HangDiag::presentTicks.load(std::memory_order_relaxed);
+			if (presentTick != s_lastMaskClearTick) {
+				s_lastMaskClearTick = presentTick;
+				const float zero[4] = { 0.0F, 0.0F, 0.0F, 0.0F };
+				pContext->ClearRenderTargetView(
+					D3DInstance->mHeatMaskRTV.Get(), zero);
+			}
+
+			// BSBatchRenderer::Draw fires for EVERY pass, including the shadow
+			// cascades and the z-prepass. Those are depth-only (no colour RTV) and
+			// their vertex shader uses the light's projection, not the camera's --
+			// re-issuing them would rasterise garbage, and their shadow-map DSV is a
+			// different size than the full-screen mask, which makes the whole OM
+			// binding invalid so D3D silently drops the draw. Only re-issue when a
+			// colour target is bound (the main camera colour/g-buffer pass), so the
+			// game VS emits camera-space clip positions that land on screen.
+			ComPtr<ID3D11RenderTargetView> sceneRTV;
+			ComPtr<ID3D11DepthStencilView> sceneDSV;
+			pContext->OMGetRenderTargets(
+				1, sceneRTV.GetAddressOf(), sceneDSV.GetAddressOf());
+			if (sceneRTV.Get()) {
+				ScopedContextState maskState(pContext);
+				// The mask binds with NO DSV: a DSV legally has to match the
+				// render target's size, and the scene depth's render resolution
+				// does not match the full-window mask. Occlusion happens in the
+				// fill PS instead, which compares this pixel's own depth (same
+				// VS, same constants -> same SV_Position.z the scene pass wrote)
+				// against the engine's main depth SRV -- so actors behind cover
+				// are clipped out of the mask per-pixel.
+				ID3D11RenderTargetView* maskRTV = D3DInstance->mHeatMaskRTV.Get();
+				pContext->OMSetRenderTargets(1, &maskRTV, nullptr);
+				pContext->OMSetDepthStencilState(
+					D3DInstance->mHeatMaskDepthState.Get(), 0);
+				pContext->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFU);
+				pContext->PSSetShader(
+					D3DInstance->mHeatMaskFillPS.Get(), nullptr, 0);
+				// Occlusion inputs: t0 = the engine's own main depth SRV
+				// (depthStencilTargets[Depth::kMain]; binding it is legal here
+				// because the OMSetRenderTargets above just unbound it as a
+				// DSV), b0 = rcp mask size for the UV reconstruction. Both are
+				// restored by maskState. Null t0 leaves clip() comparing
+				// against 0 = never visible, so skip the bind only if absent
+				// and accept a frame without occlusion data as an empty mask.
+				if (auto* rendererData = RE::BSGraphics::GetRendererData();
+					rendererData) {
+					auto* depthSRV = reinterpret_cast<ID3D11ShaderResourceView*>(
+						rendererData->depthStencilTargets[2].srViewDepth);
+					if (depthSRV) {
+						pContext->PSSetShaderResources(0, 1, &depthSRV);
+					}
+				}
+				if (ID3D11Buffer* paramsCB =
+						D3DInstance->mHeatMaskParamsCB.Get()) {
+					pContext->PSSetConstantBuffers(0, 1, &paramsCB);
+				}
+				// The game renders colour passes at varying internal resolutions
+				// (2560x1440 and 3840x2160 both observed). The VS emits full-view
+				// NDC (-1..1) regardless, so rasterise into a viewport that maps
+				// full NDC onto the full mask -> mask UV == screen UV, matching
+				// what the magnify shader samples with sourceUv, independent of the
+				// source pass resolution. Inheriting the game viewport instead
+				// misplaced and shrank the silhouettes.
+				D3D11_VIEWPORT maskVp{};
+				maskVp.TopLeftX = 0.0F;
+				maskVp.TopLeftY = 0.0F;
+				maskVp.Width = static_cast<float>(windowWidth);
+				maskVp.Height = static_cast<float>(windowHeight);
+				maskVp.MinDepth = 0.0F;
+				maskVp.MaxDepth = 1.0F;
+				pContext->RSSetViewports(1, &maskVp);
+				bSelfDraw = true;
+				original(
+					pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+				bSelfDraw = false;
+				// maskState restores all game render state on scope exit.
+			}
 		}
 		// Sphere occlusion: a draw whose bound index buffer matches a published
 		// entry is redrawn with its holed twin -- identical indices except the

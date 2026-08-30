@@ -1387,6 +1387,18 @@ namespace Hook
 		ComPtr<ID3D11RenderTargetView> mRTRenderTargetView;
 		ComPtr<ID3D11ShaderResourceView> mRTShaderResourceView;
 
+		// Heat mask (Stage 2): actor silhouettes rendered flat into an R8 target
+		// via re-issued draws, sampled at t7 by the magnify shader. The fill PS
+		// and the depth-test-no-write state are size-independent; the texture
+		// trio is rebuilt on resize.
+		ComPtr<ID3D11Texture2D> mHeatMaskTexture;
+		ComPtr<ID3D11RenderTargetView> mHeatMaskRTV;
+		ComPtr<ID3D11ShaderResourceView> mHeatMaskSRV;
+		ComPtr<ID3D11PixelShader> mHeatMaskFillPS;
+		ComPtr<ID3D11DepthStencilState> mHeatMaskDepthState;
+		// b0 for the fill PS: rcp mask dimensions, refreshed on resize.
+		ComPtr<ID3D11Buffer> mHeatMaskParamsCB;
+
 		ComPtr<ID3D11Texture2D> mCurRTTexture;
 		ComPtr<ID3D11Texture2D> rtTexture2D;
 		D3D11_TEXTURE2D_DESC rtTextureDesc;

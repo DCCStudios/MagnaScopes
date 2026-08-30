@@ -24,6 +24,7 @@ add_requires("minhook")
 
 local shader_profiles = {
     AutoSTS_PS = "ps_5_0",
+    HeatMaskFill_PS = "ps_5_0",
     OcclusionSphereFlat_PS = "ps_5_0",
     ScopeApertureSynth_VS = "vs_5_0",
     ScopeGeometryFill_GS = "gs_5_0",

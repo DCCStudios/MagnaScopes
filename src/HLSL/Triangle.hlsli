@@ -268,6 +268,10 @@ Texture2D ReticleTex : register(t5);
 // transparent black in D3D11, and SCOPE_CUSTOM_RETICLE_INDEX is held negative
 // until a texture is actually resident, so an unbound slot is never read.
 Texture2D CustomReticleTex : register(t6);
+// Heat mask (Stage 2): R8 actor-silhouette coverage, rendered from the actual
+// character geometry and depth-occluded. Sampled in source-UV space so it
+// tracks the magnified image.
+Texture2D tHeatMask : register(t7);
 
 
 float GetAspectRatio() { return BUFFER_WIDTH * rcp(BUFFER_HEIGHT); }
@@ -474,11 +478,18 @@ float3 MS_ApplyThermal(
 			gSamLinear, saturate(sourceUv + float2(0.0f, px.y)), 0.0f).rgb,
 		luma);
 	cold += (abs(sceneLum - lumRight) + abs(sceneLum - lumDown)) * edgeStrength;
-	// Warm sources (the thermal channel of the vision field, sampled once by
-	// the caller) drive the pixel from the cold band up to HOT; a strong core
-	// (heat > 1) pushes on toward white so an NPC or fire clearly glows.
-	float t = lerp(cold, HOT, saturate(heat));
-	t = lerp(t, 1.0f, saturate(heat - 1.0f));
+	// Actor bodies come from the heat mask: their true, depth-occluded
+	// silhouettes rendered from the actual character geometry (Stage 3
+	// replaces the old actor circles). The blob field remains the source for
+	// fire, placed lights and the sun. Bilinear sampling softens the body
+	// edge by a pixel; 1.4 lands a body at HOT with a push toward white.
+	const float bodyHeat =
+		tHeatMask.SampleLevel(gSamLinear, sourceUv, 0.0f).r * 1.4f;
+	const float heatSignal = max(heat, bodyHeat);
+	// Warm sources drive the pixel from the cold band up to HOT; a strong
+	// core (heatSignal > 1) pushes on toward white so a body or fire glows.
+	float t = lerp(cold, HOT, saturate(heatSignal));
+	t = lerp(t, 1.0f, saturate(heatSignal - 1.0f));
 	// Contrast pivots around the cold midpoint, so raising it separates hot
 	// from cold instead of darkening the whole field toward black.
 	const float pivot = 0.30f;

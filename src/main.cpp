@@ -1,6 +1,7 @@
 #include "ScopeProfile.h"
 #include "EyeBoxRecentering.h"
 #include "ImGuiImpl.h"
+#include "ActorHeatTag.h"
 #include "Raycast.h"
 #include "ScopeResolver.h"
 #include "ScopeCoSave.h"
@@ -4721,36 +4722,11 @@ static void PublishVisionSources(
 			++count;
 		};
 
-		// 1) Living actors -> body heat (thermal only; a person emits no light,
-		// so it never blooms night vision). Skipped when thermal is off.
-		if (a_wantThermal) {
-			auto* processLists = RE::ProcessLists::GetSingleton();
-			if (processLists) {
-				for (const RE::ActorHandle& handle :
-					processLists->highActorHandles) {
-					if (count >= D3D::kMaxHeatSources) {
-						break;
-					}
-					const RE::NiPointer<RE::Actor> actorPtr = handle.get();
-					RE::Actor* actor = actorPtr.get();
-					if (!actor || actor == a_player || actor->IsPlayerRef()) {
-						continue;
-					}
-					if (actor->IsDead(false)) {  // corpses cool off
-						continue;
-					}
-					RE::NiAVObject* actor3D = actor->Get3D();
-					if (!actor3D) {
-						continue;
-					}
-					// 0.5x the bounding sphere: the visible body is smaller than the
-				// sphere that encloses it, so this keeps the hot spot on the
-				// animal rather than a halo around it.
-				tryAdd(actor3D->worldBound.center,
-						actor3D->worldBound.fRadius * 0.5F, 1.5F, 0.0F, 1.0F);
-				}
-			}
-		}
+		// 1) Actor body heat is NOT published as blobs any more: the heat mask
+		// (ActorHeatTag draw tagging + silhouette re-issue in the DrawIndexed
+		// hook) renders their true, depth-occluded shapes, which the thermal
+		// shader samples at t7. Blobs remain the source for emitters below,
+		// which have no drawable "body" the mask could capture usefully.
 
 		// 2) Light / fire emitters -> NV bloom, plus thermal heat when warm.
 		// Enumerated whenever either mode is on. The cell references are read
@@ -4774,15 +4750,43 @@ static void PublishVisionSources(
 						continue;
 					}
 					RE::TESBoundObject* base = ref->GetObjectReference();
-					if (!base ||
-						base->formType != RE::ENUM_FORM_ID::kLIGH) {
+					if (!base) {
 						continue;
 					}
-					auto* ligh = static_cast<RE::TESObjectLIGH*>(base);
-					const float fade =
-						std::isfinite(ligh->fade) ? ligh->fade : 1.0F;
-					const float lightStrength =
-						std::clamp(fade, 0.2F, 2.0F) * 1.2F;
+					// Placed lights, plus the two transient fire carriers that
+					// spawn into the cell as references:
+					//  - HAZD: a molotov's lingering ground fire, burning oil,
+					//    gas fires... light form in BGSHazardData.
+					//  - EXPL: the explosion itself, alive for its blast's
+					//    moments. Its light form is optional, but a fireball
+					//    is bright and hot BY DEFINITION, so an explosion
+					//    emits even when its base carries no light at all.
+					// Without these the whole molotov sequence was invisible
+					// to both scopes (user-verified).
+					RE::TESObjectLIGH* ligh = nullptr;
+					bool pinnedHot = false;  // fire by nature: hazard/explosion
+					bool isExplosion = false;
+					if (base->formType == RE::ENUM_FORM_ID::kLIGH) {
+						ligh = static_cast<RE::TESObjectLIGH*>(base);
+					} else if (base->formType == RE::ENUM_FORM_ID::kHAZD) {
+						ligh = static_cast<RE::BGSHazard*>(base)->data.light;
+						pinnedHot = true;
+					} else if (base->formType == RE::ENUM_FORM_ID::kEXPL) {
+						ligh = static_cast<RE::BGSExplosion*>(base)->data.light;
+						pinnedHot = true;
+						isExplosion = true;
+					}
+					if (!ligh && !isExplosion) {
+						continue;
+					}
+					const float fade = (ligh && std::isfinite(ligh->fade)) ?
+					                       ligh->fade :
+					                       1.0F;
+					float lightStrength = std::clamp(fade, 0.2F, 2.0F) * 1.2F;
+					if (isExplosion) {
+						// Full-bright flash regardless of the light form.
+						lightStrength = std::max(lightStrength, 2.4F);
+					}
 					// Light temperature is DERIVED FROM INTENSITY: a brighter
 					// light reads hotter on thermal. Flickering sources
 					// (torches/fire) are pinned hot regardless, since flame is
@@ -4790,17 +4794,46 @@ static void PublishVisionSources(
 					// FlickerSlow, 0x80 Pulse, 0x100 PulseSlow) are the CK/xEdit
 					// values (inferred, not in commonlib); the flicker
 					// amplitudes are the reliable cross-check.
-					const bool flickers =
-						(ligh->data.flags & 0x1C8U) != 0U ||
-						ligh->data.flickerIntensityAmplitude != 0.0F ||
-						ligh->data.flickerMovementAmplitude != 0.0F;
+					// Hazard fire and explosions are hot regardless of how
+					// their light form is flagged.
+					const bool flickers = pinnedHot ||
+						(ligh &&
+							((ligh->data.flags & 0x1C8U) != 0U ||
+								ligh->data.flickerIntensityAmplitude != 0.0F ||
+								ligh->data.flickerMovementAmplitude != 0.0F));
 					float warmth = std::clamp(lightStrength * 0.5F, 0.0F, 1.0F);
 					if (flickers) {
 						warmth = std::max(warmth, 0.85F);
 					}
+					// Thermal heat comes ONLY from fire-like (flickering)
+					// emitters. Placed LIGH refs are invisible radiators --
+					// visible fixtures are separate geometry -- and interiors
+					// are salted with steady fill/ambience lights that lit up
+					// thermal as floating hot spots in empty air (user-
+					// verified). Steady lights stay NV-only, which is also
+					// closer to reality: a lamp barely registers on thermal,
+					// a flame glows.
 					const float thermalStrength =
-						a_wantThermal ? warmth * lightStrength : 0.0F;
-					const float lightOut = a_wantNV ? lightStrength : 0.0F;
+						(a_wantThermal && flickers) ? warmth * lightStrength :
+						                              0.0F;
+					// NV bloom only from sources MEANT TO BE SEEN: fire, a
+					// base form that renders its own mesh, a lens flare or
+					// god rays (authored to be looked at), or a shadow-caster
+					// (deliberate fixture light -- fills are never shadow-
+					// casting, it costs too much). A pure fill light is the
+					// negative of all of these and gets no phantom point-glow
+					// in mid-air; its illumination still reaches NV through
+					// the lit scene the gain amplifies. Shadow flag bits
+					// (0x400 spot, 0x800 hemisphere, 0x1000 omni) are CK/
+					// xEdit values, inferred like the flicker bits above.
+					const char* baseModel = ligh ? ligh->GetModel() : nullptr;
+					const bool visibleSource = flickers ||
+						(baseModel && baseModel[0] != '\0') ||
+						(ligh && ligh->lensFlare) ||
+						(ligh && ligh->godRays) ||
+						(ligh && (ligh->data.flags & 0x1C00U) != 0U);
+					const float lightOut =
+						(a_wantNV && visibleSource) ? lightStrength : 0.0F;
 					if (thermalStrength <= 0.0F && lightOut <= 0.0F) {
 						continue;
 					}
@@ -4862,15 +4895,29 @@ static void PublishVisionSources(
 	// Rate-limited so even verbose logs stay readable (~1/sec at 60fps).
 	static int s_visionDiagTick = 0;
 	if ((s_visionDiagTick++ % 60) == 0) {
+		// Heat-mask verification: how many draws the actor-tagging hooks flagged
+		// over the last ~60 frames, how many BSBatchRenderer::Draw calls were seen
+		// while active, and the current tagged-geometry set size. taggedDraws > 0
+		// with setSize > 0 proves the full pipeline works; batchDraws > 0 with
+		// taggedDraws == 0 isolates a classification (pointer) mismatch;
+		// batchDraws == 0 means the batch chokepoint hook itself never fired.
+		const auto heat = MagnaScope::ActorHeatTag::ReadDiag();
 		logger::verbose(
 			"[vision] thermal={} nv={} published={} (considered={}, "
-			"offscreen={}, occluded={})",
+			"offscreen={}, occluded={}) | actorTag: taggedDraws={} "
+			"(replay={}) batchDraws={} cb={}A/{}N refs={}",
 			a_wantThermal,
 			a_wantNV,
 			count,
 			diagConsidered,
 			diagOffscreen,
-			diagOccluded);
+			diagOccluded,
+			heat.taggedDraws,
+			heat.replayTagged,
+			heat.batchDraws,
+			heat.cbActor,
+			heat.cbNeutral,
+			heat.setSize);
 	}
 }
 
@@ -5883,7 +5930,21 @@ void HookedUpdate()
 				wantNVSrc = nvgFlag && currentData &&
 					currentData->shaderData.bCanEnableNV;
 			}
-			if (wantThermalSrc || wantNVSrc) {
+			const bool visionActive = wantThermalSrc || wantNVSrc;
+			// Heat mask: gate the per-draw actor tagging on vision being active
+			// (near-zero cost otherwise). The live-actor ref set rebuilds
+			// UNCONDITIONALLY (throttled; ~40 pointer inserts) because the
+			// command-buffer route classifies passes at RECORD time -- buffers
+			// recorded while not scoped must still classify correctly, or actors
+			// stay untagged until their buffers happen to rebuild.
+			MagnaScope::ActorHeatTag::SetActive(visionActive);
+			{
+				static int s_heatRebuildTick = 0;
+				if ((s_heatRebuildTick++ % 15) == 0) {
+					MagnaScope::ActorHeatTag::RebuildActorGeometrySet();
+				}
+			}
+			if (visionActive) {
 				PublishVisionSources(player, wantThermalSrc, wantNVSrc);
 			}
 
@@ -6628,6 +6689,9 @@ void TestingThread()
 
 void InitializePlugin()
 {
+	// Heat-mask Stage 1: install the actor-tagging vtable hooks (idempotent).
+	MagnaScope::ActorHeatTag::Install();
+
 	if (settings.AllowsPrivateRenderHooks()) {
 		// Stage 3 deliberately uses F4SE Menu Framework's already verified
 		// before-render callback. The original scope-rendering Present, ResizeBuffers,
