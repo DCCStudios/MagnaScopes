@@ -168,6 +168,26 @@ namespace logger
 			std::forward<Args>(args)...);
 	}
 
+	// Verbose gate for high-volume, per-frame/per-selection telemetry. Off by
+	// default (the log keeps only lifecycle, warning, and error lines); the
+	// menu's "Verbose Logging" toggle flips it. The hang-watchdog report reads
+	// the same flag. Relaxed atomic: a stray frame either side of a toggle is
+	// harmless.
+	inline std::atomic<bool> g_verbose{ false };
+
+	template <class... Args>
+	void verbose(std::format_string<Args...> format, Args&&... args)
+	{
+		if (!g_verbose.load(std::memory_order_relaxed)) {
+			return;
+		}
+		REX::Impl::Log(
+			std::source_location::current(),
+			REX::ELogLevel::Info,
+			format,
+			std::forward<Args>(args)...);
+	}
+
 	template <class... Args>
 	void warn(std::format_string<Args...> format, Args&&... args)
 	{

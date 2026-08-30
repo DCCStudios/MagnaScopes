@@ -209,8 +209,17 @@ namespace ScopeData
 		s.IsCircle = j.value("IsCircle", true);
 		s.bEnableZMove = j.value("EnableZMove", false);
 		s.bCanEnableNV = j.value("EnableNV", false);
+		s.bCanEnableThermal = j.value("EnableThermal", false);
+		s.bDefaultEnableNV = j.value("DefaultEnableNV", false);
+		s.bDefaultEnableThermal = j.value("DefaultEnableThermal", false);
 		s.bBoltDisable = j.value("bBoltDisable", false);
 		s.nvIntensity = j.value("nvIntensity", 3.0F);
+		s.nvNoise = j.value("nvNoise", 0.15F);
+		s.nvBloom = j.value("nvBloom", 0.30F);
+		s.nvTint = j.value("nvTint", 0);
+		s.thermalPalette = j.value("thermalPalette", 0);
+		s.thermalContrast = j.value("thermalContrast", 1.0F);
+		s.thermalEdge = j.value("thermalEdge", 0.25F);
 		s.baseWeaponPos = j.value("BaseWeaponPos", 0.0F);
 		s.movePercentage = j.value("ZMovePercentage", 0.0F);
 		s.camDepth = j.value("CamDepth", 1.0F);
@@ -239,6 +248,8 @@ namespace ScopeData
 			j.value("OpticalLagStrength", 1.0F);
 		s.imageDenoise = j.value("ImageDenoise", 0.0F);
 		s.imageSharpen = j.value("ImageSharpen", 0.0F);
+		s.magnificationFilter =
+			std::clamp(j.value("MagnificationFilter", 0), 0, 2);
 		s.reticleMagnification =
 			j.value("ReticleMagnification", 1.0F);
 		s.reticleShadowStrength =
@@ -405,8 +416,17 @@ namespace ScopeData
 			{ "IsCircle", s.IsCircle },
 			{ "EnableZMove", s.bEnableZMove },
 			{ "EnableNV", s.bCanEnableNV },
+			{ "EnableThermal", s.bCanEnableThermal },
+			{ "DefaultEnableNV", s.bDefaultEnableNV },
+			{ "DefaultEnableThermal", s.bDefaultEnableThermal },
 			{ "bBoltDisable", s.bBoltDisable },
 			{ "nvIntensity", s.nvIntensity },
+			{ "nvNoise", s.nvNoise },
+			{ "nvBloom", s.nvBloom },
+			{ "nvTint", s.nvTint },
+			{ "thermalPalette", s.thermalPalette },
+			{ "thermalContrast", s.thermalContrast },
+			{ "thermalEdge", s.thermalEdge },
 			{ "BaseWeaponPos", s.baseWeaponPos },
 			{ "ZMovePercentage", s.movePercentage },
 			{ "CamDepth", s.camDepth },
@@ -429,6 +449,7 @@ namespace ScopeData
 			{ "OpticalLagStrength", s.opticalLagStrength },
 			{ "ImageDenoise", s.imageDenoise },
 			{ "ImageSharpen", s.imageSharpen },
+			{ "MagnificationFilter", s.magnificationFilter },
 			{ "ReticleMagnification", s.reticleMagnification },
 			{ "ReticleShadowStrength", s.reticleShadowStrength },
 			{ "ReticleParallaxStrength", s.reticleParallaxStrength },
@@ -821,6 +842,21 @@ namespace ScopeData
 		}
 
 		nvKey = data.value("NvKey", 0);
+
+		const auto comboThermal = data.find("ComboThermalKey");
+		if (comboThermal != data.end() && comboThermal->is_string()) {
+			comboThermalKey = ComboKeyToInt(comboThermal->get<std::string>());
+		} else if (comboThermal != data.end() && comboThermal->is_number_integer()) {
+			comboThermalKey = comboThermal->get<int>();
+		} else {
+			comboThermalKey = -1;
+		}
+
+		thermalKey = data.value("ThermalKey", 0);
+		// Verbose logging (per-frame telemetry + hang.txt watchdog) is off by
+		// default; the menu toggles it and it persists here.
+		logger::g_verbose.store(
+			data.value("VerboseLogging", false), std::memory_order_relaxed);
 		guiKey = data.value("guiKey", 117);
 		// Unbound by default. A key that does something out of the box would
 		// collide with whatever the user or another mod already has bound, and
@@ -833,6 +869,10 @@ namespace ScopeData
 		data["BaseRenderCount"] = baseRenderCount;
 		data["ComboNVKey"] = comboNVKey;
 		data["NvKey"] = nvKey;
+		data["ComboThermalKey"] = comboThermalKey;
+		data["ThermalKey"] = thermalKey;
+		data["VerboseLogging"] =
+			logger::g_verbose.load(std::memory_order_relaxed);
 		data["guiKey"] = guiKey;
 		data["opticsKey"] = opticsKey;
 
@@ -878,10 +918,28 @@ namespace ScopeData
 		UpdateConfigValue("NvKey", nvKey);
 	}
 
+	void ScopeDataHandler::SetThermalHotKeyCombo(int comboKey)
+	{
+		comboThermalKey = comboKey;
+		UpdateConfigValue("ComboThermalKey", comboKey);
+	}
+
+	void ScopeDataHandler::SetThermalHotKeyMain(unsigned int mainkeycode)
+	{
+		thermalKey = mainkeycode;
+		UpdateConfigValue("ThermalKey", thermalKey);
+	}
+
 	void ScopeDataHandler::SetGuiKey(unsigned int mainkeycode)
 	{
 		guiKey = mainkeycode;
 		UpdateConfigValue("guiKey", guiKey);
+	}
+
+	void ScopeDataHandler::SetVerboseLogging(bool enabled)
+	{
+		logger::g_verbose.store(enabled, std::memory_order_relaxed);
+		UpdateConfigValue("VerboseLogging", enabled);
 	}
 
 	void ScopeDataHandler::SetOpticsKey(unsigned int mainkeycode)

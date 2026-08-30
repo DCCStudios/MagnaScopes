@@ -104,8 +104,26 @@ namespace ScopeData
 		bool bEnableZMove = false;
 		bool bCanEnableNV = false;
 		bool bBoltDisable = false;
+		// Per-profile permission for the thermal overlay (parallels
+		// bCanEnableNV). The live hotkey toggle is bEnableThermal in hooking.
+		bool bCanEnableThermal = false;
+		// Start each mode ON when a permitting scope is selected, instead of
+		// requiring the hotkey each time. Seeded into the live global flags at
+		// scope selection; the hotkey still toggles live afterward. Only takes
+		// effect when the matching permission (bCanEnable*) is also set.
+		bool bDefaultEnableNV = false;
+		bool bDefaultEnableThermal = false;
 
 		float nvIntensity = 3;
+		// Night-vision realism controls (nvIntensity is the gain). Thermal
+		// controls follow. These mirror the appended b5 fields in hooking.h /
+		// Triangle.hlsli.
+		float nvNoise = 0.15F;         // scintillation grain amount
+		float nvBloom = 0.30F;         // bright-source bloom
+		int nvTint = 0;                // 0 = green phosphor, 1 = white phosphor
+		int thermalPalette = 0;        // 0 white-hot, 1 black-hot, 2 ironbow
+		float thermalContrast = 1.0F;  // thermal punch
+		float thermalEdge = 0.25F;     // silhouette edge emphasis
 		float baseWeaponPos = 0;
 		float movePercentage = 0;
 
@@ -152,6 +170,16 @@ namespace ScopeData
 		// zero so existing MagnaScope profiles retain their authored image unchanged.
 		float imageDenoise = 0.0F;
 		float imageSharpen = 0.0F;
+		// Reconstruction filter for the magnified sample: 0 = bilinear (the
+		// original path, so existing profiles render identically), 1 =
+		// Catmull-Rom bicubic, 2 = Lanczos-2. Magnification is an upsample of
+		// the already-rendered frame; a negative-lobe kernel preserves edge
+		// slopes through that upsample where bilinear's tent kernel turns
+		// every source texel into a soft blob. Structural (not per-variant):
+		// a filter choice is a property of the optic's rendering, not of a
+		// magnification stop, and interpolating between kernels mid-blend is
+		// meaningless.
+		int magnificationFilter = 0;
 
 		// Independent local scale for the STS-authored 3D reticle. 1 preserves
 		// its authored size; this value never inherits scene magnification.
@@ -405,7 +433,10 @@ namespace ScopeData
 
 		void SetNVGHotKeyCombo(int);
 		void SetNVGHotKeyMain(unsigned int keycode);
+		void SetThermalHotKeyCombo(int);
+		void SetThermalHotKeyMain(unsigned int keycode);
 		void SetGuiKey(unsigned int keycode);
+		void SetVerboseLogging(bool enabled);
 
 		void SetIsUpscaler(bool);
 		const char* GetNVGComboKeyStr();
@@ -427,6 +458,8 @@ namespace ScopeData
 		bool bEnableRenderBeforeUI = false;
 		int comboNVKey = -1;
 		int nvKey = -1;
+		int comboThermalKey = -1;
+		int thermalKey = -1;
 		int guiKey = -1;
 		// Optics key: tap cycles reticles, hold + scroll switches secondary
 		// sights. Unbound by default so it cannot collide with another mod's

@@ -4,6 +4,7 @@
 #include <MinHook.h>
 #include <REX/W32/COMPTR.h>
 #include <Shlwapi.h>
+#include <TlHelp32.h>
 #include <d3d11.h>
 #include <d3d11_4.h>
 #include <d3dcommon.h>
@@ -1249,6 +1250,9 @@ namespace Hook
 		std::atomic<std::uint64_t> presentTicks{ 0U };
 		std::atomic<std::uint64_t> updateTicks{ 0U };
 		std::atomic<std::uint64_t> dispatchTicks{ 0U };
+		std::atomic<std::uint32_t> presentLoopThread{ 0U };
+		std::atomic<std::uint32_t> updateLoopThread{ 0U };
+		std::atomic<std::uint32_t> dispatchLoopThread{ 0U };
 		std::atomic<int> presentPhase{ 0 };
 		std::atomic<int> updatePhase{ 0 };
 		std::atomic<int> geometryWaitSite{ 0 };
@@ -1344,6 +1348,205 @@ namespace Hook
 			}
 		}
 
+		// --- frozen-thread stack capture ------------------------------------
+		//
+		// Every hang so far has the same shape: all loop counters stop, no
+		// MagnaScope phase is active, no tracked mutex is held. That proves
+		// the stall lives outside every instrumented section and identifies
+		// nothing else. The watchdog thread survives every freeze, so it can
+		// do what a debugger would: suspend the stalled threads, unwind their
+		// stacks, and write module+offset frames into the report.
+		//
+		// Suspension discipline: while a thread is suspended it may own the
+		// process heap lock or the loader lock, so the window between
+		// SuspendThread and ResumeThread must allocate nothing and resolve no
+		// module names. Raw PCs are collected into a caller-owned array;
+		// resolution and file writes happen only after the thread is resumed.
+
+		constexpr int kMaxStackFrames = 48;
+
+		// Separated out because __try cannot share a function with objects
+		// that need unwinding. Returns the number of PCs collected, or -1 if
+		// the thread context was unreadable.
+		static int WalkSuspendedThreadStack(
+			HANDLE thread,
+			DWORD64* pcs,
+			int maxFrames) noexcept
+		{
+			CONTEXT ctx;
+			memset(&ctx, 0, sizeof(ctx));
+			ctx.ContextFlags = CONTEXT_FULL;
+			if (!GetThreadContext(thread, &ctx)) {
+				return -1;
+			}
+			int count = 0;
+			__try {
+				pcs[count++] = ctx.Rip;
+				while (count < maxFrames) {
+					const DWORD64 previousSp = ctx.Rsp;
+					DWORD64 imageBase = 0;
+					const auto functionEntry =
+						RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
+					if (functionEntry) {
+						PVOID handlerData = nullptr;
+						DWORD64 establisherFrame = 0;
+						RtlVirtualUnwind(
+							UNW_FLAG_NHANDLER,
+							imageBase,
+							ctx.Rip,
+							functionEntry,
+							&ctx,
+							&handlerData,
+							&establisherFrame,
+							nullptr);
+					} else {
+						// No unwind data: a true leaf frame, or a detour
+						// trampoline. Treat it as a leaf -- the return
+						// address sits at RSP.
+						ctx.Rip =
+							*reinterpret_cast<const DWORD64*>(ctx.Rsp);
+						ctx.Rsp += 8U;
+					}
+					// A walk that stops making downward progress is corrupt;
+					// ending it beats the watchdog spinning forever.
+					if (ctx.Rip == 0U || ctx.Rsp <= previousSp) {
+						break;
+					}
+					pcs[count++] = ctx.Rip;
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				// Unreadable stack memory ends the walk with whatever was
+				// already collected.
+			}
+			return count;
+		}
+
+		// Module+offset is enough to be decisive: MagnaScope.dll offsets map
+		// through the PDB, and a game/driver/ntdll frame names the subsystem
+		// even without symbols.
+		std::string DescribeCodeAddress(DWORD64 pc)
+		{
+			HMODULE module = nullptr;
+			if (GetModuleHandleExA(
+					GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+						GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					reinterpret_cast<LPCSTR>(
+						static_cast<std::uintptr_t>(pc)),
+					&module) &&
+				module) {
+				char path[MAX_PATH]{};
+				GetModuleFileNameA(
+					module,
+					path,
+					static_cast<DWORD>(std::size(path)));
+				const char* baseName = strrchr(path, '\\');
+				return std::format(
+					"{}+0x{:X}",
+					baseName ? baseName + 1 : path,
+					pc - reinterpret_cast<std::uintptr_t>(module));
+			}
+			return std::format("0x{:X}", pc);
+		}
+
+		void AppendFrozenThreadStacks(std::ofstream& out)
+		{
+			const DWORD self = GetCurrentThreadId();
+			const DWORD pid = GetCurrentProcessId();
+			const DWORD presentTid =
+				presentLoopThread.load(std::memory_order_relaxed);
+			const DWORD updateTid =
+				updateLoopThread.load(std::memory_order_relaxed);
+			const DWORD dispatchTid =
+				dispatchLoopThread.load(std::memory_order_relaxed);
+
+			// The snapshot allocates, so it must complete before any thread
+			// is suspended.
+			DWORD threadIds[128];
+			int threadCount = 0;
+			{
+				HANDLE snapshot =
+					CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+				if (snapshot == INVALID_HANDLE_VALUE) {
+					out << "  stack capture: thread snapshot failed\n";
+					return;
+				}
+				THREADENTRY32 entry{};
+				entry.dwSize = sizeof(entry);
+				for (BOOL more = Thread32First(snapshot, &entry); more;
+					 more = Thread32Next(snapshot, &entry)) {
+					if (entry.th32OwnerProcessID == pid &&
+						entry.th32ThreadID != self &&
+						threadCount <
+							static_cast<int>(std::size(threadIds))) {
+						threadIds[threadCount++] = entry.th32ThreadID;
+					}
+				}
+				CloseHandle(snapshot);
+			}
+
+			out << std::format(
+				"  stack capture across {} threads (loop threads: "
+				"present={}, update={}, dispatch={}):\n",
+				threadCount,
+				presentTid,
+				updateTid,
+				dispatchTid);
+			for (int i = 0; i < threadCount; ++i) {
+				const DWORD tid = threadIds[i];
+				HANDLE thread = OpenThread(
+					THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+						THREAD_QUERY_INFORMATION,
+					FALSE,
+					tid);
+				if (!thread) {
+					continue;
+				}
+				DWORD64 pcs[kMaxStackFrames];
+				int frames = -1;
+				if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+					frames =
+						WalkSuspendedThreadStack(thread, pcs, kMaxStackFrames);
+					ResumeThread(thread);
+				}
+				CloseHandle(thread);
+				// From here the thread is running again; allocation and
+				// loader-lock APIs are safe.
+				const bool isLoopThread = tid == presentTid ||
+				                          tid == updateTid ||
+				                          tid == dispatchTid;
+				std::string role;
+				if (tid == presentTid) {
+					role += " [present loop]";
+				}
+				if (tid == updateTid && updateTid != presentTid) {
+					role += " [update loop]";
+				}
+				if (tid == dispatchTid && dispatchTid != presentTid &&
+					dispatchTid != updateTid) {
+					role += " [dispatch loop]";
+				}
+				if (frames < 0) {
+					out << std::format(
+						"  thread {}{}: context unavailable\n",
+						tid,
+						role);
+					continue;
+				}
+				// The loop threads are the question the capture exists to
+				// answer; everyone else gets enough frames to show what they
+				// are waiting in without drowning the report.
+				const int printCount =
+					isLoopThread ? frames : std::min(frames, 12);
+				out << std::format("  thread {}{}:", tid, role);
+				for (int f = 0; f < printCount; ++f) {
+					out << (f == 0 ? " " : " <- ")
+						<< DescribeCodeAddress(pcs[f]);
+				}
+				out << "\n";
+			}
+			out.flush();
+		}
+
 		// Writes with a plain ofstream on purpose: if the hang is inside the
 		// logger (or the logger's thread is a casualty), a report through
 		// logger::info would never reach the disk.
@@ -1355,7 +1558,8 @@ namespace Hook
 			std::uint64_t nowMs,
 			std::uint64_t presentAliveMs,
 			std::uint64_t updateAliveMs,
-			std::uint64_t dispatchAliveMs)
+			std::uint64_t dispatchAliveMs,
+			bool captureStacks)
 		{
 			char documents[MAX_PATH]{};
 			if (GetEnvironmentVariableA(
@@ -1449,6 +1653,9 @@ namespace Hook
 									0U :
 									(nowMs - renderLeave) / 1000U)));
 			out.flush();
+			if (captureStacks) {
+				AppendFrozenThreadStacks(out);
+			}
 		}
 
 		void ArmWatchdog()
@@ -1495,7 +1702,16 @@ namespace Hook
 					lastUpdate = u;
 					lastDispatch = d;
 					stalledSamples = frozen ? stalledSamples + 1 : 0;
-					if (stalledSamples >= 2) {
+					// hang.txt is a verbose-only diagnostic; the watchdog keeps
+					// counting so a freeze that starts before the toggle is
+					// flipped is still caught the moment it is turned on.
+					if (stalledSamples >= 2 &&
+						logger::g_verbose.load(std::memory_order_relaxed)) {
+						// Stacks are captured 10s and 70s into each episode:
+						// once early so a quick kill still leaves evidence,
+						// once late so a slow stall that is still moving
+						// (paging, a livelock) shows up as two different
+						// pictures rather than one.
 						WriteReport(
 							p,
 							u,
@@ -1504,7 +1720,8 @@ namespace Hook
 							now,
 							presentAliveMs,
 							updateAliveMs,
-							dispatchAliveMs);
+							dispatchAliveMs,
+							stalledSamples == 2 || stalledSamples == 14);
 					}
 				}
 			}).detach();
@@ -3118,6 +3335,10 @@ namespace Hook
 			scopeImageSharpen.load(std::memory_order_acquire),
 			0.0F,
 			1.0F);
+		resolution.magnificationFilter = std::clamp(
+			scopeMagnificationFilter.load(std::memory_order_acquire),
+			0.0F,
+			2.0F);
 		resolution.fishEyeStrength = std::clamp(
 			scopeFishEyeStrength.load(std::memory_order_acquire),
 			0.0F,
@@ -3663,6 +3884,10 @@ namespace Hook
 		g_Context->GSSetConstantBuffers(4, 1, &resolutionBuffer);
 		if (scopeEffectBuffer) {
 			g_Context->PSSetConstantBuffers(5, 1, &scopeEffectBuffer);
+			// b6 heat sources for the thermal overlay, bound wherever the
+			// magnify shader's b5 is bound. Null buffer -> slot unbound -> cold.
+			g_Context->PSSetConstantBuffers(
+				6, 1, m_pHeatSourceBuffer.GetAddressOf());
 		}
 
 		bSelfDraw = true;
@@ -3921,6 +4146,11 @@ namespace Hook
 		g_Context->GSSetConstantBuffers(4, 1, &resolutionBuffer);
 			if (scopeEffectBuffer) {
 				g_Context->PSSetConstantBuffers(5, 1, &scopeEffectBuffer);
+				// b6 heat sources for the thermal overlay, bound wherever the
+				// magnify shader's b5 is bound. A null buffer unbinds the slot,
+				// which the shader reads as zero heat (cold) -- fail-safe.
+				g_Context->PSSetConstantBuffers(
+					6, 1, m_pHeatSourceBuffer.GetAddressOf());
 			}
 
 			bSelfDraw = true;
@@ -4057,6 +4287,10 @@ namespace Hook
 		g_Context->GSSetConstantBuffers(4, 1, &resolutionBuffer);
 		if (scopeEffectBuffer) {
 			g_Context->PSSetConstantBuffers(5, 1, &scopeEffectBuffer);
+			// b6 heat sources for the thermal overlay, bound wherever the
+			// magnify shader's b5 is bound. Null buffer -> slot unbound -> cold.
+			g_Context->PSSetConstantBuffers(
+				6, 1, m_pHeatSourceBuffer.GetAddressOf());
 		}
 
 		bSelfDraw = true;
@@ -5211,6 +5445,7 @@ namespace Hook
 	{
 		// 常量缓冲区
 		CreateConstantBuffer(g_Device.Get(), m_pScopeEffectBuffer.GetAddressOf(), sizeof(ScopeEffectShaderData));
+		CreateConstantBuffer(g_Device.Get(), m_pHeatSourceBuffer.GetAddressOf(), sizeof(HeatSourceShaderData));
 		CreateConstantBuffer(g_Device.Get(), m_pConstantBufferData.GetAddressOf(), sizeof(ConstBufferData));
 
 		// 动态常量缓冲区（示例）
@@ -5575,7 +5810,7 @@ namespace Hook
 					}
 				}
 				if (!occlusionBuilt.empty() || totalCulled > 0U) {
-					logger::info(
+					logger::verbose(
 						"[occlusion] built {} holed index buffer(s), {} "
 						"triangle(s) culled",
 						occlusionBuilt.size(),
@@ -5666,6 +5901,25 @@ namespace Hook
 			scopeData.BaseWeaponPos = shaderData.baseWeaponPos;
 			scopeData.camDepth = shaderData.camDepth;
 			scopeData.EnableNV = shaderData.bCanEnableNV ? bEnableNVG : 0;
+			// Thermal + NV realism controls. Thermal, like NV, is gated by both
+			// the per-profile permission (bCanEnableThermal) and the live global
+			// hotkey toggle (bEnableThermal).
+			scopeData.EnableThermal =
+				shaderData.bCanEnableThermal ? bEnableThermal : 0;
+			scopeData.nvNoise = shaderData.nvNoise;
+			scopeData.nvBloom = shaderData.nvBloom;
+			scopeData.nvTint = shaderData.nvTint;
+			scopeData.thermalPalette = shaderData.thermalPalette;
+			scopeData.thermalContrast = shaderData.thermalContrast;
+			scopeData.thermalEdge = shaderData.thermalEdge;
+			// Wall-clock seconds since load so NV scintillation animates
+			// independent of framerate; frac() in the shader tolerates wrap.
+			{
+				using namespace std::chrono;
+				static const auto s_visionEpoch = steady_clock::now();
+				scopeData.visionTime =
+					duration<float>(steady_clock::now() - s_visionEpoch).count();
+			}
 			scopeData.EnableZMove = shaderData.bEnableZMove;
 			scopeData.isCircle = shaderData.IsCircle;
 			scopeData.MovePercentage = shaderData.movePercentage;
@@ -5746,6 +6000,11 @@ namespace Hook
 
 		// 区域5: 统一更新常量缓冲区
 		UpdateConstantBuffer(m_pScopeEffectBuffer, scopeData);
+		{
+			// Upload the coherent heat snapshot to b6 for the thermal shader.
+			const HeatSourceShaderData heatData = GetHeatSourceSnapshot();
+			UpdateConstantBuffer(m_pHeatSourceBuffer, heatData);
+		}
 
 		// 特殊常量缓冲区
 		constBufferData.width = windowWidth;
@@ -6470,6 +6729,9 @@ namespace Hook
 			return;
 		}
 		HangDiag::dispatchTicks.fetch_add(1U, std::memory_order_relaxed);
+		HangDiag::dispatchLoopThread.store(
+			GetCurrentThreadId(),
+			std::memory_order_relaxed);
 		if (bSelfDraw) {
 			return original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
 		}
@@ -6705,7 +6967,7 @@ namespace Hook
 						if (loggedGeometryMismatches.fetch_add(
 								1U,
 								std::memory_order_relaxed) < 8U) {
-							logger::info(
+							logger::verbose(
 								"Stage 4d ScopeFade shaped draw rejected: "
 								"VB=0x{:x} expected 0x{:x}, "
 								"IB=0x{:x} expected 0x{:x}, "
@@ -8500,6 +8762,86 @@ namespace Hook
 		return lastCoherentSnapshot;
 	}
 
+	void D3D::PublishHeatSources(const HeatSource* sources, std::uint32_t count)
+	{
+		// Same odd/even seqlock as PublishLensProjection: bump odd before
+		// touching any element, store the count and every one of the 32 slots
+		// (clearing the unused tail), then bump even. The render thread copies
+		// the whole array between two sequence reads and retries on change, so
+		// it can never mix a new count with a stale element.
+		const std::uint32_t clamped = std::min<std::uint32_t>(
+			count, static_cast<std::uint32_t>(kMaxHeatSources));
+		heatSourceSequence.fetch_add(1U, std::memory_order_acq_rel);
+		publishedHeatCount.store(clamped, std::memory_order_relaxed);
+		for (std::uint32_t i = 0U; i < kMaxHeatSources; ++i) {
+			const bool live = (i < clamped) && (sources != nullptr);
+			publishedHeatSources[i].x.store(
+				live ? sources[i].x : 0.0F, std::memory_order_relaxed);
+			publishedHeatSources[i].y.store(
+				live ? sources[i].y : 0.0F, std::memory_order_relaxed);
+			publishedHeatSources[i].radius.store(
+				live ? sources[i].radius : 0.0F, std::memory_order_relaxed);
+			publishedHeatSources[i].thermalStrength.store(
+				live ? sources[i].thermalStrength : 0.0F,
+				std::memory_order_relaxed);
+			publishedHeatSources[i].lightStrength.store(
+				live ? sources[i].lightStrength : 0.0F,
+				std::memory_order_relaxed);
+			publishedHeatSources[i].warmth.store(
+				live ? sources[i].warmth : 0.0F, std::memory_order_relaxed);
+		}
+		heatSourceSequence.fetch_add(1U, std::memory_order_release);
+	}
+
+	D3D::HeatSourceShaderData D3D::GetHeatSourceSnapshot() const
+	{
+		// Coherent read of the heat seqlock, mirroring GetLensProjectionSnapshot.
+		// A collision reuses the last coherent snapshot rather than tearing the
+		// array across a publication.
+		static thread_local HeatSourceShaderData lastCoherent{};
+		for (std::uint32_t attempt = 0U; attempt < 3U; ++attempt) {
+			const auto sequenceBefore =
+				heatSourceSequence.load(std::memory_order_acquire);
+			if ((sequenceBefore & 1U) != 0U) {
+				continue;
+			}
+
+			HeatSourceShaderData result{};
+			const std::uint32_t count = std::min<std::uint32_t>(
+				publishedHeatCount.load(std::memory_order_relaxed),
+				static_cast<std::uint32_t>(kMaxHeatSources));
+			result.sourceCount = static_cast<int>(count);
+			for (std::uint32_t i = 0U; i < kMaxHeatSources; ++i) {
+				result.sourceGeo[i].x =
+					publishedHeatSources[i].x.load(std::memory_order_relaxed);
+				result.sourceGeo[i].y =
+					publishedHeatSources[i].y.load(std::memory_order_relaxed);
+				result.sourceGeo[i].z =
+					publishedHeatSources[i].radius.load(
+						std::memory_order_relaxed);
+				result.sourceGeo[i].w =
+					publishedHeatSources[i].thermalStrength.load(
+						std::memory_order_relaxed);
+				result.sourceLight[i].x =
+					publishedHeatSources[i].lightStrength.load(
+						std::memory_order_relaxed);
+				result.sourceLight[i].y =
+					publishedHeatSources[i].warmth.load(
+						std::memory_order_relaxed);
+			}
+
+			const auto sequenceAfter =
+				heatSourceSequence.load(std::memory_order_acquire);
+			if (sequenceBefore == sequenceAfter &&
+				(sequenceAfter & 1U) == 0U) {
+				lastCoherent = result;
+				return result;
+			}
+		}
+
+		return lastCoherent;
+	}
+
 	void D3D::PublishAutomaticSTSGeometry(
 		RE::NiAVObject* renderSurface,
 		const std::vector<RE::NiAVObject*>& reticleSurfaces,
@@ -8639,7 +8981,7 @@ namespace Hook
 			publishedReady.store(true, std::memory_order_release);
 
 			if (previousVertex != vertexAddress) {
-				logger::info(
+				logger::verbose(
 					"Published automatic STS {} identity: surface={}, "
 					"VB={:p}, IB={:p}, vertices={}, indices={}, stride={}, "
 					"vertexDataOffset={}, indexDataOffset={}",
@@ -8794,7 +9136,7 @@ namespace Hook
 			static std::size_t lastLoggedReticleCount = 0U;
 			if (lastLoggedReticleCount != reticleIdentities.size()) {
 				lastLoggedReticleCount = reticleIdentities.size();
-				logger::info(
+				logger::verbose(
 					"Published automatic STS reticle subtree: {} renderable "
 					"draw identities",
 					reticleIdentities.size());
@@ -8837,7 +9179,7 @@ namespace Hook
 			const auto invalidationIndex =
 				loggedInvalidations.fetch_add(1U, std::memory_order_relaxed);
 			if (invalidationIndex < 16U) {
-				logger::info(
+				logger::verbose(
 					"Automatic STS geometry readiness cleared "
 					"(invalidation {}, draws observed this frame: {})",
 					invalidationIndex + 1U,
@@ -8931,6 +9273,9 @@ namespace Hook
 			return DXGI_ERROR_INVALID_CALL;
 		}
 		HangDiag::presentTicks.fetch_add(1U, std::memory_order_relaxed);
+		HangDiag::presentLoopThread.store(
+			GetCurrentThreadId(),
+			std::memory_order_relaxed);
 		const HangDiag::PhaseScope presentPhaseScope(
 			HangDiag::presentPhase,
 			1);
@@ -9106,7 +9451,7 @@ namespace Hook
 				scopeFadeShapedDraws != previousShapedDraws.load(
 										   std::memory_order_relaxed);
 			if (firingSighted || changed) {
-				logger::info(
+				logger::verbose(
 					"Stage 4d.2d draw telemetry: gunState={} ({}), "
 					"automaticDraws={} gated, observed DI:{} DII:{}, "
 					"ScopeFade=DI:{} DII:{} @{} shaped:{}, "
@@ -9616,6 +9961,7 @@ namespace Hook
 		pcam = pc;
 	}
 	void D3D::SetNVG(int flag) { bEnableNVG = flag; }
+	void D3D::SetThermal(int flag) { bEnableThermal = flag; }
 	void D3D::StartScope(bool flag) { bStartScope = flag; }
 
 	D3D::OldFuncs D3D::oldFuncs;
@@ -9712,6 +10058,11 @@ namespace Hook
 	bool D3D::bFinishAimAnim = false;
 	std::atomic_bool D3D::bRefreshChar{ true };
 	int D3D::bEnableNVG = 0;
+	int D3D::bEnableThermal = 0;
+	std::atomic_uint64_t D3D::heatSourceSequence{ 0U };
+	std::atomic_uint32_t D3D::publishedHeatCount{ 0U };
+	std::array<D3D::HeatSourceAtomic, D3D::kMaxHeatSources>
+		D3D::publishedHeatSources{};
 	bool D3D::bQueryRender = false;
 	bool D3D::bIsInGame = false;
 	bool D3D::isEnableScopeEffect = false;
@@ -9721,6 +10072,7 @@ namespace Hook
 	std::atomic<float> D3D::scopeFadeMagnification{ 2.0F };
 	std::atomic<float> D3D::scopeImageDenoise{ 0.0F };
 	std::atomic<float> D3D::scopeImageSharpen{ 0.0F };
+	std::atomic<float> D3D::scopeMagnificationFilter{ 0.0F };
 	std::atomic<float> D3D::scopeFishEyeStrength{ 0.0F };
 	std::atomic<float> D3D::scopeFishEyePower{ 2.0F };
 	std::atomic<float> D3D::scopeEdgeRefractionStrength{ 0.0F };

@@ -55,6 +55,13 @@ namespace Hook
 		extern std::atomic<std::uint64_t> presentTicks;
 		extern std::atomic<std::uint64_t> updateTicks;
 		extern std::atomic<std::uint64_t> dispatchTicks;
+		// The thread that last advanced each loop counter. The watchdog labels
+		// these threads in its stack capture, so a frozen report can say "the
+		// present loop's thread is parked HERE" instead of leaving the reader
+		// to guess which of sixty threads mattered.
+		extern std::atomic<std::uint32_t> presentLoopThread;
+		extern std::atomic<std::uint32_t> updateLoopThread;
+		extern std::atomic<std::uint32_t> dispatchLoopThread;
 		// See kPresentPhaseNames / kUpdatePhaseNames in hooking.cpp.
 		extern std::atomic<int> presentPhase;
 		extern std::atomic<int> updatePhase;
@@ -225,7 +232,10 @@ namespace Hook
 			// negative selects the authored 3D reticle.
 			float customReticleIndex = -1.0F;
 			float customReticleScale = 1.0F;
-			float reservedReticle0 = 0.0F;
+			// Reconstruction filter for the magnified sample: 0 bilinear,
+			// 1 Catmull-Rom bicubic, 2 Lanczos-2. Claimed from the first
+			// reserved slot, so the 224-byte layout is unchanged.
+			float magnificationFilter = 0.0F;
 			float reservedReticle1 = 0.0F;
 		};
 		static_assert(
@@ -292,10 +302,79 @@ namespace Hook
 			// so lateral parallax can be tuned without camera yaw reading as
 			// depth. Z and W pad the block to the 16-byte cbuffer granularity.
 			XMFLOAT4 scopeDepthSeparation = { 0.0F, 0.0F, 0.0F, 0.0F };
+
+			// Vision modes. EnableNV/nvIntensity above are reused as the NV
+			// toggle and gain; these two whole 16-byte rows add the NV realism
+			// controls and the thermal-mode controls. They MUST match the
+			// appended block in Triangle.hlsli's b5 cbuffer field-for-field and
+			// the static_assert below -- the three are a hand-maintained
+			// triple, and HLSL drift is silent constant corruption.
+			int EnableThermal = 0;
+			float nvNoise = 0.0F;
+			float nvBloom = 0.0F;
+			int nvTint = 0;  // 0 = green phosphor, 1 = white phosphor
+
+			int thermalPalette = 0;  // 0 white-hot, 1 black-hot, 2 ironbow
+			float thermalContrast = 1.0F;
+			float thermalEdge = 0.0F;
+			float visionTime = 0.0F;  // seconds, animates NV scintillation
 		};
 		static_assert(
-			sizeof(ScopeEffectShaderData) == 368,
+			sizeof(ScopeEffectShaderData) == 400,
 			"ScopeEffectData must match Triangle.hlsli");
+
+		// Vision sources for the thermal + night-vision overlays, uploaded to
+		// the b6 cbuffer each frame. Mirrors HeatSourceData in Triangle.hlsli:
+		// a count plus 32 blobs. Each blob carries a screen position + radius
+		// and TWO channels -- a thermal strength (warm bodies and fire read hot
+		// on the thermal palette) and a light strength (any emitter blooms in
+		// night vision). Actors set thermal only; warm/fire lights set both;
+		// cold lights set light only. Occluded sources are dropped on the game
+		// thread before publication, so a blob here is always visible.
+		__declspec(align(16)) struct HeatSourceShaderData
+		{
+			int sourceCount = 0;
+			float srcPad0 = 0.0F;
+			float srcPad1 = 0.0F;
+			float srcPad2 = 0.0F;
+			// xy = normalized screen pos [0,1], z = radius (norm by height),
+			// w = thermal strength.
+			XMFLOAT4 sourceGeo[32] = {};
+			// x = light strength (NV bloom), y = warmth [0,1], zw reserved.
+			XMFLOAT4 sourceLight[32] = {};
+		};
+		static_assert(
+			sizeof(HeatSourceShaderData) == 1040,
+			"HeatSourceData must match Triangle.hlsli");
+
+		static constexpr std::size_t kMaxHeatSources = 32U;
+
+		// One vision blob as sampled on the game thread, before publication.
+		struct HeatSource
+		{
+			float x = 0.0F;               // normalized screen X [0,1]
+			float y = 0.0F;               // normalized screen Y [0,1]
+			float radius = 0.0F;          // blob radius, normalized by height
+			float thermalStrength = 0.0F; // heat contribution (~[0,2])
+			float lightStrength = 0.0F;   // NV-bloom contribution (~[0,2])
+			float warmth = 0.0F;          // 0 = cold light, 1 = fire/body
+		};
+
+		// Lock-free game->render publication of the heat list, mirroring the
+		// projectedLensSequence seqlock: the game thread bumps the sequence odd
+		// before writing any element and even after the last, and the render
+		// thread copies the whole array between two sequence reads, retrying on
+		// change. Per-field atomics keep it data-race-free with no mutex (this
+		// plugin has a deadlock history; see the lens-projection pattern).
+		struct HeatSourceAtomic
+		{
+			std::atomic<float> x{ 0.0F };
+			std::atomic<float> y{ 0.0F };
+			std::atomic<float> radius{ 0.0F };
+			std::atomic<float> thermalStrength{ 0.0F };
+			std::atomic<float> lightStrength{ 0.0F };
+			std::atomic<float> warmth{ 0.0F };
+		};
 
 		struct GameConstBuffer
 		{
@@ -535,6 +614,12 @@ namespace Hook
 			const PhysicalEyeBoxSample& physicalEyeBox);
 		void InvalidateLensProjection();
 		[[nodiscard]] LensProjectionSnapshot GetLensProjectionSnapshot() const;
+		// Game thread: publish up to kMaxHeatSources heat blobs for the thermal
+		// overlay via the seqlock (see HeatSourceAtomic). Only normalized
+		// scalars cross; no scene-graph pointer is handed to the render thread.
+		void PublishHeatSources(const HeatSource* sources, std::uint32_t count);
+		// Render thread: a coherent snapshot as a ready-to-upload b6 payload.
+		[[nodiscard]] HeatSourceShaderData GetHeatSourceSnapshot() const;
 		// Publish the exact renderer buffers owned by STS's required
 		// ScopeFade. DrawIndexedHook compares only opaque buffer identity and
 		// suballocation metadata. It never dereferences a scene-graph object
@@ -822,6 +907,7 @@ namespace Hook
 
 	public:
 		void SetNVG(int);
+		void SetThermal(int);
 		void SetGameConstData(GameConstBuffer);
 		void SetScopeEffect(bool);
 		bool GetScopeEffect();
@@ -849,6 +935,9 @@ namespace Hook
 		static std::atomic<float> scopeFadeMagnification;
 		static std::atomic<float> scopeImageDenoise;
 		static std::atomic<float> scopeImageSharpen;
+		// 0 bilinear / 1 bicubic / 2 Lanczos, as a float because the whole
+		// resolution buffer is floats. The shader rounds it back to an int.
+		static std::atomic<float> scopeMagnificationFilter;
 		static std::atomic<float> scopeFishEyeStrength;
 		static std::atomic<float> scopeFishEyePower;
 		static std::atomic<float> scopeEdgeRefractionStrength;
@@ -958,6 +1047,11 @@ namespace Hook
 		// if the value changes, preventing recoil from tearing center, basis,
 		// and eye displacement across different frames.
 		static std::atomic_uint64_t projectedLensSequence;
+		// Thermal heat-source publication (game->render seqlock, see
+		// HeatSourceAtomic). The sequence guards the whole array plus the count.
+		static std::atomic_uint64_t heatSourceSequence;
+		static std::atomic_uint32_t publishedHeatCount;
+		static std::array<HeatSourceAtomic, kMaxHeatSources> publishedHeatSources;
 		static std::atomic<std::uintptr_t> automaticSTSVertexBuffer;
 		static std::atomic<std::uintptr_t> automaticSTSIndexBuffer;
 		static std::atomic_uint32_t automaticSTSIndexCount;
@@ -1066,6 +1160,7 @@ namespace Hook
 		static bool bStartScope;
 		static bool bFinishAimAnim;
 		static int bEnableNVG;
+		static int bEnableThermal;
 		static bool bQueryRender;
 		static bool bIsInGame;
 
@@ -1076,6 +1171,7 @@ namespace Hook
 
 		ComPtr<ID3D11Buffer> m_pConstantBufferData = nullptr;
 		ComPtr<ID3D11Buffer> m_pScopeEffectBuffer = nullptr;
+		ComPtr<ID3D11Buffer> m_pHeatSourceBuffer = nullptr;
 		ComPtr<ID3D11Buffer> m_VSBuffer = nullptr;
 		ComPtr<ID3D11Buffer> m_VSOutBuffer = nullptr;
 

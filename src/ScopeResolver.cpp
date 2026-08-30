@@ -70,6 +70,11 @@ namespace MagnaScope
 			ScopeData::ShaderData out = from;
 
 			out.nvIntensity = Lerp(from.nvIntensity, to.nvIntensity, t);
+			out.nvNoise = Lerp(from.nvNoise, to.nvNoise, t);
+			out.nvBloom = Lerp(from.nvBloom, to.nvBloom, t);
+			out.thermalContrast =
+				Lerp(from.thermalContrast, to.thermalContrast, t);
+			out.thermalEdge = Lerp(from.thermalEdge, to.thermalEdge, t);
 			out.baseWeaponPos = Lerp(from.baseWeaponPos, to.baseWeaponPos, t);
 			out.movePercentage = Lerp(from.movePercentage, to.movePercentage, t);
 			out.camDepth = Lerp(from.camDepth, to.camDepth, t);
@@ -320,8 +325,23 @@ namespace MagnaScope
 			shaderData.apertureSurface = profile.shaderData.apertureSurface;
 			shaderData.reticleSurface = profile.shaderData.reticleSurface;
 			shaderData.IsCircle = profile.shaderData.IsCircle;
+			// An enum, not a quantity: reconstructing with "filter 1.4"
+			// mid-blend is meaningless, so the base profile's choice holds
+			// across every variant.
+			shaderData.magnificationFilter =
+				profile.shaderData.magnificationFilter;
 			shaderData.bEnableZMove = profile.shaderData.bEnableZMove;
 			shaderData.bCanEnableNV = profile.shaderData.bCanEnableNV;
+			shaderData.bCanEnableThermal =
+				profile.shaderData.bCanEnableThermal;
+			shaderData.bDefaultEnableNV =
+				profile.shaderData.bDefaultEnableNV;
+			shaderData.bDefaultEnableThermal =
+				profile.shaderData.bDefaultEnableThermal;
+			// Enums, like magnificationFilter: a mid-blend value is meaningless,
+			// so the base profile's choice holds across every variant.
+			shaderData.nvTint = profile.shaderData.nvTint;
+			shaderData.thermalPalette = profile.shaderData.thermalPalette;
 			shaderData.bBoltDisable = profile.shaderData.bBoltDisable;
 
 			LerpZoom(zoom, from.zoomDataOverwrite, to.zoomDataOverwrite, t);

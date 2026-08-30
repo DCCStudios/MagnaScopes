@@ -23,6 +23,117 @@ float2 SolvePixelOffset(
         safeDeterminant;
 }
 
+// ── Magnified-image reconstruction (SCOPE_MAGNIFICATION_FILTER) ───────────
+// 0 = bilinear (the original path, and the default so existing profiles
+// render identically), 1 = Catmull-Rom bicubic, 2 = Lanczos-2.
+//
+// Magnification here is an UPSAMPLE of the already-rendered frame: at 4x
+// each output pixel covers a quarter of a source texel, and bilinear's tent
+// kernel turns every texel into a soft blob at that ratio. A negative-lobe
+// kernel preserves edge slopes through the upsample instead. No filter can
+// add detail the frame never contained; these only reconstruct what is
+// there more faithfully. Any kernel undershoot is bounded downstream by the
+// existing local min/max neighborhood clamp on the sharpened result.
+
+float3 SampleSceneBicubic(float2 uv)
+{
+    // Catmull-Rom through 9 bilinear fetches (Jimenez): the middle pair of
+    // the four cubic weights per axis is positive, so each row/column pair
+    // collapses into one linear fetch at a weighted offset.
+    const float2 textureSize = float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+    const float2 samplePosition = uv * textureSize;
+    const float2 centerTexel = floor(samplePosition - 0.5f) + 0.5f;
+    const float2 f = samplePosition - centerTexel;
+    const float2 w0 = f * (-0.5f + f * (1.0f - 0.5f * f));
+    const float2 w1 = 1.0f + f * f * (-2.5f + 1.5f * f);
+    const float2 w2 = f * (0.5f + f * (2.0f - 1.5f * f));
+    const float2 w3 = f * f * (-0.5f + 0.5f * f);
+    const float2 w12 = w1 + w2;
+    const float2 offset12 = w2 / w12;
+    const float2 uv0 = (centerTexel - 1.0f) / textureSize;
+    const float2 uv3 = (centerTexel + 2.0f) / textureSize;
+    const float2 uv12 = (centerTexel + offset12) / textureSize;
+
+    float3 result = float3(0.0f, 0.0f, 0.0f);
+    result += tBACKBUFFER.SampleLevel(
+        gSamLinear, saturate(float2(uv0.x, uv0.y)), 0.0f).rgb * (w0.x * w0.y);
+    result += tBACKBUFFER.SampleLevel(
+        gSamLinear, saturate(float2(uv12.x, uv0.y)), 0.0f).rgb * (w12.x * w0.y);
+    result += tBACKBUFFER.SampleLevel(
+        gSamLinear, saturate(float2(uv3.x, uv0.y)), 0.0f).rgb * (w3.x * w0.y);
+    result += tBACKBUFFER.SampleLevel(
+        gSamLinear, saturate(float2(uv0.x, uv12.y)), 0.0f).rgb * (w0.x * w12.y);
+    result += tBACKBUFFER.SampleLevel(
+        gSamLinear, saturate(float2(uv12.x, uv12.y)), 0.0f).rgb * (w12.x * w12.y);
+    result += tBACKBUFFER.SampleLevel(
+        gSamLinear, saturate(float2(uv3.x, uv12.y)), 0.0f).rgb * (w3.x * w12.y);
+    result += tBACKBUFFER.SampleLevel(
+        gSamLinear, saturate(float2(uv0.x, uv3.y)), 0.0f).rgb * (w0.x * w3.y);
+    result += tBACKBUFFER.SampleLevel(
+        gSamLinear, saturate(float2(uv12.x, uv3.y)), 0.0f).rgb * (w12.x * w3.y);
+    result += tBACKBUFFER.SampleLevel(
+        gSamLinear, saturate(float2(uv3.x, uv3.y)), 0.0f).rgb * (w3.x * w3.y);
+    // The negative lobes can undershoot below zero on hard edges; black is
+    // the floor a color target can express.
+    return max(result, 0.0f);
+}
+
+float LanczosWeight(float x)
+{
+    // a = 2 windowed sinc. The sin(pi x) * sin(pi x / 2) product form keeps
+    // the 0/0 at the origin out of the expression entirely.
+    x = abs(x);
+    if (x < 0.0001f) {
+        return 1.0f;
+    }
+    if (x >= 2.0f) {
+        return 0.0f;
+    }
+    const float piX = 3.14159265358979f * x;
+    return 2.0f * sin(piX) * sin(piX * 0.5f) / (piX * piX);
+}
+
+float3 SampleSceneLanczos(float2 uv)
+{
+    // 4x4 taps at exact texel centres, where the linear sampler degenerates
+    // to a point fetch, so no second sampler state is needed. Weights are
+    // renormalized because the finite window's sum is not exactly one.
+    const float2 textureSize = float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+    const float2 samplePosition = uv * textureSize;
+    const float2 centerTexel = floor(samplePosition - 0.5f) + 0.5f;
+    const float2 f = samplePosition - centerTexel;
+    float3 accumulated = float3(0.0f, 0.0f, 0.0f);
+    float totalWeight = 0.0f;
+    [unroll]
+    for (int tapY = -1; tapY <= 2; ++tapY) {
+        const float weightY = LanczosWeight((float)tapY - f.y);
+        [unroll]
+        for (int tapX = -1; tapX <= 2; ++tapX) {
+            const float weight = LanczosWeight((float)tapX - f.x) * weightY;
+            const float2 tapUv = saturate(
+                (centerTexel + float2(tapX, tapY)) / textureSize);
+            accumulated +=
+                tBACKBUFFER.SampleLevel(gSamLinear, tapUv, 0.0f).rgb * weight;
+            totalWeight += weight;
+        }
+    }
+    return max(accumulated / max(totalWeight, 0.0001f), 0.0f);
+}
+
+float3 SampleSceneFiltered(float2 uv)
+{
+    // Uniform across the draw, so this branch costs a predicate, not a
+    // divergence.
+    const int filterMode = (int)(SCOPE_MAGNIFICATION_FILTER + 0.5f);
+    if (filterMode == 1) {
+        return SampleSceneBicubic(uv);
+    }
+    if (filterMode == 2) {
+        return SampleSceneLanczos(uv);
+    }
+    return tBACKBUFFER.SampleLevel(gSamLinear, uv, 0.0f).rgb;
+}
+
 float4 main(ScopeGeometryPixel input) : SV_Target0
 {
     const float2 screenUv = input.position.xy * PixelSize;
@@ -379,21 +490,17 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
 
     // Keep the green channel at the geometric sample and move red/blue by
     // equal, opposite sub-pixel amounts. At zero aberration this is exactly
-    // one ordinary texture sample.
-    const float3 baseCenterSample =
-        tBACKBUFFER.SampleLevel(gSamLinear, sampleUv, 0.0f).rgb;
+    // one reconstruction sample. The centre and the aberration channels all
+    // go through the profile's reconstruction filter; the denoise/sharpen
+    // neighbour cross below stays bilinear on purpose -- it only feeds
+    // difference weights, where kernel quality buys nothing visible.
+    const float3 baseCenterSample = SampleSceneFiltered(sampleUv);
     float3 centerSample = baseCenterSample;
     if (dot(chromaticOffset, chromaticOffset) > 0.00000001f) {
         centerSample.r =
-            tBACKBUFFER.SampleLevel(
-                gSamLinear,
-                saturate(sampleUv + chromaticOffset),
-                0.0f).r;
+            SampleSceneFiltered(saturate(sampleUv + chromaticOffset)).r;
         centerSample.b =
-            tBACKBUFFER.SampleLevel(
-                gSamLinear,
-                saturate(sampleUv - chromaticOffset),
-                0.0f).b;
+            SampleSceneFiltered(saturate(sampleUv - chromaticOffset)).b;
     }
     const float3 sampleLeft =
         tBACKBUFFER.SampleLevel(
@@ -511,6 +618,28 @@ float4 main(ScopeGeometryPixel input) : SV_Target0
                         max(sampleDownLeft, sampleDownRight)))));
     float3 opticalColor =
         clamp(sharpened, localMinimum, localMaximum);
+
+    // Vision modes (night vision / thermal). Applied to the finished optical
+    // image but BEFORE the scope shadow below, so the aperture vignette and
+    // exit pupil still darken the recolored image exactly as they darken the
+    // ordinary sight picture. Thermal reads the heat field in SOURCE space
+    // (sampleUv) so warm blobs track the magnified image; NV grain is a sensor
+    // effect and stays in output space (screenUv). A no-op unless a mode is on.
+    opticalColor = MS_ApplyVisionMode(
+        opticalColor,
+        screenUv,
+        sampleUv,
+        EnableThermal,
+        EnableNV,
+        nvIntensity,
+        nvNoise,
+        nvBloom,
+        (float)nvTint,
+        thermalPalette,
+        thermalContrast,
+        thermalEdge,
+        visionTime,
+        activation);
 
     // The physical ScopeFade aperture, its resting rim vignette, and the
     // moving exit pupil are three separate optical layers. Neither mask moves

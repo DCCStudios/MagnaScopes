@@ -196,6 +196,10 @@ namespace ImGuiImpl
 		float magnification = 1.0F;
 		float imageDenoise = 0.0F;
 		float imageSharpen = 0.0F;
+		// 0 bilinear / 1 Catmull-Rom bicubic / 2 Lanczos-2. Structural, so
+		// the variant resolver restores it from the base profile rather than
+		// interpolating it.
+		int magnificationFilter = 0;
 		float fishEyeStrength = 0.0F;
 		float fishEyePower = 2.0F;
 		float edgeRefractionStrength = 0.0F;
@@ -456,6 +460,7 @@ namespace ImGuiImpl
 		float edgeChromaticAberration_UI = 0.0F;
 		float imageDenoise_UI = 0.0F;
 		float imageSharpen_UI = 0.0F;
+		int magnificationFilter_UI = 0;
 		float reticleMagnification_UI = 1.0F;
 		float reticleShadowStrength_UI = 0.0F;
 		float reticleParallaxStrength_UI = 1.0F;
@@ -546,11 +551,22 @@ namespace ImGuiImpl
 		bool bEnableZMove;
 		bool bEnableNVGEffect;
 		float nvIntensity_UI;
+		bool bEnableThermalEffect;
+		bool bDefaultNVEffect;
+		bool bDefaultThermalEffect;
+		float nvNoise_UI;
+		float nvBloom_UI;
+		int nvTint_UI;
+		int thermalPalette_UI;
+		float thermalContrast_UI;
+		float thermalEdge_UI;
 		float baseWeaponPos_UI;
 		float MovePercentage_UI;
 
 		int nvgComboKeyIndex = 0;
 		int nvgMainKeyIndex = 0;
+		int thermalComboKeyIndex = 0;
+		int thermalMainKeyIndex = 0;
 		bool bDisableWhileBolt = false;
 
 		void MapScopeShaderEffect();

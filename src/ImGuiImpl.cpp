@@ -297,9 +297,38 @@ namespace ImGuiImpl
 			return;
 		}
 
-		// Keyboard only, deliberately: the optics key is a hold-and-scroll
-		// modifier, and a mouse binding would fight the wheel it modifies.
-		// The range starts past the mouse VKs.
+		// Mouse buttons bind too, encoded in the framework's mouse space
+		// (Middle=258, Mouse4=259, Mouse5=260). Left (0x01) and Right (0x02)
+		// are deliberately excluded: Left operates this very editor, and both
+		// are core weapon inputs -- Left fires and Right is ADS, which the
+		// scope requires to be visible at all -- so binding either would break
+		// the feature rather than serve it. The side buttons are the natural
+		// home for a hold-and-scroll modifier (WheelMenu uses Mouse4 the same
+		// way). GetAsyncKeyState reports these VKs, and they sit inside the
+		// held-at-start array, so the fresh-press guard already covers them.
+		struct MouseCapture
+		{
+			int vk;
+			unsigned int frameworkCode;
+		};
+		static constexpr MouseCapture kMouseCaptures[] = {
+			{ VK_MBUTTON, 258U },
+			{ VK_XBUTTON1, 259U },
+			{ VK_XBUTTON2, 260U },
+		};
+		for (const auto& capture : kMouseCaptures) {
+			if (!freshlyDown(capture.vk)) {
+				continue;
+			}
+			F4SEMenuFramework::Hotkeys::SetBinding(
+				kOpticsHotkeyIdUI, capture.frameworkCode);
+			logger::info(
+				"Optics key rebound to mouse code {}", capture.frameworkCode);
+			opticsCaptureActive = false;
+			return;
+		}
+
+		// Keyboard keys. The range starts past the mouse VKs (handled above).
 		for (int vk = 0x08; vk <= 0xFE; ++vk) {
 			if (vk == VK_ESCAPE || vk == VK_TAB) {
 				continue;
@@ -329,6 +358,16 @@ namespace ImGuiImpl
 	{
 		if (code == 0U) {
 			return "Unbound";
+		}
+		// Framework mouse-button codes (256+) have no keyboard scan-code name,
+		// so name them here rather than falling through to the hex fallback.
+		switch (code) {
+		case 256U: return "Mouse Left";
+		case 257U: return "Mouse Right";
+		case 258U: return "Mouse Middle";
+		case 259U: return "Mouse 4";
+		case 260U: return "Mouse 5";
+		default: break;
 		}
 		LONG lparam = static_cast<LONG>((code & 0x7FU) << 16);
 		if (code & 0x80U) {
@@ -370,6 +409,7 @@ namespace ImGuiImpl
 		sightShiftZ = std::clamp(sightShiftZ, -50.0F, 50.0F);
 		imageDenoise = std::clamp(imageDenoise, 0.0F, 1.0F);
 		imageSharpen = std::clamp(imageSharpen, 0.0F, 1.0F);
+		magnificationFilter = std::clamp(magnificationFilter, 0, 2);
 		fishEyeStrength = std::clamp(fishEyeStrength, 0.0F, 2.0F);
 		fishEyePower = std::clamp(fishEyePower, 0.5F, 6.0F);
 		edgeRefractionStrength = std::clamp(edgeRefractionStrength, 0.0F, 0.25F);
@@ -421,6 +461,7 @@ namespace ImGuiImpl
 		snapshot.magnification = shaderData.minZoom;
 		snapshot.imageDenoise = shaderData.imageDenoise;
 		snapshot.imageSharpen = shaderData.imageSharpen;
+		snapshot.magnificationFilter = shaderData.magnificationFilter;
 		snapshot.fishEyeStrength = shaderData.fishEyeStrength;
 		snapshot.fishEyePower = shaderData.fishEyePower;
 		snapshot.edgeRefractionStrength = shaderData.edgeRefractionStrength;
@@ -602,7 +643,7 @@ namespace ImGuiImpl
 		}
 	}
 
-	void KeyBindingSection(int& nvgComboKeyIndex, int& nvgMainKeyIndex)
+	void KeyBindingSection(int& nvgComboKeyIndex, int& nvgMainKeyIndex, int& thermalComboKeyIndex, int& thermalMainKeyIndex)
 	{
 		if (nvgComboKeyIndex == -1 || nvgMainKeyIndex == -1) {
 			return;
@@ -625,6 +666,21 @@ namespace ImGuiImpl
 		Tip("Key that switches the scope's night vision effect on and off while aiming.\n"
 			"Night vision must be enabled for the scope under Effects.");
 
+		thermalComboKeyIndex = sdh->comboThermalKey + 1;
+		thermalMainKeyIndex = sdh->thermalKey + 1;
+
+		if (ImGui::Combo("Thermal Vision Modifier Key", &thermalComboKeyIndex, mainKey, static_cast<int>(std::size(mainKey)))) {
+			sdh->SetThermalHotKeyCombo(thermalComboKeyIndex - 1);
+		}
+		Tip("Optional key held together with the toggle key to switch thermal vision.\n"
+			"Set to NONE to use the toggle key alone.");
+
+		if (ImGui::Combo("Thermal Vision Toggle Key", &thermalMainKeyIndex, mainKey, static_cast<int>(std::size(mainKey)))) {
+			sdh->SetThermalHotKeyMain(thermalMainKeyIndex - 1);
+		}
+		Tip("Key that switches the scope's thermal vision effect on and off while aiming.\n"
+			"Thermal vision must be enabled for the scope under Effects.");
+
 		// The optics key is owned by F4SE Menu Framework's hotkey registry, not
 		// by the Virtual-Key combos above. That registry works in DIK scan
 		// codes, which is the same code space Fallout reports for keyboard
@@ -643,7 +699,9 @@ namespace ImGuiImpl
 		// changes between the key name and the capture prompt.
 		const std::string opticsLabel =
 			(opticsCaptureActive
-					? std::string("Press a key...  (Esc cancels, Tab unbinds)")
+					? std::string(
+						  "Press a key or mouse button...  "
+						  "(Esc cancels, Tab unbinds)")
 					: OpticsKeyDisplayName(opticsBinding)) +
 			"##opticsKeyBind";
 
@@ -651,8 +709,10 @@ namespace ImGuiImpl
 			opticsCaptureActive = !opticsCaptureActive;
 			opticsCaptureArmPending = opticsCaptureActive;
 		}
-		Tip("Click, then press the key you want -- the next keypress becomes the "
-			"binding (Esc cancels, Tab unbinds).\n\n"
+		Tip("Click, then press the key or mouse button you want -- the next "
+			"press becomes the binding (Esc cancels, Tab unbinds). Mouse "
+			"Middle, Mouse 4 and Mouse 5 can be bound; Left and Right cannot, "
+			"since they are fire and aim.\n\n"
 			"Tap the bound key to cycle this scope's reticles; hold it and "
 			"scroll to switch to a secondary sight.\n\n"
 			"The binding lives in F4SE Menu Framework's PluginHotkeys.ini, so "
@@ -660,6 +720,16 @@ namespace ImGuiImpl
 			"about conflicts with other mods.\n\n"
 			"Reticle textures go in the 'reticles' folder beside the scope's "
 			"profile.json.");
+
+		ImGui::SeparatorText("Diagnostics");
+		bool verbose = logger::g_verbose.load(std::memory_order_relaxed);
+		if (ImGui::Checkbox("Verbose Logging", &verbose)) {
+			sdh->SetVerboseLogging(verbose);
+		}
+		Tip("Off by default. Writes the detailed per-frame telemetry to\n"
+			"MagnaScope.log and enables the frame-hang watchdog report\n"
+			"(MagnaScope.hang.txt). Turn on only when capturing a bug for\n"
+			"diagnosis; leave off for normal play.");
 	}
 
 	// Points the sliders at one variant's values.
@@ -756,6 +826,8 @@ namespace ImGuiImpl
 				data->shaderData.edgeChromaticAberration;
 			ins->imageDenoise_UI = data->shaderData.imageDenoise;
 			ins->imageSharpen_UI = data->shaderData.imageSharpen;
+			ins->magnificationFilter_UI = std::clamp(
+				data->shaderData.magnificationFilter, 0, 2);
 			ins->reticleMagnification_UI =
 				data->shaderData.reticleMagnification;
 			ins->reticleShadowStrength_UI =
@@ -852,6 +924,15 @@ namespace ImGuiImpl
 			ins->bEnableZMove = data->shaderData.bEnableZMove;
 			ins->bEnableNVGEffect = data->shaderData.bCanEnableNV;
 			ins->nvIntensity_UI = data->shaderData.nvIntensity;
+			ins->bEnableThermalEffect = data->shaderData.bCanEnableThermal;
+			ins->bDefaultNVEffect = data->shaderData.bDefaultEnableNV;
+			ins->bDefaultThermalEffect = data->shaderData.bDefaultEnableThermal;
+			ins->nvNoise_UI = data->shaderData.nvNoise;
+			ins->nvBloom_UI = data->shaderData.nvBloom;
+			ins->nvTint_UI = data->shaderData.nvTint;
+			ins->thermalPalette_UI = data->shaderData.thermalPalette;
+			ins->thermalContrast_UI = data->shaderData.thermalContrast;
+			ins->thermalEdge_UI = data->shaderData.thermalEdge;
 			ins->baseWeaponPos_UI = data->shaderData.baseWeaponPos;
 			ins->MovePercentage_UI = data->shaderData.movePercentage;
 
@@ -1364,6 +1445,9 @@ namespace ImGuiImpl
 		editedProfile.scopeFrame = scopeFrame_UI;
 		editedProfile.shaderData.IsCircle = IsCircle_UI;
 		editedProfile.shaderData.bCanEnableNV = bEnableNVGEffect;
+		editedProfile.shaderData.bCanEnableThermal = bEnableThermalEffect;
+		editedProfile.shaderData.bDefaultEnableNV = bDefaultNVEffect;
+		editedProfile.shaderData.bDefaultEnableThermal = bDefaultThermalEffect;
 		editedProfile.shaderData.baseWeaponPos = baseWeaponPos_UI;
 		editedProfile.shaderData.bEnableZMove = bEnableZMove;
 		editedProfile.shaderData.movePercentage = MovePercentage_UI;
@@ -1391,6 +1475,8 @@ namespace ImGuiImpl
 			edgeChromaticAberration_UI;
 		editedProfile.shaderData.imageDenoise = imageDenoise_UI;
 		editedProfile.shaderData.imageSharpen = imageSharpen_UI;
+		editedProfile.shaderData.magnificationFilter =
+			std::clamp(magnificationFilter_UI, 0, 2);
 		editedProfile.shaderData.reticleMagnification =
 			reticleMagnification_UI;
 		editedProfile.shaderData.reticleShadowStrength =
@@ -1443,6 +1529,12 @@ namespace ImGuiImpl
 			std::clamp(breathPupilFollow_UI, 0.0F, 2.0F);
 		editedProfile.shaderData.bBoltDisable = bDisableWhileBolt;
 		editedProfile.shaderData.nvIntensity = nvIntensity_UI;
+		editedProfile.shaderData.nvNoise = nvNoise_UI;
+		editedProfile.shaderData.nvBloom = nvBloom_UI;
+		editedProfile.shaderData.nvTint = nvTint_UI;
+		editedProfile.shaderData.thermalPalette = thermalPalette_UI;
+		editedProfile.shaderData.thermalContrast = thermalContrast_UI;
+		editedProfile.shaderData.thermalEdge = thermalEdge_UI;
 		editedProfile.shaderData.fovAdjust = fovBase_UI;
 
 		editedProfile.shaderData.rectSize[0] = Size_rect_UI[0];
@@ -1630,6 +1722,7 @@ namespace ImGuiImpl
 		scopeData.MovePercentage = MovePercentage_UI;
 		scopeData.EnableZMove = bEnableZMove;
 		scopeData.EnableNV = bEnableNVGEffect;
+		scopeData.EnableThermal = bEnableThermalEffect;
 
 		scopeData.isCircle = IsCircle_UI;
 		scopeData.camDepth = camDepth_UI;
@@ -1639,6 +1732,12 @@ namespace ImGuiImpl
 		scopeData.rect = { Size_rect_UI_A[0], Size_rect_UI_A[1], Size_rect_UI_A[2], Size_rect_UI_A[3] };
 
 		scopeData.nvIntensity = nvIntensity_UI;
+		scopeData.nvNoise = nvNoise_UI;
+		scopeData.nvBloom = nvBloom_UI;
+		scopeData.nvTint = nvTint_UI;
+		scopeData.thermalPalette = thermalPalette_UI;
+		scopeData.thermalContrast = thermalContrast_UI;
+		scopeData.thermalEdge = thermalEdge_UI;
 
 		scopeData.FishEyeStrength = fishEyeStrength_UI;
 		scopeData.FishEyePower = fishEyePower_UI;
@@ -2212,6 +2311,32 @@ namespace ImGuiImpl
 				"%.2f");
 			Tip("Separates red and blue by a bounded number of source pixels\n"
 				"inside the refracted rim. 0 disables color separation.");
+			{
+				// Reconstruction filter for the magnified sample. Stored as
+				// an int on ShaderData; structural, so variants share it.
+				static const char* kFilterNames[] = {
+					"Bilinear (original)",
+					"Bicubic (Catmull-Rom)",
+					"Lanczos-2",
+				};
+				int filterIndex =
+					std::clamp(magnificationFilter_UI, 0, 2);
+				if (ImGui::Combo(
+						"Magnification Filter",
+						&filterIndex,
+						kFilterNames,
+						3)) {
+					magnificationFilter_UI = filterIndex;
+				}
+				Tip("How the magnified image is reconstructed from the "
+					"rendered frame.\n\n"
+					"Bilinear is the original look. Bicubic keeps edges "
+					"crisper through high magnification for a small GPU "
+					"cost; Lanczos-2 is sharper still and the most "
+					"expensive.\n\n"
+					"No filter can add detail the frame never contained -- "
+					"these only reconstruct what is there more faithfully.");
+			}
 			ImGui::DragFloat(
 				"Edge-Aware Cleanup",
 				&imageDenoise_UI,
@@ -2304,8 +2429,39 @@ namespace ImGuiImpl
 			ImGui::Checkbox("Night Vision", &bEnableNVGEffect);
 			Tip("Allows a night-vision tint inside the scope, switched in game with\n"
 				"the hotkeys configured above.");
+			ImGui::Checkbox("Night Vision On By Default", &bDefaultNVEffect);
+			Tip("Start night vision already on when this scope is equipped, instead\n"
+				"of requiring the hotkey each time. The hotkey still toggles it.");
 			ImGui::DragFloat("Night Vision Intensity", &nvIntensity_UI, 0.1F, 0, 1000);
 			Tip("Brightness gain of the night-vision effect.");
+			ImGui::DragFloat("NV Grain", &nvNoise_UI, 0.01F, 0.0F, 1.0F, "%.2f");
+			Tip("Amount of animated scintillation noise the intensifier adds to\n"
+				"the image. Higher values look grainier under low light.");
+			ImGui::DragFloat("NV Bloom", &nvBloom_UI, 0.01F, 0.0F, 1.0F, "%.2f");
+			Tip("How much bright sources smear and halo through the tube. Higher\n"
+				"values bloom highlights more aggressively.");
+			const char* nvTintItems[] = { "Green Phosphor", "White Phosphor" };
+			ImGui::Combo("NV Phosphor", &nvTint_UI, nvTintItems, 2);
+			Tip("Phosphor color of the intensifier: classic green or modern white.");
+
+			ImGui::Spacing();
+
+			ImGui::Checkbox("Thermal Vision", &bEnableThermalEffect);
+			Tip("Allows a thermal imaging mode inside the scope, switched in game\n"
+				"with the thermal hotkey. Thermal takes precedence over night vision\n"
+				"when both are active.");
+			ImGui::Checkbox("Thermal Vision On By Default", &bDefaultThermalEffect);
+			Tip("Start thermal already on when this scope is equipped, instead of\n"
+				"requiring the hotkey each time. The hotkey still toggles it.");
+			const char* thermalPaletteItems[] = { "White Hot", "Black Hot", "Red Hot", "Rainbow" };
+			ImGui::Combo("Thermal Palette", &thermalPalette_UI, thermalPaletteItems, 4);
+			Tip("False-color mapping for the thermal image.");
+			ImGui::DragFloat("Thermal Contrast", &thermalContrast_UI, 0.01F, 0.0F, 4.0F, "%.2f");
+			Tip("Contrast gain applied to the thermal signal. Higher values widen\n"
+				"the spread between hot and cold regions.");
+			ImGui::DragFloat("Thermal Edge", &thermalEdge_UI, 0.01F, 0.0F, 2.0F, "%.2f");
+			Tip("Emphasizes silhouettes by outlining thermal edges. 0 disables the\n"
+				"edge highlight.");
 
 			ImGui::Spacing();
 
@@ -2568,7 +2724,7 @@ namespace ImGuiImpl
 		ImGui::PushItemWidth(ImGui::GetFontSize() * 14.0F);
 
 		GeneralSettingsSection();
-		KeyBindingSection(instance->nvgComboKeyIndex, instance->nvgMainKeyIndex);
+		KeyBindingSection(instance->nvgComboKeyIndex, instance->nvgMainKeyIndex, instance->thermalComboKeyIndex, instance->thermalMainKeyIndex);
 
 		ResetUIData(instance);
 
@@ -2674,6 +2830,7 @@ namespace ImGuiImpl
 			preview.magnification = instance->minZoom_UI;
 			preview.imageDenoise = instance->imageDenoise_UI;
 			preview.imageSharpen = instance->imageSharpen_UI;
+			preview.magnificationFilter = instance->magnificationFilter_UI;
 			preview.fishEyeStrength = instance->fishEyeStrength_UI;
 			preview.fishEyePower = instance->fishEyePower_UI;
 			preview.edgeRefractionStrength = instance->edgeRefractionStrength_UI;

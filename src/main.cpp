@@ -1,6 +1,7 @@
 #include "ScopeProfile.h"
 #include "EyeBoxRecentering.h"
 #include "ImGuiImpl.h"
+#include "Raycast.h"
 #include "ScopeResolver.h"
 #include "ScopeCoSave.h"
 #define MAGNASCOPE_INTERNAL
@@ -272,6 +273,13 @@ bool bChangeAnimFlag = false;
 bool nvgFlag = false;
 bool hasCombo = false;
 bool hasNvgCommit = false;
+bool thermalFlag = false;
+// The profile whose default-on state was last applied. Selection runs every
+// frame while equipped, so default-on is seeded only when this changes -- that
+// way the live hotkey can still toggle a mode within a scope's session without
+// being re-forced on the next frame.
+ScopeData::ScopeProfile* lastVisionSeededProfile = nullptr;
+bool hasThermalCombo = false;
 bool InGameFlag = false;
 bool IsHooked = false;
 bool bHasStartedScope = false;
@@ -1947,7 +1955,7 @@ void PublishApertureCandidates(
 		summary += candidate.name;
 		summary += candidate.annulus ? " (annulus)" : " (plain)";
 	}
-	logger::info("Aperture candidates: {}", summary);
+	logger::verbose("Aperture candidates: {}", summary);
 
 	// Read-only probe. Whether the CPU vertex shadow survives for first-person
 	// weapon meshes decides whether the aperture can be measured directly or
@@ -1958,7 +1966,7 @@ void PublishApertureCandidates(
 	for (const auto& candidate : candidates) {
 		const auto measurement = MeasureApertureVerticesCached(candidate.shape);
 		if (!measurement.measured) {
-			logger::info(
+			logger::verbose(
 				"Aperture vertex probe '{}': UNAVAILABLE ({}); "
 				"dataPointer={}, invalidCpuData={}, vertices={}, stride={}, "
 				"fullPrecision={}, dataOffset={}, dataSize={}, maxDataSize={}, "
@@ -1978,7 +1986,7 @@ void PublishApertureCandidates(
 			continue;
 		}
 		constexpr const char* kAxisNames[3]{ "X", "Y", "Z" };
-		logger::info(
+		logger::verbose(
 			"Aperture vertex probe '{}': vertices={}, stride={}, "
 			"fullPrecision={}, centroid=({:.4f}, {:.4f}, {:.4f}), "
 			"halfExtents=({:.4f}, {:.4f}, {:.4f}), opticalAxis=local{}, "
@@ -2462,7 +2470,7 @@ STSApertureSelection FindSTSAperture(RE::NiAVObject* firstPersonRoot)
 			const RE::NiPoint3 centreShift =
 				synthesisMeasurement.opticalCenter -
 				synthesisMeasurement.centroid;
-			logger::info(
+			logger::verbose(
 				"Aperture sizing for '{}' (optic from '{}'): "
 				"heuristic={:.4f}, measured={:.4f}, "
 				"heuristicOverMeasured={:.3f}, innerRatio={:.3f}, "
@@ -3039,7 +3047,7 @@ void FireSightSwapGraphEvents(bool logEachEvent = true)
 		const bool handled = player->NotifyAnimationGraphImpl(
 			RE::BSFixedString(token.c_str()));
 		if (logEachEvent) {
-			logger::info(
+			logger::verbose(
 				"[sight] graph event '{}' fired (handled={})",
 				token,
 				handled);
@@ -3100,7 +3108,7 @@ void ReconcileSightZoomPointer()
 		originalZoomInstance->zoomData = desired;
 		installedSightZoom =
 			desired == originalZoomForm ? nullptr : desired;
-		logger::info(
+		logger::verbose(
 			"[sight] instance zoom pointer -> {} (sight index {})",
 			desired == originalZoomForm ? "authored form" : "runtime form",
 			state.secondaryIndex);
@@ -3115,7 +3123,7 @@ void RestoreSightZoomPointer()
 	if (originalZoomInstance && originalZoomForm && installedSightZoom &&
 		originalZoomInstance->zoomData == installedSightZoom) {
 		originalZoomInstance->zoomData = originalZoomForm;
-		logger::info(
+		logger::verbose(
 			"[sight] instance zoom pointer restored to the authored form");
 	}
 	installedSightZoom = nullptr;
@@ -3159,7 +3167,7 @@ void DriveSightZoomTransition(const ScopeData::ZoomDataOverwrite& blended)
 	const bool settledThisTick = !inFlight && wasInFlight;
 	if (inFlight != wasInFlight) {
 		wasInFlight = inFlight;
-		logger::info(
+		logger::verbose(
 			"[sight] transition {} (blend={:.2f}, target={:.0f})",
 			inFlight ? "started" : "settled",
 			state.sightBlend,
@@ -3309,6 +3317,9 @@ inline void InitCurrentScopeData()
 		bFirstTimeZoomData =
 			settings.AllowsOverrides() &&
 			profile != nullptr && containsAllAdditionalKeywords;
+		// Default-on is applied when actually sighted (see HookedUpdate), not
+		// here: profile selection runs at equip, before the profile has been
+		// configured/saved, so seeding here would latch the wrong state.
 	};
 
 	const auto clearSelection = [] {
@@ -3319,6 +3330,9 @@ inline void InitCurrentScopeData()
 		currentData = nullptr;
 		weaponInstanceData = nullptr;
 		bFirstTimeZoomData = false;
+		// Re-arm default-on so the next scope (even the same one re-equipped)
+		// applies its default again.
+		lastVisionSeededProfile = nullptr;
 	};
 
 	if (!player || !player->currentProcess || !player->currentProcess->middleHigh) {
@@ -3561,6 +3575,13 @@ std::atomic<int> pendingReticleCycle{ 0 };
 constexpr const char* kOpticsHotkeyId = "MagnaScope.Optics";
 // DIK_X. Only a default; the framework's persisted binding wins.
 constexpr unsigned int kOpticsHotkeyDefault = 0x2D;
+// The framework encodes mouse buttons as scan codes starting at 256
+// (MouseLeft=256, MouseRight=257, MouseMiddle=258, Mouse4=259, Mouse5=260),
+// deliberately above the 8-bit DIK range so a keyboard key and a mouse button
+// can never collide. Any bound code at or above this is a mouse button. This
+// is the same unified 0x100+ space Fallout's ButtonEvent also reports mouse
+// ids in, which is why the runtime comparison below needs no per-code table.
+constexpr unsigned int kMouseBindingBase = 256U;
 
 [[nodiscard]] bool RouteVariantScroll(int direction)
 {
@@ -3578,7 +3599,7 @@ constexpr unsigned int kOpticsHotkeyDefault = 0x2D;
 				.count());
 		if (now != lastReport) {
 			lastReport = now;
-			logger::info(
+			logger::verbose(
 				"Wheel not routed to variants: enabled={}, variantCount={}. "
 				"Free-scroll zoom is handling it instead.",
 				currentData->variants.enabled,
@@ -3657,7 +3678,7 @@ void ApplyPendingSightInput()
 		MagnaScope::CycleSecondarySight(*currentData, state, sightDelta)) {
 		// The resolver lerps the form's zoom data toward the new sight from
 		// here on; the player stays sighted throughout.
-		logger::info(
+		logger::verbose(
 			"[sight] switched to index {} (lerp, no state change)",
 			state.secondaryIndex);
 	}
@@ -3735,7 +3756,7 @@ void PollOpticsKey()
 		opticsKeyHeld.store(true, std::memory_order_relaxed);
 		opticsKeyConsumedByScroll.store(false, std::memory_order_relaxed);
 		opticsKeyPressTime = std::chrono::steady_clock::now();
-		logger::info("[input] optics key DOWN (poll, scan 0x{:02X})", boundCode);
+		logger::verbose("[input] optics key DOWN (poll, scan 0x{:02X})", boundCode);
 	} else if (!down && wasDown) {
 		// Reticle cycling fires on release: that distinguishes a tap from a
 		// hold without delaying the tap, and a hold that consumed a scroll
@@ -3751,7 +3772,7 @@ void PollOpticsKey()
 		}
 		opticsKeyHeld.store(false, std::memory_order_relaxed);
 		opticsKeyConsumedByScroll.store(false, std::memory_order_relaxed);
-		logger::info("[input] optics key UP (poll, held {:.2f}s)", heldSeconds);
+		logger::verbose("[input] optics key UP (poll, held {:.2f}s)", heldSeconds);
 	}
 	wasDown = down;
 }
@@ -3763,6 +3784,36 @@ void PollOpticsKey()
 // Runs on the input thread. It publishes nothing directly into the session map
 // (game-thread-owned); it only accumulates atomic deltas the game thread
 // drains. Returns false always -- MagnaScope observes input, never consumes it.
+// The optics key's press/release semantics, shared by the bound keyboard key
+// and a bound mouse button so the two behave identically: a fresh press arms
+// the hold state (the wheel handler reads opticsKeyHeld to route a
+// secondary-sight switch), and a release that was neither consumed by a scroll
+// nor held past the tap threshold cycles the reticle. `source` only labels the
+// diagnostic line.
+void ApplyOpticsKeyTransition(const ButtonEvent* button, const char* source)
+{
+	if (button->QJustPressed()) {
+		opticsKeyHeld.store(true, std::memory_order_relaxed);
+		opticsKeyConsumedByScroll.store(false, std::memory_order_relaxed);
+		opticsKeyPressTime = std::chrono::steady_clock::now();
+		logger::verbose("[input] optics key DOWN ({})", source);
+	} else if (button->value == 0.0F) {
+		const auto heldSeconds =
+			std::chrono::duration<float>(
+				std::chrono::steady_clock::now() - opticsKeyPressTime)
+				.count();
+		if (opticsKeyHeld.load(std::memory_order_relaxed) &&
+			!opticsKeyConsumedByScroll.load(std::memory_order_relaxed) &&
+			heldSeconds < kOpticsTapSeconds) {
+			RouteReticleCycle(1);
+		}
+		opticsKeyHeld.store(false, std::memory_order_relaxed);
+		opticsKeyConsumedByScroll.store(false, std::memory_order_relaxed);
+		logger::verbose(
+			"[input] optics key UP ({}, held {:.2f}s)", source, heldSeconds);
+	}
+}
+
 bool __stdcall MagnaScopeInputCallback(RE::InputEvent* rawEvent)
 {
 	// This CommonLibF4 revision has no AsButtonEvent; check eventType and cast,
@@ -3795,7 +3846,7 @@ bool __stdcall MagnaScopeInputCallback(RE::InputEvent* rawEvent)
 					.count());
 			if (nowSec != lastWheelLog) {
 				lastWheelLog = nowSec;
-				logger::info(
+				logger::verbose(
 					"[input] wheel dir={} opticsHeld={} sights={}",
 					direction,
 					held ? 1 : 0,
@@ -3810,6 +3861,23 @@ bool __stdcall MagnaScopeInputCallback(RE::InputEvent* rawEvent)
 					hookIns->AdjustZoomDelta(0.1F * direction);
 				}
 			}
+			return false;
+		}
+
+		// Not the wheel. A bound MOUSE BUTTON is the optics key, behaving
+		// exactly like a bound keyboard key: tap to cycle reticles, hold and
+		// scroll to switch sights. The framework stores mouse buttons at
+		// codes 256+, and Fallout reports mouse button ids either raw
+		// (0..7 -- left/right/middle/x1/x2) or already unified (0x100+), the
+		// same dual form the wheel arrives in; normalise to the unified space
+		// so a single comparison covers both input paths.
+		const auto boundCode =
+			F4SEMenuFramework::Hotkeys::GetBinding(kOpticsHotkeyId);
+		if (boundCode >= kMouseBindingBase) {
+			const auto unifiedId = id >= 0x100U ? id : id + 0x100U;
+			if (unifiedId == boundCode) {
+				ApplyOpticsKeyTransition(button, "mouse");
+			}
 		}
 		return false;
 	}
@@ -3818,12 +3886,20 @@ bool __stdcall MagnaScopeInputCallback(RE::InputEvent* rawEvent)
 		return false;
 	}
 
+	// A mouse-button binding is handled entirely in the mouse branch above; no
+	// keyboard event can match it, so skip the VK conversion (which is
+	// meaningless for a 256+ code) and leave the key path for keyboard binds.
+	if (F4SEMenuFramework::Hotkeys::GetBinding(kOpticsHotkeyId) >=
+		kMouseBindingBase) {
+		return false;
+	}
+
 	// DIAGNOSTIC: log every fresh keyboard press's idCode reaching this
 	// callback, to reveal whether the dispatched keyboard code is DIK (matches
 	// the 0x15 binding) or VK (e.g. 0x59 for Y) or something else. The framework
 	// confirms keyboard events DO reach here (btn kbd=1); this shows their code.
 	if (button->QJustPressed()) {
-		logger::info(
+		logger::verbose(
 			"[input] kbd press reached callback: scan 0x{:02X} (optics bound 0x{:02X})",
 			id,
 			F4SEMenuFramework::Hotkeys::GetBinding(kOpticsHotkeyId));
@@ -3852,26 +3928,7 @@ bool __stdcall MagnaScopeInputCallback(RE::InputEvent* rawEvent)
 		return false;
 	}
 
-	if (button->QJustPressed()) {
-		opticsKeyHeld.store(true, std::memory_order_relaxed);
-		opticsKeyConsumedByScroll.store(false, std::memory_order_relaxed);
-		opticsKeyPressTime = std::chrono::steady_clock::now();
-		logger::info("[input] optics key DOWN (callback, scan 0x{:02X})", id);
-	} else if (button->value == 0.0F) {
-		const auto heldSeconds =
-			std::chrono::duration<float>(
-				std::chrono::steady_clock::now() - opticsKeyPressTime)
-				.count();
-		if (opticsKeyHeld.load(std::memory_order_relaxed) &&
-			!opticsKeyConsumedByScroll.load(std::memory_order_relaxed) &&
-			heldSeconds < kOpticsTapSeconds) {
-			RouteReticleCycle(1);
-		}
-		opticsKeyHeld.store(false, std::memory_order_relaxed);
-		opticsKeyConsumedByScroll.store(false, std::memory_order_relaxed);
-		logger::info("[input] optics key UP (callback, held {:.2f}s)", heldSeconds);
-	}
-
+	ApplyOpticsKeyTransition(button, "keyboard");
 	return false;
 }
 
@@ -3932,6 +3989,28 @@ public:
 					if (hasCombo && id == (uint32_t)sdh->nvKey && evn->QJustPressed()) {
 						nvgFlag = !nvgFlag;
 						hookIns->SetNVG((int)nvgFlag);
+					}
+				}
+
+				// Thermal Vision toggle, mirroring the night-vision handler
+				// above: either a bare key or a modifier + key combo.
+				if (sdh->comboThermalKey == -1) {
+					if (id == (uint32_t)sdh->thermalKey && evn->QJustPressed()) {
+						thermalFlag = !thermalFlag;
+						hookIns->SetThermal((int)thermalFlag);
+					}
+				} else {
+					if (id == (uint32_t)(sdh->comboThermalKey) && evn->heldDownSecs > 0 && evn->value == 1) {
+						hasThermalCombo = true;
+					}
+
+					if (id == (uint32_t)(sdh->comboThermalKey) && evn->value == 0) {
+						hasThermalCombo = false;
+					}
+
+					if (hasThermalCombo && id == (uint32_t)sdh->thermalKey && evn->QJustPressed()) {
+						thermalFlag = !thermalFlag;
+						hookIns->SetThermal((int)thermalFlag);
 					}
 				}
 			}
@@ -4463,7 +4542,7 @@ void UpdateScopeOcclusion(RE::NiAVObject* firstPersonRoot, RE::NiAVObject* glass
 	walk(scopeAiming);
 
 	ImGuiImpl::PublishOcclusionShapes(shapeNames);
-	logger::info(
+	logger::verbose(
 		"[occlusion] rebuilt: {} shape(s) considered, {} substituted, "
 		"radius={:.2f} frontOnly={} excludes={}",
 		consideredShapes,
@@ -4502,6 +4581,296 @@ void HandleScopeNode()
 			} else
 				SetNodeVisibility(scopeNormalNode_i, scopeAimingNode_i, true);
 		}
+	}
+}
+
+// Game thread: build the thermal overlay's heat list from nearby living actors
+// and publish it to the render thread through the lock-free seqlock. Runs only
+// while the thermal mode is toggled on. Actors are projected with the WORLD
+// camera at worldFOV, so their normalized screen positions match where they
+// appear in the backbuffer the scope samples; the magnify shader evaluates the
+// blobs in that same source space, so magnification needs no compensation here.
+// Only normalized scalars are published -- no scene-graph pointer crosses to
+// the render thread.
+// One light/fire candidate read from the cell under its lock, before the
+// (reentrant) projection + raycast run unlocked. Kept small and POD so the
+// locked section is nothing but cheap field reads.
+struct PendingLightSource
+{
+	RE::NiPoint3 position{};
+	float thermalStrength = 0.0F;
+	float lightStrength = 0.0F;
+	float warmth = 0.0F;
+};
+
+// Game-thread producer for both overlays. Actors feed the thermal channel;
+// light/fire emitters feed the light channel (NV bloom) plus thermal when warm.
+// Every candidate is projected, off-screen-culled, then occlusion-tested with a
+// camera->source ray, so a source behind cover never glows. Runs on
+// PCUpdateMainThread (main thread), where cell iteration and Havok picks are
+// safe. Published lock-free via the heat seqlock.
+// a_cameraNode / a_fov MUST be the same first-person "Camera" node and FOV the
+// aperture projection uses (firstPersonRoot->GetObjectByName("Camera"),
+// pcam->firstPersonFOV) -- projecting world objects through any other node
+// (e.g. PlayerCamera::cameraRoot) puts them behind the camera, collapsing the
+// projected radius so ProjectWorldSphereToScreen reports invalid and every
+// source is dropped. That was why no body ever lit up.
+static void PublishVisionSources(
+	RE::PlayerCharacter* a_player,
+	bool a_wantThermal,
+	bool a_wantNV)
+{
+	auto* hook = D3D::GetSington();
+	if (!hook) {
+		return;
+	}
+
+	std::array<D3D::HeatSource, D3D::kMaxHeatSources> sources{};
+	std::uint32_t count = 0U;
+
+	// Verbose diagnostics: how many candidates were considered, dropped
+	// off-screen, culled by occlusion, and finally published. Lets a bug report
+	// (with Verbose Logging on) distinguish "no sources found" from "occlusion
+	// ate them" without a debugger.
+	int diagConsidered = 0;
+	int diagOffscreen = 0;
+	int diagOccluded = 0;
+
+	// Project through the game's WORLD camera (worldToCam), which is what
+	// actually renders the backbuffer the magnify shader samples. MagnaScope's
+	// own WorldPointToScreen is FIRST-PERSON-scene-graph space and silently
+	// rejects every main-world point -- that is why no actor, light, or the sun
+	// ever lit up. Actors, placed lights, and the sun are all main-world space.
+	auto* worldCam = RE::Main::WorldRootCamera();
+	if (worldCam) {
+		const auto& m = worldCam->worldToCam;
+		const RE::NiPoint3 camPos = worldCam->world.translate;
+
+		// World -> backbuffer UV [0,1] (y-down). Returns false behind camera.
+		// Same worldToCam row-vector projection + perspective divide the debug
+		// overlays use.
+		const auto worldToUv =
+			[&](const RE::NiPoint3& w, float& u, float& v) -> bool {
+			const float trace =
+				w.x * m[3][0] + w.y * m[3][1] + w.z * m[3][2] + m[3][3];
+			if (trace <= 0.00001F) {
+				return false;  // behind the camera
+			}
+			const float inv = 1.0F / trace;
+			const float x =
+				(w.x * m[0][0] + w.y * m[0][1] + w.z * m[0][2] + m[0][3]) * inv;
+			const float y =
+				(w.x * m[1][0] + w.y * m[1][1] + w.z * m[1][2] + m[1][3]) * inv;
+			u = (x + 1.0F) * 0.5F;
+			v = 1.0F - (y + 1.0F) * 0.5F;  // NDC y-up -> texture v (y-down)
+			return std::isfinite(u) && std::isfinite(v);
+		};
+
+		// Project a world source, cull off-screen, occlusion-test, and append a
+		// blob. Only on-screen candidates are raycast, so the per-frame cast
+		// count is bounded by what is actually visible through the optic.
+		const auto tryAdd = [&](const RE::NiPoint3& worldCenter,
+								float worldRadius, float thermalStrength,
+								float lightStrength, float warmth) {
+			++diagConsidered;
+			if (count >= D3D::kMaxHeatSources || !(worldRadius > 0.0F)) {
+				return;
+			}
+			float u = 0.0F;
+			float v = 0.0F;
+			if (!worldToUv(worldCenter, u, v)) {
+				return;  // behind camera
+			}
+			if (u < -0.25F || u > 1.25F || v < -0.25F || v > 1.25F) {
+				++diagOffscreen;
+				return;
+			}
+			// Blob radius: project a world-up offset and take the screen delta
+			// (height-normalized, matching the shader's g.z * BUFFER_HEIGHT).
+			float ru = 0.0F;
+			float rv = 0.0F;
+			float radius = 0.01F;
+			if (worldToUv({ worldCenter.x, worldCenter.y,
+							worldCenter.z + worldRadius },
+					ru, rv)) {
+				radius = std::max(radius, std::abs(rv - v));
+			}
+			// Cap well under a scope-filling disk: a bounding-sphere radius over-
+			// covers the visible object, and the scope then magnifies it further.
+			radius = std::clamp(radius, 0.004F, 0.09F);
+			// Occlusion: a solid hit closer than the source (minus its own
+			// radius, so a hit on the source's near surface does not self-cull)
+			// means it sits behind cover and must not glow.
+			const RE::NiPoint3 delta{ worldCenter.x - camPos.x,
+									  worldCenter.y - camPos.y,
+									  worldCenter.z - camPos.z };
+			const float dist = std::sqrt(
+				delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+			MagnaScope::Raycast::RayHit rayHit;
+			if (MagnaScope::Raycast::Cast(camPos, worldCenter, rayHit) &&
+				rayHit.distance < dist - worldRadius) {
+				++diagOccluded;
+				return;
+			}
+			sources[count].x = u;
+			sources[count].y = v;
+			sources[count].radius = radius;
+			sources[count].thermalStrength = thermalStrength;
+			sources[count].lightStrength = lightStrength;
+			sources[count].warmth = warmth;
+			++count;
+		};
+
+		// 1) Living actors -> body heat (thermal only; a person emits no light,
+		// so it never blooms night vision). Skipped when thermal is off.
+		if (a_wantThermal) {
+			auto* processLists = RE::ProcessLists::GetSingleton();
+			if (processLists) {
+				for (const RE::ActorHandle& handle :
+					processLists->highActorHandles) {
+					if (count >= D3D::kMaxHeatSources) {
+						break;
+					}
+					const RE::NiPointer<RE::Actor> actorPtr = handle.get();
+					RE::Actor* actor = actorPtr.get();
+					if (!actor || actor == a_player || actor->IsPlayerRef()) {
+						continue;
+					}
+					if (actor->IsDead(false)) {  // corpses cool off
+						continue;
+					}
+					RE::NiAVObject* actor3D = actor->Get3D();
+					if (!actor3D) {
+						continue;
+					}
+					// 0.5x the bounding sphere: the visible body is smaller than the
+				// sphere that encloses it, so this keeps the hot spot on the
+				// animal rather than a halo around it.
+				tryAdd(actor3D->worldBound.center,
+						actor3D->worldBound.fRadius * 0.5F, 1.5F, 0.0F, 1.0F);
+				}
+			}
+		}
+
+		// 2) Light / fire emitters -> NV bloom, plus thermal heat when warm.
+		// Enumerated whenever either mode is on. The cell references are read
+		// under the cell spin lock into locals ONLY; the projection + raycast
+		// then run UNLOCKED, because cell->Pick can take that same lock and a
+		// BSSpinLock is not recursive (deadlock otherwise -- the same
+		// read-under-lock / process-outside discipline the OAR fix uses).
+		if (a_wantThermal || a_wantNV) {
+			std::array<PendingLightSource, 64> pending{};
+			std::size_t pendingCount = 0U;
+			if (RE::TESObjectCELL* cell =
+					a_player ? a_player->parentCell : nullptr) {
+				RE::BSAutoLock lock{ cell->spinLock };
+				for (const RE::NiPointer<RE::TESObjectREFR>& refPtr :
+					cell->references) {
+					if (pendingCount >= pending.size()) {
+						break;
+					}
+					RE::TESObjectREFR* ref = refPtr.get();
+					if (!ref) {
+						continue;
+					}
+					RE::TESBoundObject* base = ref->GetObjectReference();
+					if (!base ||
+						base->formType != RE::ENUM_FORM_ID::kLIGH) {
+						continue;
+					}
+					auto* ligh = static_cast<RE::TESObjectLIGH*>(base);
+					const float fade =
+						std::isfinite(ligh->fade) ? ligh->fade : 1.0F;
+					const float lightStrength =
+						std::clamp(fade, 0.2F, 2.0F) * 1.2F;
+					// Light temperature is DERIVED FROM INTENSITY: a brighter
+					// light reads hotter on thermal. Flickering sources
+					// (torches/fire) are pinned hot regardless, since flame is
+					// hot even when dim. Flag bits (0x8 Flicker, 0x40
+					// FlickerSlow, 0x80 Pulse, 0x100 PulseSlow) are the CK/xEdit
+					// values (inferred, not in commonlib); the flicker
+					// amplitudes are the reliable cross-check.
+					const bool flickers =
+						(ligh->data.flags & 0x1C8U) != 0U ||
+						ligh->data.flickerIntensityAmplitude != 0.0F ||
+						ligh->data.flickerMovementAmplitude != 0.0F;
+					float warmth = std::clamp(lightStrength * 0.5F, 0.0F, 1.0F);
+					if (flickers) {
+						warmth = std::max(warmth, 0.85F);
+					}
+					const float thermalStrength =
+						a_wantThermal ? warmth * lightStrength : 0.0F;
+					const float lightOut = a_wantNV ? lightStrength : 0.0F;
+					if (thermalStrength <= 0.0F && lightOut <= 0.0F) {
+						continue;
+					}
+					pending[pendingCount].position = ref->GetPosition();
+					pending[pendingCount].thermalStrength = thermalStrength;
+					pending[pendingCount].lightStrength = lightOut;
+					pending[pendingCount].warmth = warmth;
+					++pendingCount;
+				}
+			}
+			// Unlocked: project + occlusion-test each candidate. A fixed ~16u
+			// glow sphere keeps a lamp a point glow rather than projecting its
+			// whole illumination volume.
+			for (std::size_t i = 0U; i < pendingCount; ++i) {
+				if (count >= D3D::kMaxHeatSources) {
+					break;
+				}
+				tryAdd(pending[i].position, 16.0F, pending[i].thermalStrength,
+					pending[i].lightStrength, pending[i].warmth);
+			}
+
+			// Directional light (sun / moon): the brightest emitter outdoors.
+			// The sun disk is placed far out in the sky, so its billboard node
+			// gives a real world position that projects to where the sun
+			// actually is. Projection rejects it when it is below the horizon
+			// (behind camera) and the occlusion ray hides it behind terrain or
+			// buildings, so it only shows in clear line of sight -- exactly like
+			// looking up at it through the optic. Radius scales with distance to
+			// a small angular disk; blinding for NV, hot for thermal.
+			if (auto* sky = RE::Sky::GetSingleton()) {
+				if (auto* sun = sky->sun) {
+					RE::NiAVObject* sunNode =
+						sun->sunGlareNode ? sun->sunGlareNode.get() :
+						sun->sunBaseNode  ? sun->sunBaseNode.get() :
+											nullptr;
+					if (sunNode) {
+						const RE::NiPoint3 sunPos = sunNode->world.translate;
+						const RE::NiPoint3 d{ sunPos.x - camPos.x,
+											  sunPos.y - camPos.y,
+											  sunPos.z - camPos.z };
+						const float sunDist = std::sqrt(
+							d.x * d.x + d.y * d.y + d.z * d.z);
+						if (sunDist > 1.0F) {
+							const float sunRadius =
+								std::max(sunDist * 0.03F, 8.0F);
+							tryAdd(sunPos, sunRadius,
+								a_wantThermal ? 2.0F : 0.0F,
+								a_wantNV ? 3.0F : 0.0F, 1.0F);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Publishing (even an empty list) is valid and clears stale blobs.
+	hook->PublishHeatSources(sources.data(), count);
+
+	// Rate-limited so even verbose logs stay readable (~1/sec at 60fps).
+	static int s_visionDiagTick = 0;
+	if ((s_visionDiagTick++ % 60) == 0) {
+		logger::verbose(
+			"[vision] thermal={} nv={} published={} (considered={}, "
+			"offscreen={}, occluded={})",
+			a_wantThermal,
+			a_wantNV,
+			count,
+			diagConsidered,
+			diagOffscreen,
+			diagOccluded);
 	}
 }
 
@@ -4753,6 +5122,40 @@ void HookedUpdate()
 				wasInADS = inADS;
 			}
 
+			// Default-on: apply each mode's per-scope default the first time we
+			// are sighted with this profile (re-armed on scope change via
+			// clearSelection, and on closing the editor so a freshly-ticked
+			// default takes effect immediately). Force-on only -- the hotkey
+			// still toggles a mode off within the session, and that sticks
+			// because the profile is marked applied. Applied while sighted
+			// rather than at selection, which runs before the profile is saved.
+			{
+				static bool wasEditingVision = false;
+				if (wasEditingVision && !editing) {
+					lastVisionSeededProfile = nullptr;
+				}
+				wasEditingVision = editing;
+
+				if (!editing && player && IsInADS(player) &&
+					currentData != lastVisionSeededProfile) {
+					lastVisionSeededProfile = currentData;
+					if (currentData->shaderData.bCanEnableNV &&
+						currentData->shaderData.bDefaultEnableNV) {
+						nvgFlag = true;
+						if (hookIns) {
+							hookIns->SetNVG(1);
+						}
+					}
+					if (currentData->shaderData.bCanEnableThermal &&
+						currentData->shaderData.bDefaultEnableThermal) {
+						thermalFlag = true;
+						if (hookIns) {
+							hookIns->SetThermal(1);
+						}
+					}
+				}
+			}
+
 			if (!editing) {
 				static auto lastResolveTime =
 					std::chrono::steady_clock::now();
@@ -4903,6 +5306,10 @@ void HookedUpdate()
 				Hook::D3D::scopeImageSharpen.store(
 					editorPreview.imageSharpen,
 					std::memory_order_release);
+				Hook::D3D::scopeMagnificationFilter.store(
+					static_cast<float>(
+						std::clamp(editorPreview.magnificationFilter, 0, 2)),
+					std::memory_order_release);
 				Hook::D3D::scopeFishEyeStrength.store(
 					editorPreview.fishEyeStrength,
 					std::memory_order_release);
@@ -5031,6 +5438,13 @@ void HookedUpdate()
 						currentData->shaderData.imageSharpen,
 						0.0F,
 						1.0F),
+					std::memory_order_release);
+				Hook::D3D::scopeMagnificationFilter.store(
+					static_cast<float>(
+						std::clamp(
+							currentData->shaderData.magnificationFilter,
+							0,
+							2)),
 					std::memory_order_release);
 				Hook::D3D::scopeFishEyeStrength.store(
 					std::clamp(
@@ -5296,6 +5710,9 @@ void HookedUpdate()
 				Hook::HangDiag::updateTicks.fetch_add(
 					1U,
 					std::memory_order_relaxed);
+				Hook::HangDiag::updateLoopThread.store(
+					GetCurrentThreadId(),
+					std::memory_order_relaxed);
 				Hook::HangDiag::updatePhase.store(
 					1,
 					std::memory_order_relaxed);
@@ -5420,7 +5837,7 @@ void HookedUpdate()
 					static RE::NiAVObject* lastLoggedAperture = nullptr;
 					if (lastLoggedAperture != scopeNode) {
 						lastLoggedAperture = scopeNode;
-						logger::info(
+						logger::verbose(
 							"Automatic STS aperture selected: plane={}, renderSurface={}, extent={}, aim={}, worldCenter=({:.4f}, {:.4f}, {:.4f}), worldRadius={:.4f}; ScopeFade depth and authored reticle offset are preserved separately",
 							scopeNode->name.c_str(),
 							aperture.renderSurface ?
@@ -5444,6 +5861,31 @@ void HookedUpdate()
 			NiPoint3 tempOut;
 
 			pcam = PlayerCamera::GetSingleton();
+
+			// Vision sources: refresh the blob list while thermal OR night
+			// vision is active on a permitting scope. In live play each want
+			// mirrors the render-side two-gate (permission AND live hotkey).
+			// In the editor the preview enable comes from the UI checkboxes,
+			// not the saved permission, so we publish BOTH channels while
+			// editing and let the shader pick -- otherwise a mode toggled on
+			// live (but not yet saved) would show the overlay with no blobs.
+			// Actors feed thermal; light/fire emitters feed both.
+			const bool editingVision = hookIns &&
+				hookIns->bEnableEditMode.load(std::memory_order_acquire);
+			bool wantThermalSrc;
+			bool wantNVSrc;
+			if (editingVision) {
+				wantThermalSrc = currentData != nullptr;
+				wantNVSrc = currentData != nullptr;
+			} else {
+				wantThermalSrc = thermalFlag && currentData &&
+					currentData->shaderData.bCanEnableThermal;
+				wantNVSrc = nvgFlag && currentData &&
+					currentData->shaderData.bCanEnableNV;
+			}
+			if (wantThermalSrc || wantNVSrc) {
+				PublishVisionSources(player, wantThermalSrc, wantNVSrc);
+			}
 
 			if (scopeNode && camNode) {
 				const float firstPersonFov =
@@ -5968,6 +6410,9 @@ void HookedUpdate()
 				0.0F,
 				std::memory_order_release);
 			Hook::D3D::scopeImageSharpen.store(
+				0.0F,
+				std::memory_order_release);
+			Hook::D3D::scopeMagnificationFilter.store(
 				0.0F,
 				std::memory_order_release);
 			Hook::D3D::scopeFishEyeStrength.store(
