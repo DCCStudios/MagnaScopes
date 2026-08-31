@@ -329,6 +329,9 @@ namespace ImGuiImpl
 		}
 
 		// Keyboard keys. The range starts past the mouse VKs (handled above).
+		// The capture reads VKs (GetAsyncKeyState's domain) but the framework
+		// registry stores DIK scan codes BY CONTRACT (its header's "Key codes:
+		// DIK, not VK" section), so convert exactly once, here at the boundary.
 		for (int vk = 0x08; vk <= 0xFE; ++vk) {
 			if (vk == VK_ESCAPE || vk == VK_TAB) {
 				continue;
@@ -348,6 +351,164 @@ namespace ImGuiImpl
 			opticsCaptureActive = false;
 			return;
 		}
+	}
+
+	// --- NV / Thermal toggle-key rebind capture --------------------------
+	//
+	// Same GetAsyncKeyState polling mechanism as the optics capture above
+	// (see that comment for why the input-event stream cannot serve while
+	// the editor window is open). Unlike the optics key, which lives in the
+	// framework's hotkey registry as a DIK code, these bindings are
+	// MagnaScope config values in the BSInputEventReceiver hook's id space:
+	// VIRTUAL-KEY codes for the keyboard, and 0x100 + button for the mouse
+	// (Middle=258, Mouse4=259, Mouse5=260 -- numerically the same codes the
+	// framework uses for the optics key, so one display/capture table
+	// serves both).
+	struct VkKeyCapture
+	{
+		bool active = false;
+		bool armPending = false;
+		bool heldAtStart[256] = {};
+	};
+	VkKeyCapture nvKeyCapture;
+	VkKeyCapture thermalKeyCapture;
+
+	// Returns true when a decision landed this frame: *a_outVk = -1 for
+	// unbind (Tab), a 258-260 mouse code, or the freshly pressed VK. Esc
+	// cancels with no decision. Mirrors ProcessOpticsKeyCapture's fresh-press
+	// arming so the click that opened the capture cannot bind itself.
+	bool ProcessVkKeyCapture(VkKeyCapture& a_capture, int* a_outVk)
+	{
+		if (!a_capture.active) {
+			return false;
+		}
+
+		if (a_capture.armPending) {
+			a_capture.armPending = false;
+			for (int vk = 0; vk < 256; ++vk) {
+				a_capture.heldAtStart[vk] =
+					(GetAsyncKeyState(vk) & 0x8000) != 0;
+			}
+		}
+
+		for (int vk = 0; vk < 256; ++vk) {
+			if (a_capture.heldAtStart[vk] &&
+				!(GetAsyncKeyState(vk) & 0x8000)) {
+				a_capture.heldAtStart[vk] = false;
+			}
+		}
+
+		const auto freshlyDown = [&a_capture](int vk) {
+			return (GetAsyncKeyState(vk) & 0x8000) != 0 &&
+			       !a_capture.heldAtStart[vk];
+		};
+
+		if (freshlyDown(VK_ESCAPE)) {
+			a_capture.active = false;
+			return false;
+		}
+		if (freshlyDown(VK_TAB)) {
+			a_capture.active = false;
+			*a_outVk = -1;
+			return true;
+		}
+
+		// Mouse buttons, in the receiver's unified 0x100 + button space. Left
+		// and Right are excluded for the same reason as the optics key: Left
+		// operates this editor and fires, Right is ADS.
+		struct MouseCapture
+		{
+			int vk;
+			int code;
+		};
+		static constexpr MouseCapture kMouseCaptures[] = {
+			{ VK_MBUTTON, 258 },
+			{ VK_XBUTTON1, 259 },
+			{ VK_XBUTTON2, 260 },
+		};
+		for (const auto& capture : kMouseCaptures) {
+			if (!freshlyDown(capture.vk)) {
+				continue;
+			}
+			a_capture.active = false;
+			*a_outVk = capture.code;
+			return true;
+		}
+
+		// Keyboard keys. The range starts past the mouse-button VKs (handled
+		// above).
+		for (int vk = 0x08; vk <= 0xFE; ++vk) {
+			if (vk == VK_ESCAPE || vk == VK_TAB) {
+				continue;
+			}
+			if (!freshlyDown(vk)) {
+				continue;
+			}
+			a_capture.active = false;
+			*a_outVk = vk;
+			return true;
+		}
+		return false;
+	}
+
+	// Virtual-Key -> display name via the active keyboard layout
+	// (GetKeyNameTextA wants a WM_KEYDOWN lParam: scan code in bits 16-23,
+	// extended-key flag in bit 24), falling back to the VK name table the old
+	// dropdowns used (indexed vk + 1), then a hex label.
+	std::string VkKeyDisplayName(int vk)
+	{
+		if (vk < 0) {
+			return "Unbound";
+		}
+		// Mouse buttons live at 0x100 + button in the receiver's id space.
+		switch (vk) {
+		case 256: return "Mouse Left";
+		case 257: return "Mouse Right";
+		case 258: return "Mouse Middle";
+		case 259: return "Mouse 4";
+		case 260: return "Mouse 5";
+		default: break;
+		}
+		bool extended = false;
+		switch (vk) {
+		case VK_UP:
+		case VK_DOWN:
+		case VK_LEFT:
+		case VK_RIGHT:
+		case VK_HOME:
+		case VK_END:
+		case VK_PRIOR:
+		case VK_NEXT:
+		case VK_INSERT:
+		case VK_DELETE:
+		case VK_RCONTROL:
+		case VK_RMENU:
+		case VK_DIVIDE:
+		case VK_NUMLOCK:
+			extended = true;
+			break;
+		default:
+			break;
+		}
+		const UINT scan = MapVirtualKeyA(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
+		if (scan != 0U) {
+			LONG lparam = static_cast<LONG>((scan & 0xFFU) << 16);
+			if (extended) {
+				lparam |= (1L << 24);
+			}
+			char name[64]{};
+			if (GetKeyNameTextA(lparam, name, sizeof(name)) > 0) {
+				return name;
+			}
+		}
+		const int index = vk + 1;
+		if (index >= 0 && index < static_cast<int>(std::size(mainKey)) &&
+			std::strcmp(mainKey[index], "Unknown") != 0) {
+			return mainKey[index];
+		}
+		char fallback[16]{};
+		std::snprintf(fallback, sizeof(fallback), "Key 0x%02X", vk);
+		return fallback;
 	}
 
 	// DIK scan code -> human-readable key name via the active keyboard layout,
@@ -643,50 +804,122 @@ namespace ImGuiImpl
 		}
 	}
 
-	void KeyBindingSection(int& nvgComboKeyIndex, int& nvgMainKeyIndex, int& thermalComboKeyIndex, int& thermalMainKeyIndex)
+	void KeyBindingSection()
 	{
-		if (nvgComboKeyIndex == -1 || nvgMainKeyIndex == -1) {
+		if (!sdh) {
 			return;
 		}
 
 		ImGui::SeparatorText("Hotkeys");
 
-		nvgComboKeyIndex = sdh->comboNVKey + 1;
-		nvgMainKeyIndex = sdh->nvKey + 1;
+		// Modifiers are held-key FAMILIES, not individual keys: the dropdown
+		// offers None / Shift / Ctrl / Alt, stored as the left-side VK of the
+		// pair (160/162/164); the dispatch accepts either side. Legacy configs
+		// holding a right-side VK display as their family; anything else that
+		// snuck into the config displays as None until rebound.
+		static constexpr const char* kModifierNames[] = {
+			"None", "Shift", "Ctrl", "Alt"
+		};
+		static constexpr int kModifierVks[] = { -1, 160, 162, 164 };
+		const auto modifierIndexFor = [](int comboVk) {
+			switch (comboVk) {
+			case 160:
+			case 161:
+				return 1;  // Shift
+			case 162:
+			case 163:
+				return 2;  // Ctrl
+			case 164:
+			case 165:
+				return 3;  // Alt
+			default:
+				return 0;  // None
+			}
+		};
 
-		if (ImGui::Combo("Night Vision Modifier Key", &nvgComboKeyIndex, mainKey, static_cast<int>(std::size(mainKey)))) {
-			sdh->SetNVGHotKeyCombo(nvgComboKeyIndex - 1);
+		// Toggle keys bind the same way the optics key does below: the button
+		// shows the bound key and clicking it captures the next keypress. Only
+		// the storage differs (MagnaScope config, VK space) -- see the capture
+		// comment at VkKeyCapture.
+		const auto toggleKeyBind = [](const char* a_id,
+									   VkKeyCapture& a_capture,
+									   int a_currentVk,
+									   auto&& a_apply) {
+			int decidedVk = 0;
+			if (ProcessVkKeyCapture(a_capture, &decidedVk)) {
+				a_apply(decidedVk);
+			}
+			const std::string label =
+				(a_capture.active ?
+						std::string(
+							"Press a key or mouse button...  "
+							"(Esc cancels, Tab unbinds)") :
+						VkKeyDisplayName(a_currentVk)) +
+				"##" + a_id;
+			if (ImGui::Button(label.c_str(), { 260, 0 })) {
+				a_capture.active = !a_capture.active;
+				a_capture.armPending = a_capture.active;
+			}
+		};
+
+		int nvModifierIndex = modifierIndexFor(sdh->comboNVKey);
+		if (ImGui::Combo(
+				"Night Vision Modifier",
+				&nvModifierIndex,
+				kModifierNames,
+				static_cast<int>(std::size(kModifierNames)))) {
+			sdh->SetNVGHotKeyCombo(kModifierVks[nvModifierIndex]);
 		}
-		Tip("Optional key held together with the toggle key to switch night vision.\n"
-			"Set to NONE to use the toggle key alone.");
+		Tip("Optional modifier held together with the toggle key to switch\n"
+			"night vision. Either side of the pair counts (Left or Right\n"
+			"Shift...). Set to None to use the toggle key alone.");
 
-		if (ImGui::Combo("Night Vision Toggle Key", &nvgMainKeyIndex, mainKey, static_cast<int>(std::size(mainKey)))) {
-			sdh->SetNVGHotKeyMain(nvgMainKeyIndex - 1);
+		toggleKeyBind("nvToggleBind", nvKeyCapture, sdh->nvKey, [](int vk) {
+			sdh->SetNVGHotKeyMain(vk);
+			logger::info("Night vision toggle key set to {}", vk);
+		});
+		ImGui::SameLine();
+		ImGui::TextUnformatted("Night Vision Toggle Key");
+		Tip("Click, then press the key or mouse button you want -- the next\n"
+			"press becomes the binding (Esc cancels, Tab unbinds). Mouse Middle,\n"
+			"Mouse 4 and Mouse 5 can be bound; Left and Right cannot, since they\n"
+			"are fire and aim. Switches the scope's night vision on and off while\n"
+			"aiming; night vision must be enabled for the scope under Effects.");
+
+		int thermalModifierIndex = modifierIndexFor(sdh->comboThermalKey);
+		if (ImGui::Combo(
+				"Thermal Vision Modifier",
+				&thermalModifierIndex,
+				kModifierNames,
+				static_cast<int>(std::size(kModifierNames)))) {
+			sdh->SetThermalHotKeyCombo(kModifierVks[thermalModifierIndex]);
 		}
-		Tip("Key that switches the scope's night vision effect on and off while aiming.\n"
-			"Night vision must be enabled for the scope under Effects.");
+		Tip("Optional modifier held together with the toggle key to switch\n"
+			"thermal vision. Either side of the pair counts (Left or Right\n"
+			"Shift...). Set to None to use the toggle key alone.");
 
-		thermalComboKeyIndex = sdh->comboThermalKey + 1;
-		thermalMainKeyIndex = sdh->thermalKey + 1;
+		toggleKeyBind(
+			"thermalToggleBind", thermalKeyCapture, sdh->thermalKey,
+			[](int vk) {
+				sdh->SetThermalHotKeyMain(vk);
+				logger::info("Thermal toggle key set to {}", vk);
+			});
+		ImGui::SameLine();
+		ImGui::TextUnformatted("Thermal Vision Toggle Key");
+		Tip("Click, then press the key or mouse button you want -- the next\n"
+			"press becomes the binding (Esc cancels, Tab unbinds). Mouse Middle,\n"
+			"Mouse 4 and Mouse 5 can be bound; Left and Right cannot, since they\n"
+			"are fire and aim. Switches the scope's thermal vision on and off\n"
+			"while aiming; thermal vision must be enabled for the scope under\n"
+			"Effects.");
 
-		if (ImGui::Combo("Thermal Vision Modifier Key", &thermalComboKeyIndex, mainKey, static_cast<int>(std::size(mainKey)))) {
-			sdh->SetThermalHotKeyCombo(thermalComboKeyIndex - 1);
-		}
-		Tip("Optional key held together with the toggle key to switch thermal vision.\n"
-			"Set to NONE to use the toggle key alone.");
-
-		if (ImGui::Combo("Thermal Vision Toggle Key", &thermalMainKeyIndex, mainKey, static_cast<int>(std::size(mainKey)))) {
-			sdh->SetThermalHotKeyMain(thermalMainKeyIndex - 1);
-		}
-		Tip("Key that switches the scope's thermal vision effect on and off while aiming.\n"
-			"Thermal vision must be enabled for the scope under Effects.");
-
-		// The optics key is owned by F4SE Menu Framework's hotkey registry, not
-		// by the Virtual-Key combos above. That registry works in DIK scan
-		// codes, which is the same code space Fallout reports for keyboard
-		// input -- binding it from the VK table meant the bound code and the
-		// reported code were never comparable, which is why the hotkey did
-		// nothing at all.
+		// The optics key is owned by F4SE Menu Framework's hotkey registry
+		// (persistence in PluginHotkeys.ini, conflict warnings), unlike the
+		// vision toggles above, which live in MagnaScope's own config. The
+		// registry stores DIK scan codes BY CONTRACT -- the framework header's
+		// "Key codes: DIK, not VK" section is explicit -- so the capture
+		// converts its VK reads to DIK exactly once at SetBinding, and the
+		// consumers in main.cpp convert back per use.
 		ImGui::SeparatorText("Optics Key");
 		const auto opticsBinding =
 			F4SEMenuFramework::Hotkeys::GetBinding(kOpticsHotkeyIdUI);
@@ -2724,7 +2957,7 @@ namespace ImGuiImpl
 		ImGui::PushItemWidth(ImGui::GetFontSize() * 14.0F);
 
 		GeneralSettingsSection();
-		KeyBindingSection(instance->nvgComboKeyIndex, instance->nvgMainKeyIndex, instance->thermalComboKeyIndex, instance->thermalMainKeyIndex);
+		KeyBindingSection();
 
 		ResetUIData(instance);
 

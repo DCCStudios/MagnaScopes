@@ -3568,11 +3568,13 @@ std::atomic<int> pendingReticleCycle{ 0 };
 // Optics hotkey, registered with F4SE Menu Framework.
 //
 // The framework owns binding, persistence (its own PluginHotkeys.ini, so our
-// updates never clobber a rebind) and conflict warnings. Critically it works in
-// DIK scan codes, which is also what Fallout's ButtonEvent reports for the
-// keyboard -- MagnaScope's editor was binding from a Virtual-Key table, so the
-// bound code and the reported code were in different code spaces and simply
-// never compared equal. No amount of gating was ever going to fix that.
+// updates never clobber a rebind) and conflict warnings. Its keyboard codes
+// are DIK scan codes BY CONTRACT (the header's "Key codes: DIK, not VK"
+// section is explicit: never pass a VK or MapVirtualKey result). MagnaScope's
+// consumers convert per use: PollOpticsKey converts DIK->VK for
+// GetAsyncKeyState, and the AddInputEvent callback converts DIK->VK because
+// PlayerCamera's receiver reports keyboard ids in VK space (proven by log
+// 2026-08-14).
 constexpr const char* kOpticsHotkeyId = "MagnaScope.Optics";
 // DIK_X. Only a default; the framework's persisted binding wins.
 constexpr unsigned int kOpticsHotkeyDefault = 0x2D;
@@ -3895,30 +3897,20 @@ bool __stdcall MagnaScopeInputCallback(RE::InputEvent* rawEvent)
 		return false;
 	}
 
-	// DIAGNOSTIC: log every fresh keyboard press's idCode reaching this
-	// callback, to reveal whether the dispatched keyboard code is DIK (matches
-	// the 0x15 binding) or VK (e.g. 0x59 for Y) or something else. The framework
-	// confirms keyboard events DO reach here (btn kbd=1); this shows their code.
 	if (button->QJustPressed()) {
 		logger::verbose(
-			"[input] kbd press reached callback: scan 0x{:02X} (optics bound 0x{:02X})",
+			"[input] kbd press reached callback: VK 0x{:02X} (optics bound scan 0x{:02X})",
 			id,
 			F4SEMenuFramework::Hotkeys::GetBinding(kOpticsHotkeyId));
 	}
 
 	// Optics key detected HERE on the AddInputEvent callback (single-path per
-	// request; PollOpticsKey is disabled in the tick). The framework dispatches
-	// the raw queue with a DIK keyboard idCode, the same space the Hotkeys
-	// binding uses, so it compares directly. Under investigation with the
-	// framework's [InputQueueHook] diagnostic (this callback was not dispatching
-	// while MagnaScope's own PlayerCamera hook was also installed).
-	// PROVEN BY LOG (2026-08-14 17:23): this receiver reports VK codes, not
-	// DIK -- pressing the bound Y arrived as 0x59 (VK 'Y'), Escape as 0x1B,
-	// Left Alt as 0xA4, while the framework binding is DIK 0x15. Matches
-	// MeleeAndThrow's documentation of this receiver ("keyboard idCode is a
-	// Windows virtual-key code; its default 0xA4 is VK_LMENU"); the framework
-	// guide's "idCode is a DIK scan code" is wrong for PlayerCamera's queue.
-	// So convert the DIK binding to VK once and compare in VK space.
+	// request; PollOpticsKey is disabled in the tick). The framework's binding
+	// is a DIK scan code by contract, but PlayerCamera's receiver reports
+	// keyboard idCodes as Windows VIRTUAL-KEY codes (proven by log 2026-08-14
+	// 17:23: the bound Y arrived as 0x59, Escape as 0x1B, Left Alt as 0xA4;
+	// matches MeleeAndThrow's documentation of this receiver). So convert the
+	// DIK binding to VK once and compare in VK space.
 	const auto boundCode =
 		F4SEMenuFramework::Hotkeys::GetBinding(kOpticsHotkeyId);
 	const auto boundVk = boundCode != 0U ?
@@ -3965,25 +3957,42 @@ public:
 		//	//TestButton(mono);
 		//}
 
-		if (evn->device == INPUT_DEVICE::kKeyboard) {
-			// The optics key is NOT handled here -- it lives in
-			// MagnaScopeInputCallback, where the framework dispatches the raw
-			// queue with DIK keyboard codes that match the Hotkeys binding
-			// directly. Only the legacy STS night-vision key remains on this
-			// receiver.
-
+		// Vision toggles accept a keyboard key OR a mouse button (Middle /
+		// Mouse4 / Mouse5, arriving here as 0x100 + button after the unify
+		// above -- the same 258/259/260 codes the editor capture stores).
+		// Modifiers are keyboard-only, tracked by the same events. The optics
+		// key is NOT handled here -- it lives in MagnaScopeInputCallback.
+		if (evn->device == INPUT_DEVICE::kKeyboard ||
+			evn->device == INPUT_DEVICE::kMouse) {
 			if (currentData) {
+				// The GUI stores modifiers as the LEFT VK of the pair (Shift
+				// 160, Ctrl 162, Alt 164); either physical side counts. Legacy
+				// configs holding a right-side VK (161/163/165) still match
+				// exactly.
+				const auto comboMatches = [](uint32_t a_id, int a_combo) {
+					if (a_combo < 0) {
+						return false;
+					}
+					const auto combo = (uint32_t)a_combo;
+					if (a_id == combo) {
+						return true;
+					}
+					return (combo == 160U && a_id == 161U) ||
+					       (combo == 162U && a_id == 163U) ||
+					       (combo == 164U && a_id == 165U);
+				};
+
 				if (sdh->comboNVKey == -1) {
 					if (id == (uint32_t)sdh->nvKey && evn->QJustPressed()) {
 						nvgFlag = !nvgFlag;
 						hookIns->SetNVG((int)nvgFlag);
 					}
 				} else {
-					if (id == (uint32_t)(sdh->comboNVKey) && evn->heldDownSecs > 0 && evn->value == 1) {
+					if (comboMatches(id, sdh->comboNVKey) && evn->heldDownSecs > 0 && evn->value == 1) {
 						hasCombo = true;
 					}
 
-					if (id == (uint32_t)(sdh->comboNVKey) && evn->value == 0) {
+					if (comboMatches(id, sdh->comboNVKey) && evn->value == 0) {
 						hasCombo = false;
 					}
 
@@ -4001,11 +4010,11 @@ public:
 						hookIns->SetThermal((int)thermalFlag);
 					}
 				} else {
-					if (id == (uint32_t)(sdh->comboThermalKey) && evn->heldDownSecs > 0 && evn->value == 1) {
+					if (comboMatches(id, sdh->comboThermalKey) && evn->heldDownSecs > 0 && evn->value == 1) {
 						hasThermalCombo = true;
 					}
 
-					if (id == (uint32_t)(sdh->comboThermalKey) && evn->value == 0) {
+					if (comboMatches(id, sdh->comboThermalKey) && evn->value == 0) {
 						hasThermalCombo = false;
 					}
 
@@ -6915,8 +6924,9 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 				// Three-way split of optics input, by what actually works in
 				// game (confirmed via the [input] logs):
 				//   * BINDING lives in the framework's hotkey registry (DIK scan
-				//     codes, persisted in PluginHotkeys.ini, conflict warnings,
-				//     rebind UI). Its press-only callback is intentionally empty.
+				//     codes by contract, persisted in PluginHotkeys.ini, conflict
+				//     warnings, rebind UI). Its press-only callback is
+				//     intentionally empty.
 				//   * The WHEEL is detected by the AddInputEvent callback below,
 				//     which (v3.4+) does deliver MOUSE events reliably.
 				//   * The KEY is polled (PollOpticsKey). The framework

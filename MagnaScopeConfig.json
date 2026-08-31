@@ -4,5 +4,6 @@
   "EnableRenderBeforeUI": false,
   "NvKey": 0,
   "RenderPassIndex": 1,
+  "VerboseLogging": false,
   "guiKey": 117
 }

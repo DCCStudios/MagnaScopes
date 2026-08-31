@@ -563,10 +563,6 @@ namespace ImGuiImpl
 		float baseWeaponPos_UI;
 		float MovePercentage_UI;
 
-		int nvgComboKeyIndex = 0;
-		int nvgMainKeyIndex = 0;
-		int thermalComboKeyIndex = 0;
-		int thermalMainKeyIndex = 0;
 		bool bDisableWhileBolt = false;
 
 		void MapScopeShaderEffect();
