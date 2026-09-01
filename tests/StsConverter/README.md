@@ -220,6 +220,30 @@ The hip-model clones were verified separately against the same reference
 snapshot and produced the same figures. All errors are at double-precision
 round-off level: the reparenting is exact.
 
+## Credits and licence
+
+- **NiflySharp** by ousnius (NuGet `Nifly` 1.0.0): the NIF library both the
+  CLI and the GUI read and write with. A clean-room C# rewrite of nifly,
+  generated from the NifTools `nifxml` specification.
+  https://github.com/ousnius/NiflySharp
+- **Miniball**, C# port by Lorenzo Delana (SearchAThing forks), original by
+  Bernd Gaertner; used by NiflySharp for bounding spheres. Apache-2.0.
+- **nifxml** by the NifTools team. https://github.com/niftools/nifxml
+- **See Through Scopes** by henkspamadres: the framework this converts for.
+  Every convention in the appendix was measured from STS's own meshes, and the
+  preset route points at materials STS ships in `Materials\Scope\Defaults`.
+- **NifInspector** (`tests/NifInspector`, also on NiflySharp): the
+  reconnaissance tool whose corpus dumps these conventions came from.
+- **NifSkope** (NifTools) and **Outfit Studio** (ousnius): `NifIo.Save`
+  reproduces NifSkope's Sanitize > Reorder Blocks; both are where a conversion
+  gets finished by hand.
+- Test material: the M4A1, MK18 and RU556 sights from the Haru's M4 pack.
+
+NiflySharp is **GPL-3.0**. It is compiled into `StsConverterGui.exe`, so the
+distributed GUI is under GPL-3.0 terms regardless of the MIT licence on the
+rest of this repository; the converter's source is these two project folders.
+The release archive ships the GPL-3.0 text as `LICENSE-NiflySharp.txt`.
+
 ---
 
 # Appendix: the STS layout as measured from the reference files

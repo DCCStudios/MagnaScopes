@@ -167,6 +167,17 @@ internal sealed class MainForm : Form
             "Advanced: set the materials folder on the selected rows (custom " +
             "reticle route only).";
 
+        var about = new ToolStripButton("About…")
+        {
+            Alignment = ToolStripItemAlignment.Right,
+            ToolTipText = "Version, credits and licence notes.",
+        };
+        about.Click += (_, _) =>
+        {
+            using var dialog = new AboutForm();
+            dialog.ShowDialog(this);
+        };
+
         var strip = new ToolStrip
         {
             GripStyle = ToolStripGripStyle.Hidden,
@@ -182,6 +193,7 @@ internal sealed class MainForm : Form
             new ToolStripSeparator(),
             _shapesButton,
             _materialsButton,
+            about,
         });
         return strip;
     }

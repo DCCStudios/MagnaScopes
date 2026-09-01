@@ -651,6 +651,7 @@ alone. Read it before touching either project.
 | publish | self-contained, single-file, win-x64, in-file compression on. 66 MB exe, 57.8 MB zipped. Without compression the exe is 146 MB |
 | version | `0.1.0` (csproj `<Version>`); assembly title "STS Scope Converter" |
 | package | `Package/StsConverterGui-0.1.0.zip` = `StsConverterGui.exe` + `README.md` (the release notes). `Package/` and `tests/**/publish/` are git-ignored |
+| licence | NiflySharp is GPL-3.0 and is compiled into the exe, so the distributed GUI is GPL-3.0 regardless of the repo's MIT `LICENSE.txt` (which is still the unfilled template: `[year] [fullname]`). The zip ships the GPL text as `LICENSE-NiflySharp.txt`; the About dialog, the release notes and the converter README carry the credits (ousnius/NiflySharp, Miniball Apache-2.0, nifxml, See Through Scopes, NifInspector, NifSkope/Outfit Studio, Haru's M4 test sights, .NET 8) |
 
 Publish command (the repo has no script for it; this is the whole recipe):
 
