@@ -631,3 +631,105 @@ Orphaned `claude.exe` processes are the ones whose command line has no
 | `ac73932` | Pick the glass, not the first shape under `ScopeAiming` (lens/rear/radius tie-breaks). |
 | `62398dc` | Drive strafe lag from `PlayerCharacter::GetPosition()`. |
 | `48072c4` | Dual draw-hook binding — the partial fix for the intermittent no-scope bug. Now known insufficient; see §5.3. |
+
+---
+
+# 9. StsConverter GUI: release audit (2026-08-30)
+
+The See Through Scopes converter lives in `tests/StsConverter` (CLI and the
+conversion library) and `tests/StsConverterGui` (WinForms front end, the
+artifact that ships). This section records the audit done before the first
+packaged release of the GUI, what it changed, and what it deliberately left
+alone. Read it before touching either project.
+
+## 9.1 What ships
+
+| item | value |
+|---|---|
+| project | `tests/StsConverterGui/StsConverterGui.csproj`, `net8.0-windows`, WinForms, references `tests/StsConverter` |
+| dependency | NuGet `Nifly` 1.0.0 (NiflySharp). Pure managed, no native libraries, so single-file publish is safe |
+| publish | self-contained, single-file, win-x64, in-file compression on. 66 MB exe, 57.8 MB zipped. Without compression the exe is 146 MB |
+| version | `0.1.0` (csproj `<Version>`); assembly title "STS Scope Converter" |
+| package | `Package/StsConverterGui-0.1.0.zip` = `StsConverterGui.exe` + `README.md` (the release notes). `Package/` and `tests/**/publish/` are git-ignored |
+
+Publish command (the repo has no script for it; this is the whole recipe):
+
+```
+cd tests\StsConverterGui
+dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -p:DebugType=none -p:DebugSymbols=false -o publish
+```
+
+Do not add `PublishTrimmed`. `StsBuilder` reads and writes `BSEffectShaderProperty`
+texture fields by reflection (`BlockReflection`), and trimming removes exactly
+the members reflection needs.
+
+Self-test (headless; constructs the window, loads real files, checks the grid
+and asserts the shipped defaults):
+
+```
+StsConverterGui.exe --selftest <one or more .nif>
+```
+
+The release build was checked against four sights under the Haru M4 mod's
+`meshes\Weapons\CyM4\sights\` folder in the MagnumOpus MO2 instance (build 0
+warnings, self-test PASSED on both the bin and the published exe).
+
+## 9.2 Findings
+
+Severity is about what a user would have hit with the tool as it was.
+
+| # | severity | finding | status |
+|---|---|---|---|
+| 1 | high | **The default settings produced the route that renders black in game.** `OptionsPanel` shipped with "keep original reticle material" unchecked, and `MainForm.AddFiles` auto-fills `MaterialsRoot` from `FileEntry.GuessMaterialsRoot` (any `Materials` folder within five parents of the mesh, which loose-file mods have). In `StsBuilder.CreateTextureLoader`, a materials root makes `TextureFromMaterial` return the BGEM texture, which sets `explicitReticleTexture`, which repoints the reticle material at the non-existent `ReticleCrossCustom` (line ~922). That is the missing-material route, and the 2026-08-15 in-game test recorded it as a solid black square. The only route confirmed working in game (`--keep-reticle-material`) was opt-in. | fixed: keep is the default radio; the per-file texture and materials inputs only reach the builder when the advanced block is open and keep is not selected; the self-test asserts the defaults |
+| 2 | medium | Segment count was an editable numeric. Anything but 24 breaks MagnaScope's exact geometry-replay path, and the tooltip said so instead of preventing it. | fixed: locked to `ScopeFadeGeometry.CanonicalSegments`, shown as a fixed label |
+| 3 | medium | A WinExe with no unhandled-exception handler dies silently: no console, no dialog, the window is just gone. Only the analyse and convert paths caught exceptions. | fixed: `Application.ThreadException` and `AppDomain.UnhandledException` show a dialog with the type, message and stack |
+| 4 | medium | `tests/StsConverter/README.md` limitation 7 said "Nothing here has been tested in game", contradicting its own header, which records the in-game verdicts. | fixed (text) |
+| 5 | low | README staleness not fixed: section A1 and the layout diagram call the reticle holder `Adjustments`, but `ConvertOptions.ReticleHolderName` defaults to `ReticleNode` after the 122-file corpus survey (see the comment on that property); the route table still calls `--materials` "preferred" although in game it renders black. The README is the CLI document and was left for its own pass. | open |
+| 6 | low | `FileEntry.DotTexture` has no editor in the GUI and was still passed to the builder. | `BuildOptions` now passes `null` explicitly; the field remains for the CLI |
+| 7 | low | `StsBuilder` line ~353 runs `NormalizeReticleRenderState` whenever `KeepReticleMaterial` is false, even when nothing was repointed. The comment above it says keep-material conversions are left untouched; the condition is "keep not requested", not "material repointed". Harmless with keep as the GUI default. CLI users converting without `--keep-reticle-material` and without any texture route still get their reticle render state rewritten to corpus values. | open, documented |
+| 8 | low | The log appended by rebuilding the whole `TextBox.Text` per line, quadratic in batch size. | fixed: `AppendText` |
+| 9 | low | Output folder defaults to `<input folder>\StsOutput`, inside the mod's mesh tree. Safe (the converter refuses to write over its input) but the user has to move the file to the original's relative path for it to override anything. | not changed; the options panel and the completion log now say so |
+| 10 | info | The glass and reticle guesses (`ScopeAnalysis`) are name-driven: `glass`/`lens` +100, `reticle` +100, `crosshair` +80, `dot` +20, `parallax` -60, plus small triangle-count and flatness terms. A scope with unusual or non-English shape names lands in "Needs selection" and is held back rather than converted wrongly, which is the right failure. On an already-converted STS file the glass scorer picks the `_full` hip clone; harmless (those files need Force anyway) but it shows the scorer has no penalty for the clone suffix. | open, low value |
+| 11 | info | Things the tool cannot do, restated because every release note must carry them: the aiming model is not cut down (the rear geometry stays in `ScopeAiming`; that is NifSkope or Outfit Studio work); the ScopeFade size is a heuristic (0.94 of the measured glass radius); the rearward axis is assumed to be -Y. | by design |
+
+## 9.3 What the GUI rework changed
+
+- Defaults are the in-game-verified configuration: keep the scope's own
+  reticle, generate the canonical annulus, clone the model into the hip branch,
+  no custom texture, no materials repoint.
+- The reticle choice is two radios: keep (recommended) or an STS preset (with
+  a note that the preset route is unverified in game). The custom
+  missing-material route is not offered as a first-class choice at all.
+- The grid shows File, Glass, Reticle, Dot, Status, Result. The "Reticle
+  texture" and "Materials folder" columns and the Materials button exist only
+  while "Show advanced options" is ticked, and their values are ignored while
+  keep is selected.
+- Advanced block, collapsed by default: fade mode and scale, geometry (fixed),
+  hip duplicate, TextureLoader, flat ScopeViewParts, hip clone suffix, error
+  tolerance, force, and a warning about the custom route.
+- One action bar at the bottom: output folder, Browse, Open (opens the output
+  folder in Explorer), Convert Selected, and an accent-coloured Convert All
+  that becomes Cancel while a batch runs.
+- A "Shapes..." button opens the per-shape report for the selected file
+  (double-click still works).
+- Segoe UI 9, flat header row, row height 26, an empty-state hint above the
+  grid, a Consolas log. Window 1180x760, minimum 980x620 (was 1400x820 /
+  1100x620).
+- The self-test now also asserts the defaults, so a stray edit cannot ship
+  the black-square route again without failing the smoke test.
+
+## 9.4 What to do next on this tool
+
+1. In-game pass on scopes that are not the five M4A1/MK18/RU556 sights. The
+   release notes carry an explicit "not sure how well it works per scope"
+   disclaimer for this reason.
+2. Test the preset route in game once; it passes every structural check and
+   would give users STS reticle swapping.
+3. If the custom route is ever wanted, the fix is known: parse the BGEM blend
+   fields (`blendState`, `blendFunc1/2`, `alphaTest`, `alphaTestRef`, NiAlpha
+   enum values; the v1 header layout is in the memory notes and in
+   `BgemReader`) and replicate them on the NIF shader instead of applying the
+   STS blend recipe to a texture authored against the mod's own.
+4. README refresh for the CLI (finding 5).
+5. Cosmetic: an application icon; the Shapes report already prints the fade
+   radius at 0.94, a live preview in the grid would save a NifSkope round trip.

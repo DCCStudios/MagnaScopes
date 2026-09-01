@@ -191,9 +191,12 @@ Input files are never modified; `convert` refuses to write over its own input.
    are relative to `Data\Textures`, so `Textures\` is prefixed when writing
    them into the shader property.
 
-7. **Nothing here has been tested in game.** Every claim in this README about
-   structure and transforms is verified numerically against the files; whether
-   Fallout 4 and STS accept the result is unproven.
+7. **In-game coverage is thin.** The keep-material route was confirmed in game
+   on five M4A1/MK18/RU556 sights (2026-08-15); the preset route is untested in
+   game and the custom missing-material route renders black. Every claim about
+   structure and transforms is verified numerically against the files, but how
+   well a given scope converts depends on that scope's authoring, and most
+   scopes have not been tried.
 
 8. `BSConnectPoint::Parents` / `BSConnectPoint::Children` are opaque to
    NiflySharp 1.0.0. They round-trip byte-identically (checked on all five test

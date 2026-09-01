@@ -1,4 +1,4 @@
-using System.Text;
+using System.Diagnostics;
 
 namespace StsConverter.Gui;
 
@@ -8,22 +8,29 @@ internal sealed class MainForm : Form
     private const int ColumnGlass = 1;
     private const int ColumnReticle = 2;
     private const int ColumnDot = 3;
-    private const int ColumnReticleTexture = 4;
-    private const int ColumnMaterials = 5;
-    private const int ColumnStatus = 6;
-    private const int ColumnDetail = 7;
+    private const int ColumnStatus = 4;
+    private const int ColumnDetail = 5;
+    private const int ColumnReticleTexture = 6;
+    private const int ColumnMaterials = 7;
 
     private const string NoneLabel = "(none)";
 
+    private static readonly Color AccentColor = Color.FromArgb(0, 120, 212);
+    private static readonly Color CancelColor = Color.FromArgb(196, 89, 17);
+
     private readonly DataGridView _grid = new();
+    private readonly Label _emptyHint = new();
     private readonly TextBox _log = new();
     private readonly TextBox _outputFolder = new();
     private readonly OptionsPanel _options = new();
     private readonly ToolStripProgressBar _progress = new();
     private readonly ToolStripStatusLabel _statusLabel = new();
-    private readonly ToolStripButton _convertAll = new("Convert All");
-    private readonly ToolStripButton _convertSelected = new("Convert Selected");
     private readonly ToolStripButton _removeButton = new("Remove");
+    private readonly ToolStripButton _materialsButton = new("Materials…");
+    private readonly ToolStripButton _shapesButton = new("Shapes…");
+    private readonly Button _convertAll = new();
+    private readonly Button _convertSelected = new();
+    private readonly Button _openOutput = new();
 
     private readonly List<FileEntry> _entries = new();
     private CancellationTokenSource? _cancellation;
@@ -32,18 +39,33 @@ internal sealed class MainForm : Form
     public MainForm()
     {
         Text = "STS Scope Converter";
-        MinimumSize = new Size(1100, 620);
-        Size = new Size(1400, 820);
+        Font = new Font("Segoe UI", 9f);
+        MinimumSize = new Size(980, 620);
+        Size = new Size(1180, 760);
         StartPosition = FormStartPosition.CenterScreen;
         AllowDrop = true;
 
         var toolStrip = BuildToolStrip();
         var statusStrip = BuildStatusStrip();
+        var actionBar = BuildActionBar();
 
         ConfigureGrid();
         ConfigureLog();
 
-        var outputRow = BuildOutputRow();
+        _emptyHint.Text =
+            "Drop scope .nif files here, or use Add Files / Add Folder. Each " +
+            "file is analysed on arrival and its glass and reticle are guessed; " +
+            "check them before converting.";
+        _emptyHint.Dock = DockStyle.Top;
+        _emptyHint.Height = 40;
+        _emptyHint.TextAlign = ContentAlignment.MiddleLeft;
+        _emptyHint.Padding = new Padding(8, 0, 8, 0);
+        _emptyHint.ForeColor = SystemColors.GrayText;
+        _emptyHint.BackColor = Color.FromArgb(247, 249, 252);
+
+        var gridHost = new Panel { Dock = DockStyle.Fill };
+        gridHost.Controls.Add(_grid);
+        gridHost.Controls.Add(_emptyHint);
 
         // Size explicitly before touching SplitterDistance or Panel*MinSize. A
         // docked SplitContainer is still at its 150x100 default here, and both
@@ -52,16 +74,16 @@ internal sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             Orientation = Orientation.Horizontal,
-            Size = new Size(1400, 700),
+            Size = new Size(1180, 640),
         };
-        verticalSplit.Panel1.Controls.Add(_grid);
+        verticalSplit.Panel1.Controls.Add(gridHost);
         verticalSplit.Panel2.Controls.Add(_log);
         verticalSplit.Panel1MinSize = 160;
-        verticalSplit.Panel2MinSize = 80;
+        verticalSplit.Panel2MinSize = 70;
 
         var optionsGroup = new GroupBox
         {
-            Text = "Conversion options (apply to every file)",
+            Text = "Options (apply to every file)",
             Dock = DockStyle.Fill,
             Padding = new Padding(4),
         };
@@ -71,15 +93,16 @@ internal sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             Orientation = Orientation.Vertical,
-            Size = new Size(1400, 700),
+            Size = new Size(1180, 640),
+            FixedPanel = FixedPanel.Panel2,
         };
         horizontalSplit.Panel1.Controls.Add(verticalSplit);
         horizontalSplit.Panel2.Controls.Add(optionsGroup);
-        horizontalSplit.Panel1MinSize = 420;
-        horizontalSplit.Panel2MinSize = 300;
+        horizontalSplit.Panel1MinSize = 480;
+        horizontalSplit.Panel2MinSize = 320;
 
         Controls.Add(horizontalSplit);
-        Controls.Add(outputRow);
+        Controls.Add(actionBar);
         Controls.Add(toolStrip);
         Controls.Add(statusStrip);
 
@@ -87,19 +110,19 @@ internal sealed class MainForm : Form
         // WinForms silently clamps it to whatever the design-time width was.
         Shown += (_, _) =>
         {
-            SetSplitter(
-                horizontalSplit, horizontalSplit.Width - 420);
-            SetSplitter(
-                verticalSplit, (int)(verticalSplit.Height * 0.62));
+            SetSplitter(horizontalSplit, horizontalSplit.Width - 350);
+            SetSplitter(verticalSplit, (int)(verticalSplit.Height * 0.66));
         };
+
+        _options.AdvancedVisibleChanged += (_, _) => ApplyAdvancedVisibility();
+        ApplyAdvancedVisibility();
 
         DragEnter += OnDragEnter;
         DragDrop += OnDragDrop;
 
-        Log("Drop scope NIFs here, or use Add Files / Add Folder.");
-        Log("Each file is analysed on arrival and the glass and reticle are " +
-            "guessed. Check them before converting — the guesses are " +
-            "heuristics, not detection.");
+        Log("Ready. The defaults are the configuration verified in game: the " +
+            "scope keeps its own reticle, a canonical ScopeFade is generated, " +
+            "and the full model is cloned into the hip branch.");
         UpdateButtons();
     }
 
@@ -131,19 +154,24 @@ internal sealed class MainForm : Form
 
         _removeButton.Click += (_, _) => RemoveSelected();
 
-        var materials = new ToolStripButton("Materials…");
-        materials.Click += (_, _) => SetMaterialsForSelection();
-
         var clear = new ToolStripButton("Clear");
         clear.Click += (_, _) => ClearAll();
 
-        _convertAll.Click += (_, _) => StartConversion(convertAll: true);
-        _convertSelected.Click += (_, _) => StartConversion(convertAll: false);
+        _shapesButton.Click += (_, _) => ShowShapesForSelection();
+        _shapesButton.ToolTipText =
+            "Full per-shape report for the selected file, for when a guess " +
+            "looks wrong. Double-clicking a row does the same.";
+
+        _materialsButton.Click += (_, _) => SetMaterialsForSelection();
+        _materialsButton.ToolTipText =
+            "Advanced: set the materials folder on the selected rows (custom " +
+            "reticle route only).";
 
         var strip = new ToolStrip
         {
             GripStyle = ToolStripGripStyle.Hidden,
-            Padding = new Padding(4),
+            RenderMode = ToolStripRenderMode.System,
+            Padding = new Padding(6, 3, 6, 3),
         };
         strip.Items.AddRange(new ToolStripItem[]
         {
@@ -152,10 +180,8 @@ internal sealed class MainForm : Form
             _removeButton,
             clear,
             new ToolStripSeparator(),
-            materials,
-            new ToolStripSeparator(),
-            _convertAll,
-            _convertSelected,
+            _shapesButton,
+            _materialsButton,
         });
         return strip;
     }
@@ -173,18 +199,20 @@ internal sealed class MainForm : Form
         return strip;
     }
 
-    private Control BuildOutputRow()
+    private Control BuildActionBar()
     {
         var label = new Label
         {
             Text = "Output folder:",
             AutoSize = true,
             Anchor = AnchorStyles.Left,
-            Margin = new Padding(3, 8, 3, 3),
+            Margin = new Padding(3, 9, 3, 3),
         };
 
         _outputFolder.Dock = DockStyle.Fill;
-        var browse = new Button { Text = "Browse…", AutoSize = true };
+        _outputFolder.Margin = new Padding(3, 6, 3, 3);
+
+        var browse = new Button { Text = "Browse…", AutoSize = true, Margin = new Padding(3, 4, 3, 3) };
         browse.Click += (_, _) =>
         {
             using var dialog = new FolderBrowserDialog
@@ -196,20 +224,55 @@ internal sealed class MainForm : Form
                 _outputFolder.Text = dialog.SelectedPath;
         };
 
+        _openOutput.Text = "Open";
+        _openOutput.AutoSize = true;
+        _openOutput.Margin = new Padding(3, 4, 12, 3);
+        _openOutput.Click += (_, _) => OpenOutputFolder();
+
+        StylePrimary(_convertAll, "Convert All");
+        _convertAll.Click += (_, _) => StartConversion(convertAll: true);
+
+        _convertSelected.Text = "Convert Selected";
+        _convertSelected.AutoSize = true;
+        _convertSelected.Height = 30;
+        _convertSelected.Margin = new Padding(3, 4, 3, 3);
+        _convertSelected.Click += (_, _) => StartConversion(convertAll: false);
+
         var layout = new TableLayoutPanel
         {
-            Dock = DockStyle.Top,
-            ColumnCount = 3,
-            Height = 34,
-            Padding = new Padding(6, 4, 6, 4),
+            Dock = DockStyle.Bottom,
+            ColumnCount = 6,
+            Height = 42,
+            Padding = new Padding(6, 0, 6, 0),
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         layout.Controls.Add(label, 0, 0);
         layout.Controls.Add(_outputFolder, 1, 0);
         layout.Controls.Add(browse, 2, 0);
+        layout.Controls.Add(_openOutput, 3, 0);
+        layout.Controls.Add(_convertSelected, 4, 0);
+        layout.Controls.Add(_convertAll, 5, 0);
         return layout;
+    }
+
+    private static void StylePrimary(Button button, string text)
+    {
+        button.Text = text;
+        button.AutoSize = true;
+        button.Height = 30;
+        button.MinimumSize = new Size(130, 30);
+        button.Margin = new Padding(3, 4, 3, 3);
+        button.FlatStyle = FlatStyle.Flat;
+        button.FlatAppearance.BorderSize = 0;
+        button.BackColor = AccentColor;
+        button.ForeColor = Color.White;
+        button.Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold);
+        button.UseVisualStyleBackColor = false;
     }
 
     private void ConfigureGrid()
@@ -223,12 +286,21 @@ internal sealed class MainForm : Form
         _grid.MultiSelect = true;
         _grid.EditMode = DataGridViewEditMode.EditOnEnter;
         _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+        _grid.BackgroundColor = SystemColors.Window;
+        _grid.BorderStyle = BorderStyle.None;
+        _grid.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
+        _grid.GridColor = Color.FromArgb(232, 232, 232);
+        _grid.EnableHeadersVisualStyles = false;
+        _grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(243, 243, 243);
+        _grid.ColumnHeadersDefaultCellStyle.Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold);
+        _grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize;
+        _grid.RowTemplate.Height = 26;
 
         _grid.Columns.Add(new DataGridViewTextBoxColumn
         {
             HeaderText = "File",
             ReadOnly = true,
-            FillWeight = 130,
+            FillWeight = 140,
         });
         _grid.Columns.Add(new DataGridViewComboBoxColumn
         {
@@ -253,40 +325,35 @@ internal sealed class MainForm : Form
         });
         _grid.Columns.Add(new DataGridViewTextBoxColumn
         {
-            HeaderText = "Reticle texture (blank = keep material)",
-            FillWeight = 200,
-            ToolTipText =
-                "Leave blank and the reticle keeps its own material and renders " +
-                "exactly as before, but STS reticle swapping is off. Enter a " +
-                "verified texture path to turn swapping on. The path shown in " +
-                "the mesh is NOT trustworthy: while a real material exists the " +
-                "engine ignores this field, so it is routinely stale.",
-        });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn
-        {
-            HeaderText = "Materials folder",
-            FillWeight = 200,
-            ToolTipText =
-                "Where this mesh's .BGEM materials live. The reticle's real " +
-                "texture is read from there and retained, which is the only " +
-                "reliable way to keep the scope's own reticle -- the material " +
-                "is where the engine actually gets the texture, and the path " +
-                "stored in the mesh is ignored while a material exists. " +
-                "Guessed from a Materials folder near the mesh. Per-file, " +
-                "because a batch can span mods. Use the Materials... button to " +
-                "set it on several rows at once.",
-        });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn
-        {
             HeaderText = "Status",
             ReadOnly = true,
-            FillWeight = 80,
+            FillWeight = 85,
         });
         _grid.Columns.Add(new DataGridViewTextBoxColumn
         {
             HeaderText = "Result",
             ReadOnly = true,
             FillWeight = 220,
+        });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Reticle texture (advanced)",
+            FillWeight = 170,
+            Visible = false,
+            ToolTipText =
+                "Custom route only. A verified texture path switches this file " +
+                "to the missing-material route, which rendered black in game on " +
+                "the test scopes. Ignored while the scope keeps its own reticle.",
+        });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Materials folder (advanced)",
+            FillWeight = 170,
+            Visible = false,
+            ToolTipText =
+                "Custom route only. Where this mesh's .BGEM materials live, so " +
+                "the reticle's real texture can be read for the missing-material " +
+                "route. Ignored while the scope keeps its own reticle.",
         });
 
         _grid.CellValueChanged += OnCellValueChanged;
@@ -314,8 +381,17 @@ internal sealed class MainForm : Form
         _log.ReadOnly = true;
         _log.ScrollBars = ScrollBars.Vertical;
         _log.WordWrap = true;
-        _log.Font = new Font(FontFamily.GenericMonospace, 8.5f);
-        _log.BackColor = SystemColors.Window;
+        _log.Font = new Font("Consolas", 9f);
+        _log.BackColor = Color.FromArgb(250, 250, 250);
+        _log.BorderStyle = BorderStyle.None;
+    }
+
+    private void ApplyAdvancedVisibility()
+    {
+        var advanced = _options.AdvancedVisible;
+        _grid.Columns[ColumnReticleTexture].Visible = advanced;
+        _grid.Columns[ColumnMaterials].Visible = advanced;
+        _materialsButton.Visible = advanced;
     }
 
     private void OnDragEnter(object? sender, DragEventArgs e)
@@ -435,6 +511,26 @@ internal sealed class MainForm : Form
             }
         }
 
+        // The defaults are the contract this release makes with users: the
+        // verified keep-material route, canonical fade, hip clone. Assert them
+        // so a stray edit cannot ship the black-square route as the default.
+        if (form._entries.Count > 0)
+        {
+            var probe = form._options.BuildOptions(form._entries[0], Path.GetTempFileName());
+            var defaultsOk =
+                probe.KeepReticleMaterial &&
+                probe.ReticlePreset is null &&
+                probe.ReticleTexture is null &&
+                probe.MaterialsRoot is null &&
+                !probe.RenameFade && !probe.NoScopeFade && !probe.NoDuplicate &&
+                probe.Segments == ScopeFadeGeometry.CanonicalSegments;
+            Console.WriteLine(defaultsOk
+                ? "  defaults: keep-material route, canonical fade, hip clone (OK)"
+                : "  ! defaults deviate from the verified configuration");
+            if (!defaultsOk)
+                ++failures;
+        }
+
         Console.WriteLine(
             failures == 0
                 ? "GUI self-test: PASSED"
@@ -505,8 +601,8 @@ internal sealed class MainForm : Form
                 if (analysis.AlreadyConverted)
                 {
                     Log($"  ! {entry.FileName} already contains " +
-                        $"{string.Join(", ", analysis.ExistingStsNodes)} — " +
-                        "tick Force to convert it anyway.");
+                        $"{string.Join(", ", analysis.ExistingStsNodes)}. Tick " +
+                        "Force under advanced options to convert it anyway.");
                 }
             }
             catch (Exception exception)
@@ -514,7 +610,7 @@ internal sealed class MainForm : Form
                 entry.AnalysisError = exception.Message;
                 entry.Status = EntryStatus.Failed;
                 entry.Detail = exception.Message;
-                Log($"{entry.FileName}: FAILED to analyse — {exception.Message}");
+                Log($"{entry.FileName}: FAILED to analyse: {exception.Message}");
             }
 
             RefreshRow(entry);
@@ -536,16 +632,15 @@ internal sealed class MainForm : Form
         var textureCell = row.Cells[ColumnReticleTexture];
         textureCell.Value = entry.ReticleTexture;
         textureCell.ToolTipText = string.IsNullOrEmpty(entry.ReticleTexture)
-            ? $"Blank: keeping the original material. The mesh names " +
-              $"'{entry.SuggestedReticleTexture}', but that field is unused " +
-              "while a real material exists, so verify it before using it."
+            ? $"Blank. The mesh names '{entry.SuggestedReticleTexture}', but " +
+              "that field is unused while a real material exists, so it is " +
+              "not trustworthy."
             : entry.ReticleTexture;
 
         var materialsCell = row.Cells[ColumnMaterials];
         materialsCell.Value = entry.MaterialsRoot;
         materialsCell.ToolTipText = string.IsNullOrEmpty(entry.MaterialsRoot)
-            ? "Not set: the reticle texture cannot be read from its material, " +
-              "so the mesh's own (often stale) path is all there is."
+            ? "Not set."
             : entry.MaterialsRoot;
 
         row.Cells[ColumnStatus].Value = entry.StatusText;
@@ -655,6 +750,18 @@ internal sealed class MainForm : Form
         detail.ShowDialog(this);
     }
 
+    private void ShowShapesForSelection()
+    {
+        var entry = _grid.SelectedRows.Cast<DataGridViewRow>()
+            .Select(row => row.Tag)
+            .OfType<FileEntry>()
+            .FirstOrDefault();
+        if (entry is null)
+            return;
+        using var detail = new ShapeDetailForm(entry);
+        detail.ShowDialog(this);
+    }
+
     private DataGridViewRow? RowFor(FileEntry entry) =>
         _grid.Rows.Cast<DataGridViewRow>()
             .FirstOrDefault(row => ReferenceEquals(row.Tag, entry));
@@ -679,8 +786,8 @@ internal sealed class MainForm : Form
         using var dialog = new FolderBrowserDialog
         {
             Description =
-                $"Materials folder for {targets.Count} file(s). The reticle's " +
-                "real texture is read from the .BGEM materials inside it.",
+                $"Materials folder for {targets.Count} file(s). Custom reticle " +
+                "route only; ignored while the scope keeps its own reticle.",
             SelectedPath = targets[0].MaterialsRoot,
         };
         if (dialog.ShowDialog(this) != DialogResult.OK)
@@ -717,6 +824,21 @@ internal sealed class MainForm : Form
         _entries.Clear();
         _grid.Rows.Clear();
         UpdateButtons();
+    }
+
+    private void OpenOutputFolder()
+    {
+        var folder = _outputFolder.Text.Trim();
+        if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
+        {
+            Log("The output folder does not exist yet; it is created on the first conversion.");
+            return;
+        }
+
+        Process.Start(new ProcessStartInfo("explorer.exe", $"\"{folder}\"")
+        {
+            UseShellExecute = true,
+        });
     }
 
     private void StartConversion(bool convertAll)
@@ -822,7 +944,7 @@ internal sealed class MainForm : Form
                 entry.Detail = outcome.Passed
                     ? $"{outcome.ShapesCompared} shapes, max error " +
                       $"{outcome.MaxTranslationError:E2} units"
-                    : $"VERIFICATION FAILED — max error " +
+                    : $"VERIFICATION FAILED: max error " +
                       $"{outcome.MaxTranslationError:E2} units";
 
                 if (outcome.Passed)
@@ -844,7 +966,7 @@ internal sealed class MainForm : Form
                 ++failed;
                 entry.Status = EntryStatus.Failed;
                 entry.Detail = exception.Message;
-                Log($"{entry.FileName}: FAILED — {exception.Message}");
+                Log($"{entry.FileName}: FAILED: {exception.Message}");
             }
 
             RefreshRow(entry);
@@ -852,6 +974,13 @@ internal sealed class MainForm : Form
         }
 
         Log($"=== Done: {succeeded} converted, {failed} failed ===");
+        if (succeeded > 0)
+        {
+            Log("Install a converted file at the same path as the original " +
+                "inside a mod (meshes\\Weapons\\...) so it overrides it, then " +
+                "check the scope in game: the ScopeFade size is a heuristic and " +
+                "the aiming model still contains the rear geometry.");
+        }
         if (failed > 0)
         {
             Log("A failed verification means a mesh moved. Do not ship those " +
@@ -899,14 +1028,17 @@ internal sealed class MainForm : Form
             .OfType<FileEntry>()
             .Count(entry => entry.IsConvertible);
 
-        _convertAll.Enabled = !_busy && convertible > 0;
+        _convertAll.Enabled = _busy || convertible > 0;
         _convertSelected.Enabled = !_busy && selectedConvertible > 0;
         _removeButton.Enabled = !_busy && _grid.SelectedRows.Count > 0;
+        _shapesButton.Enabled = _grid.SelectedRows.Count > 0;
         _grid.Enabled = !_busy;
         _options.Enabled = !_busy;
         _outputFolder.Enabled = !_busy;
+        _emptyHint.Visible = _entries.Count == 0;
 
         _convertAll.Text = _busy ? "Cancel" : "Convert All";
+        _convertAll.BackColor = _busy ? CancelColor : AccentColor;
 
         if (!_busy)
         {
@@ -923,11 +1055,9 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var builder = new StringBuilder(_log.Text);
-        if (builder.Length > 0)
-            builder.AppendLine();
-        builder.Append(message);
-        _log.Text = builder.ToString();
+        if (_log.TextLength > 0)
+            _log.AppendText(Environment.NewLine);
+        _log.AppendText(message);
         _log.SelectionStart = _log.TextLength;
         _log.ScrollToCaret();
     }

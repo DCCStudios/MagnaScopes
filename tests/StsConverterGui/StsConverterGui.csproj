@@ -10,6 +10,11 @@
     <RootNamespace>StsConverter.Gui</RootNamespace>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <StartupObject>StsConverter.Gui.GuiProgram</StartupObject>
+    <Version>0.1.0</Version>
+    <AssemblyTitle>STS Scope Converter</AssemblyTitle>
+    <Product>STS Scope Converter</Product>
+    <Company>DCC Studios</Company>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
 
   <ItemGroup>
