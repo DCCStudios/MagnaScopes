@@ -254,7 +254,11 @@ cbuffer ScopeEffectData : register(b5)
 cbuffer HeatSourceData : register(b6)
 {
 	int   sourceCount;
-	float3 _srcPad;
+	// Heat-mask UV scale: the mask holds the actor silhouettes in the
+	// top-left [0,scale] region when it was rasterized with the game
+	// dynamic-resolution viewport (ENB mode); (1,1) otherwise.
+	float2 maskUvScale;
+	float  _srcPad;
 	float4 sourceGeo[32];
 	float4 sourceLight[32];
 };
@@ -484,7 +488,10 @@ float3 MS_ApplyThermal(
 	// fire, placed lights and the sun. Bilinear sampling softens the body
 	// edge by a pixel; 1.4 lands a body at HOT with a push toward white.
 	const float bodyHeat =
-		tHeatMask.SampleLevel(gSamLinear, sourceUv, 0.0f).r * 1.4f;
+		tHeatMask.SampleLevel(
+			gSamLinear,
+			sourceUv * (maskUvScale.x > 0.0f ? maskUvScale : float2(1.0f, 1.0f)),
+			0.0f).r * 1.4f;
 	const float heatSignal = max(heat, bodyHeat);
 	// Warm sources drive the pixel from the cold band up to HOT; a strong
 	// core (heatSignal > 1) pushes on toward white so a body or fire glows.

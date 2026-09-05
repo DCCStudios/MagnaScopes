@@ -16,13 +16,17 @@ Texture2D<float> tSceneDepth : register(t0);
 
 cbuffer MaskParams : register(b0)
 {
-	float2 RcpMaskSize;  // 1 / mask (window) dimensions
-	float2 Pad;
+	float2 RcpMaskSize;   // 1 / mask (window) dimensions
+	// Dynamic-resolution ratio of the scene depth: under a DRS-driven
+	// upscaler the depth buffer only holds the scene in its top-left
+	// [0,ratio] subrect, so a full-frame UV has to be scaled into it.
+	// (1,1) when no dynamic resolution is active.
+	float2 DepthUvScale;
 };
 
 float4 main(float4 pos : SV_Position) : SV_Target
 {
-	const float2 uv = pos.xy * RcpMaskSize;
+	const float2 uv = pos.xy * RcpMaskSize * DepthUvScale;
 	uint depthWidth = 0;
 	uint depthHeight = 0;
 	tSceneDepth.GetDimensions(depthWidth, depthHeight);

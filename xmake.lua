@@ -3,7 +3,7 @@
 includes("lib/commonlibf4")
 
 set_project("MagnaScope")
-set_version("0.11.0")
+set_version("0.12.0")
 set_license("MIT")
 set_languages("c++23")
 set_warnings("allextra")
@@ -24,12 +24,15 @@ add_requires("minhook")
 
 local shader_profiles = {
     AutoSTS_PS = "ps_5_0",
+    FullscreenTriangle_VS = "vs_5_0",
     HeatMaskFill_PS = "ps_5_0",
     OcclusionSphereFlat_PS = "ps_5_0",
     ScopeApertureSynth_VS = "vs_5_0",
     ScopeGeometryFill_GS = "gs_5_0",
     ScopeGeometryMagnify_PS = "ps_5_0",
     ScopeGeometryProbe_PS = "ps_5_0",
+    SubrectStretch_PS = "ps_5_0",
+    HeatStencilResolve_PS = "ps_5_0",
     ReticleLayer_PS = "ps_5_0",
     ScopeEffect_PS = "ps_5_0",
     ScopeEffect_PS_Legacy = "ps_5_0",

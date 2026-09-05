@@ -6,6 +6,7 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <array>
+#include <unordered_map>
 #include <mutex>
 #include <vector>
 #include <wrl/client.h>
@@ -104,6 +105,14 @@ namespace Hook
 			UINT StartIndexLocation,
 			INT BaseVertexLocation,
 			UINT StartInstanceLocation);
+		typedef void(__stdcall* D3D11ClearRenderTargetViewHook)(
+			ID3D11DeviceContext* pContext,
+			ID3D11RenderTargetView* pRenderTargetView,
+			const FLOAT ColorRGBA[4]);
+		typedef void(__stdcall* D3D11CopyResourceHook)(
+			ID3D11DeviceContext* pContext,
+			ID3D11Resource* pDstResource,
+			ID3D11Resource* pSrcResource);
 
 	private:
 		static std::once_flag flagOnce;
@@ -334,8 +343,10 @@ namespace Hook
 		__declspec(align(16)) struct HeatSourceShaderData
 		{
 			int sourceCount = 0;
-			float srcPad0 = 0.0F;
-			float srcPad1 = 0.0F;
+			// xy = heat-mask UV scale (mask viewport / window; 1,1 when the
+			// mask was rasterized full-window). Was padding.
+			float maskUvScaleX = 1.0F;
+			float maskUvScaleY = 1.0F;
 			float srcPad2 = 0.0F;
 			// xy = normalized screen pos [0,1], z = radius (norm by height),
 			// w = thermal strength.
@@ -903,6 +914,9 @@ namespace Hook
 			std::array<D3D11DrawIndexedHook, kDrawHookSlots> drawIndexedSlots{};
 			std::array<D3D11DrawIndexedInstancedHook, kDrawHookSlots>
 				drawIndexedInstancedSlots{};
+			std::array<D3D11ClearRenderTargetViewHook, kDrawHookSlots>
+				clearRenderTargetViewSlots{};
+			std::array<D3D11CopyResourceHook, kDrawHookSlots> copyResourceSlots{};
 		};
 
 	public:
@@ -1366,6 +1380,12 @@ namespace Hook
 		// already-rendered 1x destination, while leaving destination alpha
 		// untouched for ENB/upscaler metadata.
 		ComPtr<ID3D11BlendState> BSScopeFadeReplaceRGB;
+		// Same replacement blend with alpha written too. Used only while the
+		// pre-upsample source is active: there the composite destination is
+		// the UI layer of a D3D12 present composite that keys opacity off
+		// alpha, and an RGB-only write left every lens pixel at alpha 0, so
+		// the composite showed the magnified image at its luma only.
+		ComPtr<ID3D11BlendState> BSScopeFadeReplaceRGBA;
 
 		ComPtr<ID3D11Texture2D> mTextDDS;
 		ComPtr<ID3D11Resource> mTextDDS_Res;
@@ -1398,6 +1418,175 @@ namespace Hook
 		ComPtr<ID3D11DepthStencilState> mHeatMaskDepthState;
 		// b0 for the fill PS: rcp mask dimensions, refreshed on resize.
 		ComPtr<ID3D11Buffer> mHeatMaskParamsCB;
+		// Last (rcpW, rcpH, drsW, drsH) uploaded to mHeatMaskParamsCB.
+		float mHeatMaskParamsLast[4] = { 0.0F, 0.0F, 0.0F, 0.0F };
+		// RTV twin of mShaderResourceView so a stretch pass can fill the
+		// legacy scene source in place of a CopyResource.
+		ComPtr<ID3D11RenderTargetView> mCurRTTextureRTV;
+		// RTV twin of mScopeFadeSceneSRV, same reason, replay path.
+		ComPtr<ID3D11RenderTargetView> mScopeFadeSceneRTV;
+
+		// --- Pre-upsample scene source (DRS-driven upscalers) -----------
+		// Under the jarari Upscaling frame-generation proxy the upscaled
+		// scene stays in D3D12 and the D3D11 back buffer is a UI-only layer
+		// at Present, so the Present-anchor capture reads black. The last
+		// D3D11 texture that holds the finished scene is the frame buffer at
+		// the UpsampleDynamicResolution imagespace stage (the upscaler's own
+		// input); it is captured there, and stretched from its DRS subrect to
+		// a full-frame source at Present. See CapturePreUpsampleFrame.
+		ComPtr<ID3D11Texture2D> mPreUpsampleTexture;
+		ComPtr<ID3D11ShaderResourceView> mPreUpsampleSRV;
+		bool mPreUpsampleCaptured = false;
+		float mPreUpsampleRatio[2] = { 1.0F, 1.0F };
+		ComPtr<ID3D11Device> mNativeDevice;
+		ComPtr<ID3D11DeviceContext> mNativeContext;
+		bool mNativeContextResolved = false;
+		// Heat mask under ENB: the mask is rasterized with the game viewport
+		// (a DRS subrect) instead of a full-window one, so ENB never sees a
+		// foreign viewport. The magnify shader then samples the mask through
+		// this scale (viewport / window), published in b6.
+		float mHeatMaskUvScale[2] = { 1.0F, 1.0F };
+		bool mHeatMaskInheritViewport = false;
+		// Private copy of the scene depth for the mask occlusion test. Binding
+		// the engine's own depth view as a shader resource mid-scene is the
+		// kind of bind ENB watches to locate the depth buffer, and doing it
+		// per actor draw made ENB misjudge the frame under dynamic
+		// resolution. Refreshed once per frame at the first tagged draw.
+		ComPtr<ID3D11Texture2D> mHeatMaskDepthCopy;
+		ComPtr<ID3D11ShaderResourceView> mHeatMaskDepthCopySRV;
+		std::uint64_t mHeatMaskDepthCopyTick = ~0ULL;
+		// Stencil-marking states, keyed by the game's state object (kept
+		// alive alongside the clone so the key cannot be recycled).
+		std::unordered_map<ID3D11DepthStencilState*,
+			std::pair<ComPtr<ID3D11DepthStencilState>, ComPtr<ID3D11DepthStencilState>>>
+			mHeatStencilStates;
+		ComPtr<ID3D11PixelShader> mHeatStencilResolvePS;
+		ComPtr<ID3D11Buffer> mHeatStencilResolveCB;
+		bool mHeatStencilMarkedThisFrame = false;
+		UINT mHeatStencilBit = kHeatStencilBit;
+		UINT mHeatStencilRefUnion = 0;
+		// Low bits of the game reference on marked actor draws (0x01 seen);
+		// the resolve matches exactly (kHeatStencilBit | this).
+		UINT mHeatStencilActorRefLow = 0x01U;
+		// Live dynamic-resolution ratio at the time actors were marked. The
+		// stencil is at that ratio; by the first imagespace effect the
+		// upscaler may already have forced the ratio to 1 (ENB path).
+		float mHeatStencilMarkRatio[2] = { 1.0F, 1.0F };
+		bool mHeatStencilResolvedThisFrame = false;
+		ComPtr<ID3D11VertexShader> mFullscreenTriangleVS;
+		ComPtr<ID3D11PixelShader> mSubrectStretchPS;
+		ComPtr<ID3D11Buffer> mSubrectStretchCB;
+		// BSTransparent with alpha WRITTEN (1 inside the lens) instead of
+		// preserved: a D3D12 UI composite keys opacity off the D3D11 layer's
+		// alpha/luma, and a preserved zero alpha would make dark magnified
+		// pixels see-through.
+		ComPtr<ID3D11BlendState> BSTransparentWriteAlpha;
+
+	public:
+		// Render thread, at the imagespace stage: copy the frame buffer
+		// (DRS subrect + ratio) for this frame scope pass. Public: called
+		// from the ImageSpaceManager::RenderEffect detour, a free function.
+		void CapturePreUpsampleFrame(
+			ID3D11DeviceContext* context,
+			ID3D11Texture2D* frameBuffer,
+			float widthRatio,
+			float heightRatio);
+		// True when this frame has a pre-upsample capture to serve as the
+		// scene source instead of the back buffer.
+		[[nodiscard]] bool PreUpsampleSourceActive() const;
+		// Stretch the captured subrect into target (full extent). False when
+		// no capture is active or resources are missing; callers fall back
+		// to their CopyResource path.
+		bool StretchPreUpsampleInto(
+			ID3D11DeviceContext* context,
+			ID3D11RenderTargetView* target,
+			UINT targetWidth,
+			UINT targetHeight);
+		// Present finished: the capture is consumed.
+		void EndFramePreUpsample();
+		// The transparent blend for the lens draw: alpha-writing while the
+		// pre-upsample source is active, alpha-preserving otherwise.
+		[[nodiscard]] ID3D11BlendState* ActiveTransparentBlend();
+		// Uploads mask params (rcp size + DRS depth UV scale) when changed.
+		void UpdateHeatMaskParams(ID3D11DeviceContext* context);
+		// Once-per-frame copy of the engine depth for the mask (see
+		// mHeatMaskDepthCopy).
+		void RefreshHeatMaskDepthCopy(ID3D11DeviceContext* context);
+		// Heat mask via stencil marking. Returns a clone of the game's
+		// depth-stencil state that also writes kHeatStencilBit where the
+		// depth test passes (ref is updated to carry the bit), or null when
+		// the game's own stencil usage makes that unsafe for this draw.
+		ID3D11DepthStencilState* HeatStencilStateFor(
+			ID3D11DepthStencilState* gameState, UINT& ref);
+		// Records a stencil reference the game wrote and re-derives the mark
+		// bit as the highest bit no observed reference uses, so a later engine
+		// pass comparing those values is left undisturbed.
+		void NoteGameStencilRef(UINT ref);
+		// One full-screen pass: stencil bit -> R8 mask. Ratio maps the
+		// full-window mask onto the dynamic-resolution subrect the stencil
+		// holds.
+		void ResolveHeatMaskFromStencil(
+			ID3D11DeviceContext* context, float widthRatio, float heightRatio);
+		// Entry point for the imagespace detour (a free function): resolves
+		// the actor marks at the first imagespace effect of the frame and, when
+		// armed, logs the stencil histogram first.
+		void EarlyHeatStencilResolve(ID3D11DeviceContext* context, std::atomic<bool>& histogramArmed);
+		// Diagnostic: histogram of stencil values around the lens.
+		void LogStencilHistogram(ID3D11DeviceContext* context, const char* label);
+		// High bit marks actors; the game's own low bits are preserved in the
+		// reference so its later stencil tests keep their meaning as far as
+		// the low bits go. Resolution matches the WHOLE byte.
+		static constexpr UINT kHeatStencilBit = 0x80U;
+		// BSScopeFadeReplaceRGBA while the pre-upsample source is active,
+		// BSScopeFadeReplaceRGB otherwise.
+		ID3D11BlendState* ActiveScopeFadeReplaceBlend();
+		// With ENB loaded, the immediate context the game hands us is ENB's
+		// wrapper, and ENB infers the dynamic-resolution rectangle from the
+		// viewports it sees bound during the scene pass. The heat-mask pass
+		// binds a full-window viewport mid-scene, which under a subrect made
+		// ENB treat the frame as native and project it stretched across the
+		// whole screen. This returns the underlying (real) immediate context,
+		// obtained through a resource's device the way the upscaler does for
+		// its own helper draws, so that pass stays invisible to ENB. Null
+		// when ENB is not loaded or the bypass is not safe.
+		ID3D11DeviceContext* NativeContextForEnbBypass();
+
+		// ClearRenderTargetView (vtable slot 50) goes through the same
+		// six-slot binder as the draws: d3d11 re-points the entry between its
+		// own template instantiations and wrapper contexts, so one MinHook on
+		// the address seen at install would miss calls. Only bound when an
+		// upscaler module is loaded. The upscaler clears the frame buffer right
+		// after consuming it, and that clear is the pre-upsample scene anchor.
+		template <std::size_t Slot>
+		static void __stdcall ClearRenderTargetViewSlotHook(
+			ID3D11DeviceContext* pContext,
+			ID3D11RenderTargetView* pRenderTargetView,
+			const FLOAT ColorRGBA[4]);
+		static void* const* ClearRenderTargetViewDetourSlots();
+		static void** ClearRenderTargetViewOriginalSlots();
+		static void ClearRenderTargetViewDispatch(
+			ID3D11DeviceContext* pContext,
+			ID3D11RenderTargetView* pRenderTargetView,
+			const FLOAT ColorRGBA[4],
+			D3D11ClearRenderTargetViewHook original);
+		// CopyResource (vtable slot 47), same binder. Diagnostic only: the
+		// upscaler copies the D3D11 back buffer into its present staging
+		// texture right before its D3D12 UI composite, and that copy is the
+		// last moment the layer can be inspected as the composite sees it.
+		template <std::size_t Slot>
+		static void __stdcall CopyResourceSlotHook(
+			ID3D11DeviceContext* pContext,
+			ID3D11Resource* pDstResource,
+			ID3D11Resource* pSrcResource);
+		static void* const* CopyResourceDetourSlots();
+		static void** CopyResourceOriginalSlots();
+		static void CopyResourceDispatch(
+			ID3D11DeviceContext* pContext,
+			ID3D11Resource* pDstResource,
+			ID3D11Resource* pSrcResource,
+			D3D11CopyResourceHook original);
+
+	private:
 
 		ComPtr<ID3D11Texture2D> mCurRTTexture;
 		ComPtr<ID3D11Texture2D> rtTexture2D;

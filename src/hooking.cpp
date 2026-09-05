@@ -1,4 +1,7 @@
 #include "hooking.h"
+
+#include <Psapi.h>
+#pragma comment(lib, "Psapi.lib")
 #include "DDSTextureLoader11.h"
 #include "WICTextureLoader11.h"
 #include <MinHook.h>
@@ -816,6 +819,8 @@ DWORD_PTR* g_deviceContextVTable = nullptr;
 struct DrawHookBinding;
 extern DrawHookBinding g_drawIndexedBinding;
 extern DrawHookBinding g_drawIndexedInstancedBinding;
+extern DrawHookBinding g_clearRenderTargetViewBinding;
+extern DrawHookBinding g_copyResourceBinding;
 
 // "module.dll+0xOFFSET" for a code address. Which module owns a hook target is
 // the difference between having hooked d3d11's own function and having hooked
@@ -880,6 +885,8 @@ struct DrawHookBinding
 
 DrawHookBinding g_drawIndexedBinding{};
 DrawHookBinding g_drawIndexedInstancedBinding{};
+DrawHookBinding g_clearRenderTargetViewBinding{};
+DrawHookBinding g_copyResourceBinding{};
 
 // Binding happens from two threads: the install thread walks the vtable once at
 // startup, and every Present re-checks it. MH_CreateHook can take over a
@@ -1166,6 +1173,16 @@ ID3D11Buffer* gdc_pVertexBuffer = NULL;
 ID3D11InputLayout* gdc_pVertexLayout = NULL;
 ID3D11Buffer* gdc_pIndexBuffer = NULL;
 HMODULE upscalerMod;
+// Diagnostic: armed by a scope diag frame; the upscaler's back-buffer copy
+// (its present staging) then reads back the lens region as the composite
+// will see it. See D3D::CopyResourceDispatch.
+std::atomic<bool> g_finalLayerProbeArmed{ false };
+int g_finalLayerProbeX = 0;
+int g_finalLayerProbeY = 0;
+// Second sample well away from the lens (15% across the frame): a full-frame
+// artefact shows up here while the lens-centre sample cannot tell.
+std::atomic<bool> g_captureProbeArmed{ false };
+const char* g_finalLayerProbeLabel = "final UI layer as copied by the upscaler for its composite";
 
 using namespace ScopeData;
 
@@ -1246,6 +1263,21 @@ struct SavedState
 
 namespace Hook
 {
+	namespace
+	{
+		// Defined later in this translation unit (diagnostic readback).
+		void LogRegionMean(
+			ID3D11DeviceContext* context,
+			ID3D11Texture2D* texture,
+			int cx,
+			int cy,
+			const char* label);
+		// Defined later in this translation unit (ENB module lookup).
+		HMODULE FindEnbModule();
+		// Heat-mask stencil histogram diagnostics, armed by a scoped diag frame.
+		std::atomic<bool> g_stencilHistogramArmed{ false };
+		std::atomic<bool> g_stencilHistogramAnchorArmed{ false };
+	}
 	namespace HangDiag
 	{
 		std::atomic<std::uint64_t> presentTicks{ 0U };
@@ -1965,6 +1997,52 @@ namespace Hook
 		pContext->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, state.pRTVs, &state.pDSV);
 		pContext->OMGetBlendState(&state.pBlendState, state.BlendFactor, &state.SampleMask);
 		pContext->OMGetDepthStencilState(&state.pDepthStencilState, &state.StencilRef);
+	}
+
+	// Applies only the draw INPUTS of a saved state (IA, VS, GS, rasterizer)
+	// to another context and releases every reference the save took. Used to
+	// re-issue a game draw on the real immediate context behind an ENB
+	// wrapper: ENB keeps its own state cache and forwards lazily, so the real
+	// context does not carry the game's bindings until ENB's next draw. The
+	// output stages (PS/OM/viewport) are deliberately not mirrored; the
+	// caller sets its own. Render-target views are never touched here since
+	// the back-buffer view is the one object ENB is known to wrap.
+	void MirrorDrawInputsAndRelease(ID3D11DeviceContext* target, SavedState& state)
+	{
+		if (target) {
+			target->IASetInputLayout(state.pInputLayout);
+			target->IASetVertexBuffers(0, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT,
+				state.pVertexBuffers, state.VertexStrides, state.VertexOffsets);
+			target->IASetIndexBuffer(state.pIndexBuffer, state.IndexBufferFormat, state.IndexBufferOffset);
+			target->IASetPrimitiveTopology(state.PrimitiveTopology);
+			target->VSSetShader(state.pVS, nullptr, 0);
+			target->VSSetConstantBuffers(0, MAX_CB_SLOTS, state.pVSCBuffers);
+			target->VSSetShaderResources(0, MAX_SRV_SLOTS, state.pVSSRVs);
+			target->VSSetSamplers(0, MAX_SAMPLER_SLOTS, state.pVSSamplers);
+			target->GSSetShader(state.pGS, nullptr, 0);
+			target->RSSetState(state.pRasterizerState);
+			target->RSSetScissorRects(state.NumScissorRects, state.ScissorRects);
+		}
+#define SAFE_RELEASE_ARRAY(arr, count) \
+	for (UINT i = 0; i < count; ++i) SAFE_RELEASE(arr[i])
+		SAFE_RELEASE(state.pInputLayout);
+		SAFE_RELEASE_ARRAY(state.pVertexBuffers, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT);
+		SAFE_RELEASE(state.pIndexBuffer);
+		SAFE_RELEASE(state.pVS);
+		SAFE_RELEASE_ARRAY(state.pVSCBuffers, MAX_CB_SLOTS);
+		SAFE_RELEASE_ARRAY(state.pVSSRVs, MAX_SRV_SLOTS);
+		SAFE_RELEASE_ARRAY(state.pVSSamplers, MAX_SAMPLER_SLOTS);
+		SAFE_RELEASE(state.pGS);
+		SAFE_RELEASE(state.pPS);
+		SAFE_RELEASE_ARRAY(state.pPSCBuffers, MAX_CB_SLOTS);
+		SAFE_RELEASE_ARRAY(state.pPSSRVs, MAX_SRV_SLOTS);
+		SAFE_RELEASE_ARRAY(state.pPSSamplers, MAX_SAMPLER_SLOTS);
+		SAFE_RELEASE(state.pRasterizerState);
+		SAFE_RELEASE_ARRAY(state.pRTVs, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT);
+		SAFE_RELEASE(state.pDSV);
+		SAFE_RELEASE(state.pBlendState);
+		SAFE_RELEASE(state.pDepthStencilState);
+#undef SAFE_RELEASE_ARRAY
 	}
 
 	void RestoreState(ID3D11DeviceContext* pContext, SavedState& state)
@@ -2770,6 +2848,7 @@ namespace Hook
 		mScopeFadeSampler.Reset();
 		mScopeFadeResolutionBuffer.Reset();
 		BSScopeFadeReplaceRGB.Reset();
+		BSScopeFadeReplaceRGBA.Reset();
 		m_pGeometryShader_STSGeometryFill.Reset();
 		m_pPixelShader_STSGeometryMagnify.Reset();
 		m_pPixelShader_STSReticleLayer.Reset();
@@ -2898,6 +2977,18 @@ namespace Hook
 				device->CreateBlendState(
 					&replacementBlendDescription,
 					BSScopeFadeReplaceRGB.ReleaseAndGetAddressOf());
+			// Alpha-writing twin for the upscaler UI-layer composite (see
+			// hooking.h). Only the lens geometry is drawn with it.
+			replacementTarget.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+			if (FAILED(device->CreateBlendState(
+					&replacementBlendDescription,
+					BSScopeFadeReplaceRGBA.ReleaseAndGetAddressOf()))) {
+				BSScopeFadeReplaceRGBA.Reset();
+			}
+			replacementTarget.RenderTargetWriteMask =
+				D3D11_COLOR_WRITE_ENABLE_RED |
+				D3D11_COLOR_WRITE_ENABLE_GREEN |
+				D3D11_COLOR_WRITE_ENABLE_BLUE;
 			if (FAILED(replacementBlendResult) ||
 				!BSScopeFadeReplaceRGB.Get()) {
 				logger::error(
@@ -3184,7 +3275,10 @@ namespace Hook
 
 			D3D11_TEXTURE2D_DESC copyDescription = sourceDescription;
 			copyDescription.Usage = D3D11_USAGE_DEFAULT;
-			copyDescription.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			// RENDER_TARGET as well: the pre-upsample stretch fills this
+			// texture with a draw instead of a CopyResource.
+			copyDescription.BindFlags =
+				D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 			copyDescription.CPUAccessFlags = 0;
 			copyDescription.MiscFlags = 0;
 			const HRESULT textureResult = contextDevice->CreateTexture2D(
@@ -3219,6 +3313,15 @@ namespace Hook
 				return false;
 			}
 
+			mScopeFadeSceneRTV.Reset();
+			D3D11_RENDER_TARGET_VIEW_DESC sceneRtvDescription{};
+			sceneRtvDescription.Format = targetDescription.Format;
+			sceneRtvDescription.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+			contextDevice->CreateRenderTargetView(
+				mScopeFadeSceneTexture.Get(),
+				&sceneRtvDescription,
+				mScopeFadeSceneRTV.GetAddressOf());
+
 			logger::info(
 				"Stage 4e.2 ScopeFade scene source created: {}x{}, "
 				"resource format={}, view format={}",
@@ -3229,9 +3332,17 @@ namespace Hook
 		}
 
 		if (!preferredWorldSource) {
-			context->CopyResource(
-				mScopeFadeSceneTexture.Get(),
-				sourceTexture.Get());
+			// Under a DRS-driven upscaler the composite target is UI-only at
+			// Present; the pre-upsample capture is the scene.
+			if (!StretchPreUpsampleInto(
+					context,
+					mScopeFadeSceneRTV.Get(),
+					sourceDescription.Width,
+					sourceDescription.Height)) {
+				context->CopyResource(
+					mScopeFadeSceneTexture.Get(),
+					sourceTexture.Get());
+			}
 		}
 
 		const auto projection = GetLensProjectionSnapshot();
@@ -3846,7 +3957,7 @@ namespace Hook
 			0,
 			replayPixelShader,
 			replay.inputLayout.Get(),
-			BSScopeFadeReplaceRGB.Get(),
+			ActiveScopeFadeReplaceBlend(),
 			vertexConstantBufferSlots,
 			replay.indexBuffer.Get(),
 			replay.indexFormat,
@@ -4122,7 +4233,7 @@ namespace Hook
 				0,
 				opticalPixelShader,
 				placement.inputLayout.Get(),
-				BSScopeFadeReplaceRGB.Get(),
+				ActiveScopeFadeReplaceBlend(),
 				placementConstantBuffers,
 				mApertureSynthIndexBuffer.Get(),
 				DXGI_FORMAT_R16_UINT,
@@ -4268,7 +4379,7 @@ namespace Hook
 			0,
 			opticalPixelShader,
 			mApertureSynthInputLayout.Get(),
-			BSScopeFadeReplaceRGB.Get(),
+			ActiveScopeFadeReplaceBlend(),
 			noVertexConstantBuffers,
 			mApertureSynthIndexBuffer.Get(),
 			DXGI_FORMAT_R16_UINT,
@@ -5195,6 +5306,19 @@ namespace Hook
 					}
 				}
 				const auto snapshot = GetLensProjectionSnapshot();
+				if (upscalerMod && mAutomaticSTSReticleLayerTexture.Get() &&
+					layerDescription.Width > 0 && layerDescription.Height > 0) {
+					// What the black-background capture holds, at 30%, 50% and
+					// 80% of the layer. Under dynamic resolution the capture
+					// should end at the recorded viewport extent; content at 80%
+					// means the authored draw rasterized at full size and the
+					// composite's capture scale is then wrong (enlarged ghost).
+					const int w = static_cast<int>(layerDescription.Width);
+					const int hgt = static_cast<int>(layerDescription.Height);
+					LogRegionMean(g_Context.Get(), mAutomaticSTSReticleLayerTexture.Get(), w * 3 / 10, hgt * 3 / 10, "reticle layer B at 30%");
+					LogRegionMean(g_Context.Get(), mAutomaticSTSReticleLayerTexture.Get(), w / 2, hgt / 2, "reticle layer B at 50%");
+					LogRegionMean(g_Context.Get(), mAutomaticSTSReticleLayerTexture.Get(), w * 8 / 10, hgt * 8 / 10, "reticle layer B at 80%");
+				}
 				logger::info(
 					"Reticle layer composite: layer={}x{}, target={}x{}, "
 					"viewport={:.0f}x{:.0f} at ({:.0f}, {:.0f}), "
@@ -5420,6 +5544,21 @@ namespace Hook
 		rtDesc.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
 		HR(g_Device->CreateBlendState(&blendDesc, BSTransparent.GetAddressOf()));
 
+		// 3. Same blend, but alpha is WRITTEN as the shader alpha (1 inside
+		// the lens). Used only while the pre-upsample source is active: there
+		// the D3D11 target is the UI layer of a D3D12 composite that keys
+		// opacity off alpha/luma, and preserving a zero alpha would turn every
+		// dark magnified pixel transparent. Only the lens geometry is drawn,
+		// so no full-frame alpha is disturbed.
+		// MAX rather than replace: the legacy path draws a full-screen
+		// triangle whose shader alpha is 0 outside the lens, and replacing
+		// destination alpha there would strip the HUD's own alpha. MAX leaves
+		// everything outside the lens untouched and forces 1 inside it.
+		rtDesc.SrcBlendAlpha = D3D11_BLEND_ONE;
+		rtDesc.DestBlendAlpha = D3D11_BLEND_ONE;
+		rtDesc.BlendOpAlpha = D3D11_BLEND_OP_MAX;
+		HR(g_Device->CreateBlendState(&blendDesc, BSTransparentWriteAlpha.GetAddressOf()));
+
 	}
 
 	void CreateConstantBuffer(ID3D11Device* device, ID3D11Buffer** buffer, UINT byteWidth)
@@ -5522,6 +5661,57 @@ namespace Hook
 			// The command-buffer tag route needs the device to mint its 1x1
 			// identity SRV; dormant until this call.
 			MagnaScope::ActorHeatTag::SetTagDevice(g_Device.Get());
+		}
+
+		// Pre-upsample scene source (DRS-driven upscalers): fullscreen
+		// triangle VS + subrect stretch PS + a 16-byte params buffer.
+		// Non-fatal: without them StretchPreUpsampleInto returns false and
+		// the back-buffer copy path is used as before.
+		{
+			ComPtr<ID3DBlob> blob;
+			if (SUCCEEDED(CreateShaderFromFile(
+					L"Data\\Shaders\\MagnaScope\\FullscreenTriangle_VS.cso",
+					L"src\\HLSL\\FullscreenTriangle_VS.hlsl", "main", "vs_5_0",
+					blob.ReleaseAndGetAddressOf())) &&
+				blob.Get()) {
+				g_Device->CreateVertexShader(
+					blob->GetBufferPointer(), blob->GetBufferSize(),
+					nullptr, mFullscreenTriangleVS.ReleaseAndGetAddressOf());
+			}
+			if (SUCCEEDED(CreateShaderFromFile(
+					L"Data\\Shaders\\MagnaScope\\SubrectStretch_PS.cso",
+					L"src\\HLSL\\SubrectStretch_PS.hlsl", "main", "ps_5_0",
+					blob.ReleaseAndGetAddressOf())) &&
+				blob.Get()) {
+				g_Device->CreatePixelShader(
+					blob->GetBufferPointer(), blob->GetBufferSize(),
+					nullptr, mSubrectStretchPS.ReleaseAndGetAddressOf());
+			}
+			D3D11_BUFFER_DESC stretchDesc{};
+			stretchDesc.ByteWidth = 16;
+			stretchDesc.Usage = D3D11_USAGE_DEFAULT;
+			stretchDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+			g_Device->CreateBuffer(
+				&stretchDesc, nullptr, mSubrectStretchCB.ReleaseAndGetAddressOf());
+			if (SUCCEEDED(CreateShaderFromFile(
+					L"Data\\Shaders\\MagnaScope\\HeatStencilResolve_PS.cso",
+					L"src\\HLSL\\HeatStencilResolve_PS.hlsl", "main", "ps_5_0",
+					blob.ReleaseAndGetAddressOf())) &&
+				blob.Get()) {
+				g_Device->CreatePixelShader(
+					blob->GetBufferPointer(), blob->GetBufferSize(),
+					nullptr, mHeatStencilResolvePS.ReleaseAndGetAddressOf());
+			}
+			g_Device->CreateBuffer(
+				&stretchDesc, nullptr, mHeatStencilResolveCB.ReleaseAndGetAddressOf());
+			if (!mHeatStencilResolvePS.Get()) {
+				logger::warn("[heat] HeatStencilResolve_PS.cso missing; thermal actor mask disabled");
+			}
+			if (!mFullscreenTriangleVS.Get() || !mSubrectStretchPS.Get()) {
+				logger::warn(
+					"[upscaler] subrect stretch shaders missing; the scope keeps "
+					"the back-buffer source (black under a D3D12 present override)");
+			}
 		}
 
 		CreateBlender();
@@ -5629,12 +5819,15 @@ namespace Hook
 			const float maskParams[4] = {
 				windowWidth > 0 ? 1.0F / static_cast<float>(windowWidth) : 0.0F,
 				windowHeight > 0 ? 1.0F / static_cast<float>(windowHeight) : 0.0F,
-				0.0F,
-				0.0F
+				1.0F,
+				1.0F
 			};
+			std::copy(std::begin(maskParams), std::end(maskParams), mHeatMaskParamsLast);
 			D3D11_BUFFER_DESC cbDesc{};
 			cbDesc.ByteWidth = sizeof(maskParams);
-			cbDesc.Usage = D3D11_USAGE_IMMUTABLE;
+			// DEFAULT, not IMMUTABLE: the DRS depth-UV scale is refreshed
+			// per frame by UpdateHeatMaskParams.
+			cbDesc.Usage = D3D11_USAGE_DEFAULT;
 			cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 			D3D11_SUBRESOURCE_DATA cbInit{};
 			cbInit.pSysMem = maskParams;
@@ -5670,6 +5863,14 @@ namespace Hook
 		mHeatMaskRTV.Reset();
 		mHeatMaskTexture.Reset();
 		mHeatMaskParamsCB.Reset();
+		mHeatMaskDepthCopySRV.Reset();
+		mHeatMaskDepthCopy.Reset();
+		mHeatStencilStates.clear();
+		mCurRTTextureRTV.Reset();
+		mScopeFadeSceneRTV.Reset();
+		mPreUpsampleSRV.Reset();
+		mPreUpsampleTexture.Reset();
+		mPreUpsampleCaptured = false;
 		{
 			std::scoped_lock lock(mAutomaticSTSReticleLayerMutex);
 			mAutomaticSTSReticleLayerWhiteSRV.Reset();
@@ -6084,7 +6285,9 @@ namespace Hook
 		UpdateConstantBuffer(m_pScopeEffectBuffer, scopeData);
 		{
 			// Upload the coherent heat snapshot to b6 for the thermal shader.
-			const HeatSourceShaderData heatData = GetHeatSourceSnapshot();
+			HeatSourceShaderData heatData = GetHeatSourceSnapshot();
+			heatData.maskUvScaleX = mHeatMaskUvScale[0];
+			heatData.maskUvScaleY = mHeatMaskUvScale[1];
 			UpdateConstantBuffer(m_pHeatSourceBuffer, heatData);
 		}
 
@@ -6105,7 +6308,7 @@ namespace Hook
 			0,
 			m_pPixelShader.Get(),
 			gdc_pVertexLayout,
-			BSTransparent.Get(),
+			ActiveTransparentBlend(),
 			noVertexConstants,
 			gdc_pIndexBuffer,
 			DXGI_FORMAT_R32_UINT,
@@ -6308,7 +6511,7 @@ namespace Hook
 			m_pPixelShader_OcclusionSphereFlat.Get(), nullptr, 0U);
 		context->PSSetConstantBuffers(
 			0U, 1U, mOcclusionSphereConstantBuffer.GetAddressOf());
-		context->OMSetBlendState(BSTransparent.Get(), nullptr, 0xFFFFFFFFU);
+		context->OMSetBlendState(ActiveTransparentBlend(), nullptr, 0xFFFFFFFFU);
 		context->RSSetState(solidRasterizer.Get());
 		bSelfDraw = true;
 		context->DrawIndexed(mOcclusionSphereIndexCount, 0U, 0);
@@ -6650,12 +6853,60 @@ namespace Hook
 				currentProfile && currentProfile->autoProfile ?
 					m_pPixelShader_AutoSTS.Get() :
 					m_pPixelShader_Legacy.Get();
-			SetupCommonRenderState(m_pVertexShader_Legacy.Get(), nullptr, 0, pixelShader, gdc_pVertexLayout, BSTransparent.Get(),
+			SetupCommonRenderState(m_pVertexShader_Legacy.Get(), nullptr, 0, pixelShader, gdc_pVertexLayout, ActiveTransparentBlend(),
 				vsCBuffersSlots, gdc_pIndexBuffer, DXGI_FORMAT_R32_UINT, 0, &gdc_pVertexBuffer, &strides, &offsets, 1, compositeTarget);
 
 			// 旧版特定资源
 			g_Context->PSSetShaderResources(4, 1, D3DInstance->mShaderResourceView.GetAddressOf());
 			g_Context->PSSetShaderResources(5, 1, D3DInstance->mTextDDS_SRV.GetAddressOf());
+
+			if (upscalerMod) {
+				// Diagnostic: the state actually bound for the lens draw, read
+				// back from the context rather than assumed.
+				static std::once_flag loggedBound;
+				std::call_once(loggedBound, [&] {
+					ComPtr<ID3D11BlendState> bound;
+					FLOAT factor[4]{};
+					UINT mask = 0;
+					g_Context->OMGetBlendState(bound.GetAddressOf(), factor, &mask);
+					D3D11_BLEND_DESC desc{};
+					if (bound.Get()) {
+						bound->GetDesc(&desc);
+					}
+					const auto& rt = desc.RenderTarget[0];
+					ComPtr<ID3D11PixelShader> boundPS;
+					g_Context->PSGetShader(boundPS.GetAddressOf(), nullptr, nullptr);
+					ComPtr<ID3D11RenderTargetView> boundRTV;
+					g_Context->OMGetRenderTargets(1, boundRTV.GetAddressOf(), nullptr);
+					D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+					if (boundRTV.Get()) {
+						boundRTV->GetDesc(&rtvDesc);
+					}
+					logger::info(
+						"Lens draw bound state: blend {:p} (write-alpha {:p}, preserve {:p}) enable={} "
+						"src={} dst={} op={} srcA={} dstA={} opA={} mask={:#x} sampleMask={:#x}; "
+						"PS {:p} (AutoSTS {:p}, Legacy {:p}); RTV {:p} format {}; EnableMerge={} zoom={:.2f}",
+						static_cast<void*>(bound.Get()),
+						static_cast<void*>(BSTransparentWriteAlpha.Get()),
+						static_cast<void*>(BSTransparent.Get()),
+						rt.BlendEnable != 0,
+						static_cast<int>(rt.SrcBlend),
+						static_cast<int>(rt.DestBlend),
+						static_cast<int>(rt.BlendOp),
+						static_cast<int>(rt.SrcBlendAlpha),
+						static_cast<int>(rt.DestBlendAlpha),
+						static_cast<int>(rt.BlendOpAlpha),
+						rt.RenderTargetWriteMask,
+						mask,
+						static_cast<void*>(boundPS.Get()),
+						static_cast<void*>(m_pPixelShader_AutoSTS.Get()),
+						static_cast<void*>(m_pPixelShader_Legacy.Get()),
+						static_cast<void*>(boundRTV.Get()),
+						static_cast<int>(rtvDesc.Format),
+						scopeData.EnableMerge,
+						scopeData.ScopeEffect_Zoom);
+				});
+			}
 
 			bSelfDraw = true;
 			g_Context->DrawIndexed(3, 0, 0);
@@ -6680,7 +6931,7 @@ namespace Hook
 				renderedAtTAAThisFrame ? nullptr : m_pRenderTargetView.Get();
 			SetupCommonRenderState(
 				targetVS.Get(), nullptr, 0, m_outPutPixelShader.Get(), targetInputLayout.Get(),
-				BSTransparent.Get(), vsCBuffersSlots, targetIndexBuffer.Get(), DXGI_FORMAT_R16_UINT, targetIndexBufferOffset, targetVertexBuffer.GetAddressOf(), &targetVertexBufferStrides,
+				ActiveTransparentBlend(), vsCBuffersSlots, targetIndexBuffer.Get(), DXGI_FORMAT_R16_UINT, targetIndexBufferOffset, targetVertexBuffer.GetAddressOf(), &targetVertexBufferStrides,
 				&targetVertexBufferOffsets, 1, compositeTarget);
 
 			// 新版特有资源绑定
@@ -6857,94 +7108,66 @@ namespace Hook
 				StartIndexLocation,
 				BaseVertexLocation);
 		}
-		// Heat mask (Stage 2): if the actor-tagging hooks flagged this draw as
-		// character geometry, re-issue it into the R8 mask with a flat pixel
-		// shader and the live scene depth (tested, not written) so the mask holds
-		// the actor's true, depth-occluded silhouette. Full state is saved and
-		// restored; the game's VS/IA are kept so the silhouette is pixel-exact.
-		if (D3DInstance && D3DInstance->mHeatMaskRTV.Get() &&
-			D3DInstance->mHeatMaskFillPS.Get() &&
-			D3DInstance->mHeatMaskDepthState.Get() &&
-			MagnaScope::ActorHeatTag::CurrentDrawIsActor(pContext)) {
-			// Lazy per-frame clear: wipe the mask on the first tagged draw of a
-			// new present cycle. Render-thread only, so a plain static is fine.
-			static std::uint64_t s_lastMaskClearTick = ~0ULL;
-			const auto presentTick =
-				HangDiag::presentTicks.load(std::memory_order_relaxed);
-			if (presentTick != s_lastMaskClearTick) {
-				s_lastMaskClearTick = presentTick;
-				const float zero[4] = { 0.0F, 0.0F, 0.0F, 0.0F };
-				pContext->ClearRenderTargetView(
-					D3DInstance->mHeatMaskRTV.Get(), zero);
+		// Heat mask (Stage 2): actor draws are MARKED in the scene stencil
+		// during their own draw, with a clone of the game's depth-stencil state
+		// that also writes kHeatStencilBit where the depth test passes. The
+		// hardware depth test gives exact occlusion for free, and nothing is
+		// re-issued: the earlier design re-drew every actor into a private
+		// target, and that per-actor render-target switching mid-scene made
+		// ENB misjudge the frame under dynamic resolution (full-frame
+		// stretched projection). The bit is resolved into the R8 mask once
+		// per frame after the scene (ResolveHeatMaskFromStencil).
+		if (D3DInstance && D3DInstance->mHeatMaskRTV.Get()) {
+			// Sparse sample of the stencil references the game uses on
+			// ordinary draws, to keep the actor mark bit out of their way.
+			static unsigned sampleCounter = 0;
+			if ((++sampleCounter & 63U) == 0U) {
+				ComPtr<ID3D11DepthStencilState> anyState;
+				UINT anyRef = 0;
+				pContext->OMGetDepthStencilState(anyState.GetAddressOf(), &anyRef);
+				D3DInstance->NoteGameStencilRef(anyRef);
 			}
-
-			// BSBatchRenderer::Draw fires for EVERY pass, including the shadow
-			// cascades and the z-prepass. Those are depth-only (no colour RTV) and
-			// their vertex shader uses the light's projection, not the camera's --
-			// re-issuing them would rasterise garbage, and their shadow-map DSV is a
-			// different size than the full-screen mask, which makes the whole OM
-			// binding invalid so D3D silently drops the draw. Only re-issue when a
-			// colour target is bound (the main camera colour/g-buffer pass), so the
-			// game VS emits camera-space clip positions that land on screen.
+		}
+		if (D3DInstance && D3DInstance->mHeatMaskRTV.Get() &&
+			MagnaScope::ActorHeatTag::CurrentDrawIsActor(pContext)) {
+			// Main colour pass only: depth-only passes (shadow cascades, the
+			// z-prepass) use other depth buffers or light projections.
 			ComPtr<ID3D11RenderTargetView> sceneRTV;
 			ComPtr<ID3D11DepthStencilView> sceneDSV;
 			pContext->OMGetRenderTargets(
 				1, sceneRTV.GetAddressOf(), sceneDSV.GetAddressOf());
-			if (sceneRTV.Get()) {
-				ScopedContextState maskState(pContext);
-				// The mask binds with NO DSV: a DSV legally has to match the
-				// render target's size, and the scene depth's render resolution
-				// does not match the full-window mask. Occlusion happens in the
-				// fill PS instead, which compares this pixel's own depth (same
-				// VS, same constants -> same SV_Position.z the scene pass wrote)
-				// against the engine's main depth SRV -- so actors behind cover
-				// are clipped out of the mask per-pixel.
-				ID3D11RenderTargetView* maskRTV = D3DInstance->mHeatMaskRTV.Get();
-				pContext->OMSetRenderTargets(1, &maskRTV, nullptr);
-				pContext->OMSetDepthStencilState(
-					D3DInstance->mHeatMaskDepthState.Get(), 0);
-				pContext->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFU);
-				pContext->PSSetShader(
-					D3DInstance->mHeatMaskFillPS.Get(), nullptr, 0);
-				// Occlusion inputs: t0 = the engine's own main depth SRV
-				// (depthStencilTargets[Depth::kMain]; binding it is legal here
-				// because the OMSetRenderTargets above just unbound it as a
-				// DSV), b0 = rcp mask size for the UV reconstruction. Both are
-				// restored by maskState. Null t0 leaves clip() comparing
-				// against 0 = never visible, so skip the bind only if absent
-				// and accept a frame without occlusion data as an empty mask.
-				if (auto* rendererData = RE::BSGraphics::GetRendererData();
-					rendererData) {
-					auto* depthSRV = reinterpret_cast<ID3D11ShaderResourceView*>(
-						rendererData->depthStencilTargets[2].srViewDepth);
-					if (depthSRV) {
-						pContext->PSSetShaderResources(0, 1, &depthSRV);
+			if (sceneRTV.Get() && sceneDSV.Get()) {
+				ComPtr<ID3D11DepthStencilState> gameState;
+				UINT gameRef = 0;
+				pContext->OMGetDepthStencilState(gameState.GetAddressOf(), &gameRef);
+				D3DInstance->NoteGameStencilRef(gameRef);
+				UINT markedRef = gameRef;
+				if (ID3D11DepthStencilState* marked =
+						D3DInstance->HeatStencilStateFor(gameState.Get(), markedRef)) {
+					pContext->OMSetDepthStencilState(marked, markedRef);
+					bSelfDraw = true;
+					original(
+						pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+					bSelfDraw = false;
+					pContext->OMSetDepthStencilState(gameState.Get(), gameRef);
+					if (!D3DInstance->mHeatStencilMarkedThisFrame) {
+						float wr = 1.0F;
+						float hr = 1.0F;
+						if (upscalerMod) {
+							static REL::Relocation<RE::BSGraphics::RenderTargetManager*> targetManager{
+								RE::ID::BSGraphics::RenderTargetManager::Singleton
+							};
+							if (auto* manager = targetManager.get()) {
+								wr = manager->dynamicWidthRatio;
+								hr = manager->dynamicHeightRatio;
+							}
+						}
+						D3DInstance->mHeatStencilMarkRatio[0] = (wr > 0.0F && wr <= 1.0F) ? wr : 1.0F;
+						D3DInstance->mHeatStencilMarkRatio[1] = (hr > 0.0F && hr <= 1.0F) ? hr : 1.0F;
 					}
+					D3DInstance->mHeatStencilMarkedThisFrame = true;
+					return;
 				}
-				if (ID3D11Buffer* paramsCB =
-						D3DInstance->mHeatMaskParamsCB.Get()) {
-					pContext->PSSetConstantBuffers(0, 1, &paramsCB);
-				}
-				// The game renders colour passes at varying internal resolutions
-				// (2560x1440 and 3840x2160 both observed). The VS emits full-view
-				// NDC (-1..1) regardless, so rasterise into a viewport that maps
-				// full NDC onto the full mask -> mask UV == screen UV, matching
-				// what the magnify shader samples with sourceUv, independent of the
-				// source pass resolution. Inheriting the game viewport instead
-				// misplaced and shrank the silhouettes.
-				D3D11_VIEWPORT maskVp{};
-				maskVp.TopLeftX = 0.0F;
-				maskVp.TopLeftY = 0.0F;
-				maskVp.Width = static_cast<float>(windowWidth);
-				maskVp.Height = static_cast<float>(windowHeight);
-				maskVp.MinDepth = 0.0F;
-				maskVp.MaxDepth = 1.0F;
-				pContext->RSSetViewports(1, &maskVp);
-				bSelfDraw = true;
-				original(
-					pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
-				bSelfDraw = false;
-				// maskState restores all game render state on scope exit.
 			}
 		}
 		// Sphere occlusion: a draw whose bound index buffer matches a published
@@ -8552,11 +8775,30 @@ namespace Hook
 						mCurRTTexture.Get(),
 						nullptr,
 						mShaderResourceView.GetAddressOf()));
+					mCurRTTextureRTV.Reset();
+					g_Device->CreateRenderTargetView(
+						mCurRTTexture.Get(),
+						nullptr,
+						mCurRTTextureRTV.GetAddressOf());
 				}
 
 				bIsFirst = false;
 
-				g_Context->CopyResource(mCurRTTexture.Get(), rtTexture2D.Get());
+				// Under a DRS-driven upscaler the back buffer is UI-only here;
+				// the pre-upsample capture (stretched from its subrect) is the
+				// scene. Otherwise the back buffer copy is the scene as before.
+				if (!StretchPreUpsampleInto(
+						g_Context.Get(),
+						mCurRTTextureRTV.Get(),
+						rtTextureDesc.Width,
+						rtTextureDesc.Height)) {
+					g_Context->CopyResource(mCurRTTexture.Get(), rtTexture2D.Get());
+				}
+				if (!upscalerMod) {
+					// No pre-upsample anchor without an upscaler: resolve the
+					// actor marks here, before the composite samples the mask.
+					D3DInstance->ResolveHeatMaskFromStencil(g_Context.Get(), 1.0F, 1.0F);
+				}
 				UpdateScene(currData);
 
 				// One-shot diagnostics on the 30th scoped frame (a steady-state
@@ -8614,7 +8856,7 @@ namespace Hook
 							const std::array<std::pair<int, int>, 3> points{ { { lensX, lensY },
 								{ lensX + radius / 2, lensY },
 								{ lensX, lensY - radius / 2 } } };
-							std::array<std::array<std::uint64_t, 3>, 3> sums{};
+							std::array<std::array<std::uint64_t, 4>, 3> sums{};
 							result.hashes.fill(1469598103934665603ULL);
 							for (std::size_t point = 0; point < points.size(); ++point) {
 								const int startX = std::clamp(
@@ -8633,9 +8875,7 @@ namespace Hook
 											const auto value = row[x * 4 + channel];
 											result.hashes[point] ^= value;
 											result.hashes[point] *= 1099511628211ULL;
-											if (channel < 3) {
-												sums[point][channel] += value;
-											}
+											sums[point][channel] += value;
 										}
 									}
 								}
@@ -8643,19 +8883,22 @@ namespace Hook
 							g_Context->Unmap(stagingTexture.Get(), 0);
 							result.valid = true;
 							logger::info(
-								"Scope {} probe at ({}, {}): center={} {} {}, right={} {} {}, upper={} {} {}, hashes={:016X}/{:016X}/{:016X}",
+								"Scope {} probe at ({}, {}): center={} {} {} a{}, right={} {} {} a{}, upper={} {} {} a{}, hashes={:016X}/{:016X}/{:016X}",
 								label,
 								lensX,
 								lensY,
 								sums[0][0] / 256,
 								sums[0][1] / 256,
 								sums[0][2] / 256,
+								sums[0][3] / 256,
 								sums[1][0] / 256,
 								sums[1][1] / 256,
 								sums[1][2] / 256,
+								sums[1][3] / 256,
 								sums[2][0] / 256,
 								sums[2][1] / 256,
 								sums[2][2] / 256,
+								sums[2][3] / 256,
 								result.hashes[0],
 								result.hashes[1],
 								result.hashes[2]);
@@ -8681,6 +8924,32 @@ namespace Hook
 						scopeData.ScopeScreenPos.x,
 						scopeData.ScopeScreenPos.y);
 					sourceProbe = probeLens(mCurRTTexture.Get(), "source");
+					// What the composite destination holds BEFORE we draw. Under
+					// an upscaler present override this is the UI-only layer;
+					// with ENB in the chain the surface may be a D3D11/D3D12
+					// shared texture whose readback behaves differently, and
+					// without this baseline the after-draw probe cannot be read.
+					(void)probeLens(rtTexture2D.Get(), "target-before-draw");
+					static std::once_flag loggedTargetDesc;
+					std::call_once(loggedTargetDesc, [&] {
+						D3D11_TEXTURE2D_DESC targetDesc{};
+						rtTexture2D->GetDesc(&targetDesc);
+						logger::info(
+							"Scope composite destination: {}x{} format {} bind {:#x} misc {:#x} "
+							"(shared {}, keyed mutex {}, nt handle {}); lens blend {} alpha "
+							"(write-alpha state {:p}, preserve state {:p})",
+							targetDesc.Width,
+							targetDesc.Height,
+							static_cast<int>(targetDesc.Format),
+							targetDesc.BindFlags,
+							targetDesc.MiscFlags,
+							(targetDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED) != 0,
+							(targetDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) != 0,
+							(targetDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) != 0,
+							D3DInstance->PreUpsampleSourceActive() ? "writes" : "preserves destination",
+							static_cast<void*>(D3DInstance->BSTransparentWriteAlpha.Get()),
+							static_cast<void*>(D3DInstance->BSTransparent.Get()));
+					});
 				}
 
 				if (bLegacyMode) {
@@ -8706,6 +8975,14 @@ namespace Hook
 					// rtTexture2D is the composite destination at both anchors
 					// (the back buffer at Present, the bound target at TAA).
 					const auto targetProbe = probeLens(rtTexture2D.Get(), "target-after-draw");
+					if (upscalerMod) {
+						g_finalLayerProbeX = static_cast<int>(scopeData.ScopeScreenPos.x);
+						g_finalLayerProbeY = static_cast<int>(scopeData.ScopeScreenPos.y);
+						g_finalLayerProbeLabel = "final UI layer (scoped) as copied by the upscaler for its composite";
+						g_finalLayerProbeArmed.store(true, std::memory_order_release);
+						g_captureProbeArmed.store(true, std::memory_order_release);
+						g_stencilHistogramArmed.store(true, std::memory_order_release);
+					}
 					if (sourceProbe.valid && targetProbe.valid) {
 						logger::info(
 							"Scope draw changed sampled blocks: center={}, right={}, upper={}",
@@ -9477,6 +9754,22 @@ namespace Hook
 					DrawIndexedInstancedOriginalSlots(),
 					g_drawIndexedInstancedBinding,
 					"DrawIndexedInstancedHook");
+				if (upscalerMod) {
+					BindDrawHookTarget(
+						contextVTable,
+						50U,
+						ClearRenderTargetViewDetourSlots(),
+						ClearRenderTargetViewOriginalSlots(),
+						g_clearRenderTargetViewBinding,
+						"ClearRenderTargetViewHook");
+					BindDrawHookTarget(
+						contextVTable,
+						47U,
+						CopyResourceDetourSlots(),
+						CopyResourceOriginalSlots(),
+						g_copyResourceBinding,
+						"CopyResourceHook");
+				}
 			}
 		}
 
@@ -9705,6 +9998,30 @@ namespace Hook
 			compositedThisFrame = lastRenderProducedComposite;
 		}
 
+		// Diagnostic baseline: what the UI layer holds at screen centre on an
+		// ordinary unscoped frame, sampled twice per session. Compared with
+		// the scoped sample this tells whether a full-frame scene repaint of
+		// the back buffer (seen with ENB) happens every frame or only once
+		// the lens has been drawn.
+		{
+			static unsigned presentCount = 0;
+			++presentCount;
+			if (upscalerMod && !g_finalLayerProbeArmed.load(std::memory_order_acquire)) {
+				if (!D3D::isEnableRender && presentCount % 600U == 0U) {
+					g_finalLayerProbeX = static_cast<int>(windowWidth / 2);
+					g_finalLayerProbeY = static_cast<int>(windowHeight / 2);
+					g_finalLayerProbeLabel = "final UI layer (UNSCOPED baseline) as copied by the upscaler for its composite";
+					g_finalLayerProbeArmed.store(true, std::memory_order_release);
+				} else if (D3D::isEnableRender && presentCount % 300U == 0U) {
+					g_finalLayerProbeX = static_cast<int>(windowWidth / 2);
+					g_finalLayerProbeY = static_cast<int>(windowHeight / 2);
+					g_finalLayerProbeLabel = "final UI layer (SCOPED periodic, screen centre) as copied by the upscaler";
+					g_finalLayerProbeArmed.store(true, std::memory_order_release);
+					g_captureProbeArmed.store(true, std::memory_order_release);
+				}
+			}
+		}
+
 		const auto result = [&] {
 			const HangDiag::PhaseScope originalPresentPhase(
 				HangDiag::presentPhase,
@@ -9726,6 +10043,7 @@ namespace Hook
 		renderedAtTAAThisFrame = false;
 		compositedThisFrame = false;
 		renderPassHandledThisFrame = false;
+		D3DInstance->EndFramePreUpsample();
 		return result;
 	}
 
@@ -9892,6 +10210,1349 @@ namespace Hook
 		}
 		static inline REL::Relocation<decltype(thunk)*> func;
 	};
+
+
+	// --- Pre-upsample scene capture (DRS-driven upscalers) ---------------
+	//
+	// Why this exists: the jarari Upscaling frame-generation proxy keeps the
+	// upscaled scene in D3D12 and composites the game's D3D11 back buffer
+	// OVER it as a UI layer (its D3D12UIComposite keys opacity off the D3D11
+	// layer's alpha/luma). At Present, the D3D11 back buffer therefore holds
+	// only HUD pixels over black, and every MagnaScope capture that read it
+	// there read black (log sentinel: source probe hashes C8A6259CE7A13383).
+	//
+	// The last D3D11 texture that holds the finished scene is the frame
+	// buffer at the UpsampleDynamicResolution imagespace stage: tonemapped,
+	// pre-UI, and exactly the input the upscaler itself consumes, sitting in
+	// the dynamic-resolution subrect [0,ratio) of a full-size target.
+	// ImageSpaceManager::RenderEffect fires per effect, so effect 21 is
+	// intercepted, the frame buffer copied before the original runs, and the
+	// DRS ratio recorded at that moment (the upscaler restores the ratio to 1
+	// after upscaling, so reading it at Present would be wrong). Present then
+	// stretches the subrect into a full-frame scene source and draws the lens
+	// with alpha written, so the D3D12 composite shows it opaque.
+	//
+	// Fallback: should effect 21 never fire under some configuration, the
+	// frame buffer is also copied after the gamma-correct family (14-16, the
+	// last LDR writers before upsampling) until 21 is first observed.
+	namespace
+	{
+		using ImageSpaceRenderEffectFn = void (*)(void*, void*, int, int, void*);
+		ImageSpaceRenderEffectFn g_origImageSpaceRenderEffect = nullptr;
+		bool g_upsampleEffectSeen = false;
+		// Which anchor produced the capture the once-log reports.
+		const char* g_preUpsampleAnchor = "none";
+		// Image range of the upscaler module, for attributing clears to it.
+		std::uintptr_t g_upscalerImageBegin = 0;
+		std::uintptr_t g_upscalerImageEnd = 0;
+		// Modules that merely forward a clear (ourselves, d3d11, wrapper
+		// contexts); frames in these are skipped when finding the logical caller.
+		std::array<void*, 4> g_clearAttributionPassthrough{};
+
+		// ENB changes what the captured frame buffer contains. With ENB's
+		// master effect on, the upscaler runs the late imagespace range at a
+		// full-frame viewport with the dynamic ratio forced to 1 and only
+		// afterwards downscales that native image into its own upscaler input
+		// (Hax Upscaling.cpp: ApplyFullFrameViewport + PrepareENBSuperResolutionInput).
+		// The target we copy at its clear is therefore already full-frame and
+		// must not be stretched by 1/ratio. Mirror the upscaler's own predicate:
+		// an ENB module is loaded (exports ENBGetSDKVersion) and GLOBAL/UseEffect
+		// reads true through ENBGetParameter. Minimal local SDK types so no
+		// header dependency is added.
+		enum EnbParameterType : long
+		{
+			kEnbParamBool = 4
+		};
+		struct EnbParameter
+		{
+			unsigned char data[16];
+			unsigned long size;
+			long type;
+		};
+		using EnbGetParameterA = bool (*)(const char*, const char*, const char*, EnbParameter*);
+
+		HMODULE FindEnbModule()
+		{
+			static HMODULE cached = nullptr;
+			static bool scanned = false;
+			if (scanned) {
+				return cached;
+			}
+			scanned = true;
+			std::array<HMODULE, 1024> modules{};
+			DWORD needed = 0;
+			if (!EnumProcessModules(
+					GetCurrentProcess(),
+					modules.data(),
+					static_cast<DWORD>(modules.size() * sizeof(HMODULE)),
+					&needed)) {
+				return nullptr;
+			}
+			const auto count = std::min<std::size_t>(modules.size(), needed / sizeof(HMODULE));
+			for (std::size_t i = 0; i < count; ++i) {
+				if (modules[i] && GetProcAddress(modules[i], "ENBGetSDKVersion")) {
+					cached = modules[i];
+					break;
+				}
+			}
+			return cached;
+		}
+
+		// True while ENB's master effect is on. Re-queried every 64 calls; the
+		// ENB API reads its in-memory config, so this is cheap but not free.
+		bool EnbNativeFramePathActive()
+		{
+			static bool cachedValue = false;
+			static unsigned callsSinceQuery = 64;
+			if (++callsSinceQuery < 64) {
+				return cachedValue;
+			}
+			callsSinceQuery = 0;
+			const auto enbModule = FindEnbModule();
+			if (!enbModule) {
+				cachedValue = false;
+				return cachedValue;
+			}
+			static EnbGetParameterA getParameter = nullptr;
+			if (!getParameter) {
+				getParameter = reinterpret_cast<EnbGetParameterA>(
+					GetProcAddress(enbModule, "ENBGetParameter"));
+			}
+			if (!getParameter) {
+				cachedValue = false;
+				return cachedValue;
+			}
+			EnbParameter param{};
+			const bool found =
+				getParameter("enbseries.ini", "GLOBAL", "UseEffect", &param) ||
+				getParameter(nullptr, "GLOBAL", "UseEffect", &param);
+			cachedValue = found && param.type == kEnbParamBool && param.size >= sizeof(BOOL) &&
+			              *reinterpret_cast<const BOOL*>(param.data) != FALSE;
+			return cachedValue;
+		}
+		// Destination render-target index of the last top-level imagespace
+		// effect this frame. Under a DRS-driven upscaler the late effect range
+		// ends in a full-size scratch target (observed: GammaCorrectResize
+		// 1 -> 3), the upscaler consumes that target and then clears it, and the
+		// engine's own upsample copy into the back buffer never runs. The clear
+		// of exactly this target is the pre-upsample scene anchor.
+		std::atomic<int> g_lastImageSpaceDest{ -1 };
+
+		int ImageSpaceEffectIndex(void* a_manager, void* a_effect)
+		{
+			auto* manager = static_cast<RE::ImageSpaceManager*>(a_manager);
+			if (!manager || !a_effect) {
+				return -1;
+			}
+			const auto* data = manager->effectList.data();
+			if (!data) {
+				return -1;
+			}
+			const auto count = std::min<std::uint32_t>(
+				static_cast<std::uint32_t>(manager->effectList.size()), 0x48U);
+			for (std::uint32_t i = 0; i < count; ++i) {
+				if (data[i] == a_effect) {
+					return static_cast<int>(i);
+				}
+			}
+			return -1;
+		}
+
+		void CapturePreUpsampleTextureNow(
+			ID3D11DeviceContext* context,
+			ID3D11Texture2D* frameBuffer,
+			const char* anchor)
+		{
+			if (!D3DInstance || !context || !frameBuffer) {
+				return;
+			}
+			g_preUpsampleAnchor = anchor;
+			static REL::Relocation<RE::BSGraphics::RenderTargetManager*> targetManager{
+				RE::ID::BSGraphics::RenderTargetManager::Singleton
+			};
+			float widthRatio = 1.0F;
+			float heightRatio = 1.0F;
+			if (auto* manager = targetManager.get()) {
+				widthRatio = manager->dynamicWidthRatio;
+				heightRatio = manager->dynamicHeightRatio;
+			}
+			if (!(widthRatio > 0.0F && widthRatio <= 1.0F)) {
+				widthRatio = 1.0F;
+			}
+			if (!(heightRatio > 0.0F && heightRatio <= 1.0F)) {
+				heightRatio = 1.0F;
+			}
+			const float liveWidthRatio = widthRatio;
+			const float liveHeightRatio = heightRatio;
+			// See EnbNativeFramePathActive: with ENB's effect on, the captured
+			// target is a native full-frame image, not a DRS subrect.
+			if (EnbNativeFramePathActive()) {
+				widthRatio = 1.0F;
+				heightRatio = 1.0F;
+				g_preUpsampleAnchor = "ClearRenderTargetView issued by Upscaling.dll (ENB native full-frame, no subrect stretch)";
+			}
+			D3DInstance->CapturePreUpsampleFrame(
+				context,
+				frameBuffer,
+				widthRatio,
+				heightRatio);
+			if (g_stencilHistogramAnchorArmed.exchange(false, std::memory_order_acq_rel)) {
+				D3DInstance->LogStencilHistogram(context, "at pre-upsample anchor");
+			}
+			// Fallback only: the resolve normally happened at the first
+			// imagespace effect (see HookedImageSpaceRenderEffect).
+			D3DInstance->ResolveHeatMaskFromStencil(context, liveWidthRatio, liveHeightRatio);
+		}
+
+		void CapturePreUpsampleFrameBufferNow()
+		{
+			auto* rendererData = RE::BSGraphics::GetRendererData();
+			if (!rendererData || !rendererData->context) {
+				return;
+			}
+			CapturePreUpsampleTextureNow(
+				reinterpret_cast<ID3D11DeviceContext*>(rendererData->context),
+				reinterpret_cast<ID3D11Texture2D*>(rendererData->renderTargets[0].texture),
+				"ImageSpaceManager::RenderEffect");
+		}
+
+		void HookedImageSpaceRenderEffect(
+			void* a_this, void* a_effect, int a_targetA, int a_targetB, void* a_params)
+		{
+			if (!upscalerMod) {
+				g_origImageSpaceRenderEffect(a_this, a_effect, a_targetA, a_targetB, a_params);
+				return;
+			}
+			const int index = ImageSpaceEffectIndex(a_this, a_effect);
+			// Heat mask: the stencil still holds this frame's actor marks at
+			// the start of the imagespace stage; later passes rewrite it.
+			if (index >= 0 && D3DInstance) {
+				if (auto* rendererData = RE::BSGraphics::GetRendererData(); rendererData && rendererData->context) {
+					D3DInstance->EarlyHeatStencilResolve(
+						reinterpret_cast<ID3D11DeviceContext*>(rendererData->context),
+						g_stencilHistogramArmed);
+				}
+			}
+			{
+				// First sighting of each index, once per session: this is how we
+				// learn which effects the engine still routes through
+				// RenderEffect under a given upscaler.
+				static std::atomic<std::uint32_t> seenMask{ 0 };
+				static std::atomic<bool> unindexedLogged{ false };
+				if (index >= 0 && index < 32) {
+					g_lastImageSpaceDest.store(a_targetB, std::memory_order_relaxed);
+					const auto bit = 1U << static_cast<unsigned>(index);
+					if ((seenMask.fetch_or(bit, std::memory_order_relaxed) & bit) == 0) {
+						logger::info(
+							"[upscaler] RenderEffect observed effect {} (targets {} -> {})",
+							index,
+							a_targetA,
+							a_targetB);
+					}
+				} else if (!unindexedLogged.exchange(true)) {
+					logger::info(
+						"[upscaler] RenderEffect observed an effect not in the manager list "
+						"(targets {} -> {})",
+						a_targetA,
+						a_targetB);
+				}
+			}
+			constexpr int kUpsampleDynamicResolution = 21;
+			if (index == kUpsampleDynamicResolution) {
+				g_upsampleEffectSeen = true;
+				CapturePreUpsampleFrameBufferNow();
+				g_origImageSpaceRenderEffect(a_this, a_effect, a_targetA, a_targetB, a_params);
+				return;
+			}
+			g_origImageSpaceRenderEffect(a_this, a_effect, a_targetA, a_targetB, a_params);
+			// Gamma-correct family (14 GammaCorrect, 15 LUT, 16 Resize): the
+			// last LDR writers before the upsample. Fallback only.
+			if (!g_upsampleEffectSeen && index >= 14 && index <= 16) {
+				CapturePreUpsampleFrameBufferNow();
+			}
+		}
+	}
+
+	template <std::size_t Slot>
+	void __stdcall D3D::ClearRenderTargetViewSlotHook(
+		ID3D11DeviceContext* pContext,
+		ID3D11RenderTargetView* pRenderTargetView,
+		const FLOAT ColorRGBA[4])
+	{
+		static_assert(Slot < kDrawHookSlots);
+		ClearRenderTargetViewDispatch(
+			pContext,
+			pRenderTargetView,
+			ColorRGBA,
+			oldFuncs.clearRenderTargetViewSlots[Slot]);
+	}
+
+	void* const* D3D::ClearRenderTargetViewDetourSlots()
+	{
+		static void* const detours[]{
+			reinterpret_cast<void*>(&D3D::ClearRenderTargetViewSlotHook<0>),
+			reinterpret_cast<void*>(&D3D::ClearRenderTargetViewSlotHook<1>),
+			reinterpret_cast<void*>(&D3D::ClearRenderTargetViewSlotHook<2>),
+			reinterpret_cast<void*>(&D3D::ClearRenderTargetViewSlotHook<3>),
+			reinterpret_cast<void*>(&D3D::ClearRenderTargetViewSlotHook<4>),
+			reinterpret_cast<void*>(&D3D::ClearRenderTargetViewSlotHook<5>),
+		};
+		static_assert(std::size(detours) == kDrawHookSlots);
+		return detours;
+	}
+
+	void** D3D::ClearRenderTargetViewOriginalSlots()
+	{
+		return reinterpret_cast<void**>(oldFuncs.clearRenderTargetViewSlots.data());
+	}
+
+	// The upscaler upscales the finished LDR frame buffer into its own D3D12
+	// chain and then clears that same render target so the UI draws over black
+	// for the present composite. Copying the target right before any clear
+	// that hits it therefore yields the pre-upsample scene; the game's own
+	// frame-start clear of the same target also matches, but the later
+	// (upscaler) clear overwrites that capture within the frame, so the copy
+	// Present sees is the scene. Everything else (shadow maps, G-buffer,
+	// MagnaScope's own targets) is filtered out by identity.
+	// The upscaler upscales the finished LDR frame buffer into its own D3D12
+	// chain and then clears that same render target so the UI draws over black
+	// for the present composite. That clear is the only ClearRenderTargetView
+	// the upscaler issues, and it is issued from inside Upscaling.dll, so the
+	// call's origin identifies it without guessing render-target indices or
+	// effect order: any clear of an engine render target whose call stack
+	// passes through the upscaler image is the pre-upsample scene anchor.
+	// Copying the target right before that clear yields the scene at render
+	// size (DRS subrect) exactly as the upscaler consumed it.
+	void D3D::ClearRenderTargetViewDispatch(
+		ID3D11DeviceContext* pContext,
+		ID3D11RenderTargetView* pRenderTargetView,
+		const FLOAT ColorRGBA[4],
+		D3D11ClearRenderTargetViewHook original)
+	{
+		if (!original) {
+			return;
+		}
+		if (upscalerMod && D3DInstance && pContext && pRenderTargetView &&
+			g_upscalerImageEnd > g_upscalerImageBegin) {
+			// Cheap pre-filter: only engine render targets can be the scene.
+			int clearedIndex = -1;
+			if (auto* rendererData = RE::BSGraphics::GetRendererData()) {
+				for (int i = 0; i < static_cast<int>(std::size(rendererData->renderTargets)); ++i) {
+					if (rendererData->renderTargets[i].rtView &&
+						reinterpret_cast<ID3D11RenderTargetView*>(rendererData->renderTargets[i].rtView) ==
+							pRenderTargetView) {
+						clearedIndex = i;
+						break;
+					}
+				}
+			}
+			if (clearedIndex >= 0) {
+				// Only the immediate logical caller counts. The upscaler's
+				// call-site thunks wrap whole engine stages, so "Upscaling.dll
+				// anywhere on the stack" also matched the engine's own clears
+				// inside those stages (render target 18 was captured that way and
+				// overwrote the real scene). Skip our own frames, d3d11, wrapper
+				// contexts and hook trampolines (no owning module); the first
+				// remaining frame decides.
+				void* frames[16]{};
+				const auto captured = RtlCaptureStackBackTrace(0, 16, frames, nullptr);
+				bool fromUpscaler = false;
+				for (USHORT i = 0; i < captured; ++i) {
+					void* base = nullptr;
+					RtlPcToFileHeader(frames[i], &base);
+					if (!base) {
+						continue;
+					}
+					bool passthrough = false;
+					for (void* skip : g_clearAttributionPassthrough) {
+						if (skip && skip == base) {
+							passthrough = true;
+							break;
+						}
+					}
+					if (passthrough) {
+						continue;
+					}
+					fromUpscaler = base == static_cast<void*>(upscalerMod);
+					break;
+				}
+				if (fromUpscaler) {
+					// The back-buffer record may carry no texture pointer (the
+					// engine owns it through the swap chain), so take the texture
+					// from the view itself.
+					ComPtr<ID3D11Resource> resource;
+					pRenderTargetView->GetResource(resource.GetAddressOf());
+					ComPtr<ID3D11Texture2D> texture;
+					if (resource.Get()) {
+						resource.As(&texture);
+					}
+					static std::atomic<std::uint32_t> loggedIndices{ 0 };
+					const auto bit = clearedIndex < 32 ? (1U << static_cast<unsigned>(clearedIndex)) : 0U;
+					if (bit && (loggedIndices.fetch_or(bit, std::memory_order_relaxed) & bit) == 0) {
+						logger::info(
+							"[upscaler] clear anchor: Upscaling.dll clears engine render target {} "
+							"(texture {}); capturing it as the pre-upsample scene",
+							clearedIndex,
+							texture.Get() ? "resolved from the view" : "MISSING");
+					}
+					if (texture.Get()) {
+						CapturePreUpsampleTextureNow(
+							pContext,
+							texture.Get(),
+							"ClearRenderTargetView issued by Upscaling.dll");
+					}
+				}
+			}
+		}
+		original(pContext, pRenderTargetView, ColorRGBA);
+	}
+
+	namespace
+	{
+		// Logical-caller test shared by the clear and copy dispatches: walk
+		// the stack, skip our own frames, d3d11, wrapper contexts and
+		// trampolines; the first remaining frame must be the upscaler image.
+		bool LogicalCallerIsUpscaler()
+		{
+			void* frames[16]{};
+			const auto captured = RtlCaptureStackBackTrace(0, 16, frames, nullptr);
+			for (USHORT i = 0; i < captured; ++i) {
+				void* base = nullptr;
+				RtlPcToFileHeader(frames[i], &base);
+				if (!base) {
+					continue;
+				}
+				bool passthrough = false;
+				for (void* skip : g_clearAttributionPassthrough) {
+					if (skip && skip == base) {
+						passthrough = true;
+						break;
+					}
+				}
+				if (passthrough) {
+					continue;
+				}
+				return base == static_cast<void*>(upscalerMod);
+			}
+			return false;
+		}
+
+		// Reads back a 16x16 block around (cx, cy) of a texture and logs the
+		// mean RGBA. Diagnostic only; the Map stalls the GPU for this frame.
+		void LogRegionMean(
+			ID3D11DeviceContext* context,
+			ID3D11Texture2D* texture,
+			int cx,
+			int cy,
+			const char* label)
+		{
+			if (!context || !texture) {
+				return;
+			}
+			D3D11_TEXTURE2D_DESC desc{};
+			texture->GetDesc(&desc);
+			if (desc.Width < 16 || desc.Height < 16) {
+				return;
+			}
+			ComPtr<ID3D11Device> device;
+			context->GetDevice(device.GetAddressOf());
+			if (!device.Get()) {
+				return;
+			}
+			D3D11_TEXTURE2D_DESC stagingDesc = desc;
+			stagingDesc.Width = 16;
+			stagingDesc.Height = 16;
+			stagingDesc.MipLevels = 1;
+			stagingDesc.ArraySize = 1;
+			stagingDesc.Usage = D3D11_USAGE_STAGING;
+			stagingDesc.BindFlags = 0;
+			stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			stagingDesc.MiscFlags = 0;
+			ComPtr<ID3D11Texture2D> staging;
+			if (FAILED(device->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf()))) {
+				return;
+			}
+			const int x0 = std::clamp(cx - 8, 0, static_cast<int>(desc.Width) - 16);
+			const int y0 = std::clamp(cy - 8, 0, static_cast<int>(desc.Height) - 16);
+			const D3D11_BOX box{
+				static_cast<UINT>(x0), static_cast<UINT>(y0), 0U,
+				static_cast<UINT>(x0 + 16), static_cast<UINT>(y0 + 16), 1U
+			};
+			context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, texture, 0, &box);
+			D3D11_MAPPED_SUBRESOURCE mapped{};
+			if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+				return;
+			}
+			std::uint64_t sums[4]{};
+			const auto* base = static_cast<const std::uint8_t*>(mapped.pData);
+			for (int y = 0; y < 16; ++y) {
+				const auto* row = base + y * mapped.RowPitch;
+				for (int x = 0; x < 16; ++x) {
+					for (int ch = 0; ch < 4; ++ch) {
+						sums[ch] += row[x * 4 + ch];
+					}
+				}
+			}
+			context->Unmap(staging.Get(), 0);
+			logger::info(
+				"Scope {} at ({}, {}): mean rgba {} {} {} a{} (format {})",
+				label,
+				cx,
+				cy,
+				sums[0] / 256,
+				sums[1] / 256,
+				sums[2] / 256,
+				sums[3] / 256,
+				static_cast<int>(desc.Format));
+		}
+	}
+
+	template <std::size_t Slot>
+	void __stdcall D3D::CopyResourceSlotHook(
+		ID3D11DeviceContext* pContext,
+		ID3D11Resource* pDstResource,
+		ID3D11Resource* pSrcResource)
+	{
+		static_assert(Slot < kDrawHookSlots);
+		CopyResourceDispatch(pContext, pDstResource, pSrcResource, oldFuncs.copyResourceSlots[Slot]);
+	}
+
+	void* const* D3D::CopyResourceDetourSlots()
+	{
+		static void* const detours[]{
+			reinterpret_cast<void*>(&D3D::CopyResourceSlotHook<0>),
+			reinterpret_cast<void*>(&D3D::CopyResourceSlotHook<1>),
+			reinterpret_cast<void*>(&D3D::CopyResourceSlotHook<2>),
+			reinterpret_cast<void*>(&D3D::CopyResourceSlotHook<3>),
+			reinterpret_cast<void*>(&D3D::CopyResourceSlotHook<4>),
+			reinterpret_cast<void*>(&D3D::CopyResourceSlotHook<5>),
+		};
+		static_assert(std::size(detours) == kDrawHookSlots);
+		return detours;
+	}
+
+	void** D3D::CopyResourceOriginalSlots()
+	{
+		return reinterpret_cast<void**>(oldFuncs.copyResourceSlots.data());
+	}
+
+	void D3D::CopyResourceDispatch(
+		ID3D11DeviceContext* pContext,
+		ID3D11Resource* pDstResource,
+		ID3D11Resource* pSrcResource,
+		D3D11CopyResourceHook original)
+	{
+		if (!original) {
+			return;
+		}
+		// Zero cost unless a diag frame armed the probe.
+		if (g_finalLayerProbeArmed.load(std::memory_order_acquire) &&
+			upscalerMod && D3DInstance && pContext && pSrcResource) {
+			ComPtr<ID3D11Texture2D> source;
+			pSrcResource->QueryInterface(IID_PPV_ARGS(source.GetAddressOf()));
+			bool isBackBuffer = source.Get() && source.Get() == D3DInstance->mBackBuffer.Get();
+			if (!isBackBuffer && source.Get()) {
+				if (auto* rendererData = RE::BSGraphics::GetRendererData()) {
+					isBackBuffer = source.Get() ==
+					               reinterpret_cast<ID3D11Texture2D*>(rendererData->renderTargets[0].texture);
+				}
+			}
+			if (isBackBuffer && LogicalCallerIsUpscaler()) {
+				g_finalLayerProbeArmed.store(false, std::memory_order_release);
+				logger::info(
+					"[upscaler] final-layer sample (ratio {:.3f}x{:.3f}, scoped {}):",
+					D3DInstance->mPreUpsampleRatio[0],
+					D3DInstance->mPreUpsampleRatio[1],
+					static_cast<bool>(D3D::isEnableRender));
+				LogRegionMean(
+					pContext,
+					source.Get(),
+					g_finalLayerProbeX,
+					g_finalLayerProbeY,
+					g_finalLayerProbeLabel);
+				LogRegionMean(
+					pContext,
+					source.Get(),
+					static_cast<int>(windowWidth * 0.15F),
+					static_cast<int>(windowHeight * 0.15F),
+					"final UI layer OFF-LENS (15%,15%) as copied by the upscaler");
+			}
+		}
+		original(pContext, pDstResource, pSrcResource);
+	}
+
+	void InstallPreUpsampleCaptureHook()
+	{
+		static bool attempted = false;
+		if (attempted) {
+			return;
+		}
+		attempted = true;
+		if (!REX::FModule::IsRuntimeOG()) {
+			return;
+		}
+		if (!upscalerMod) {
+			logger::info(
+				"[upscaler] no upscaler/frame-generation module detected; the "
+				"pre-upsample scene capture stays uninstalled");
+			return;
+		}
+		// Primary anchor: the frame-buffer clear (see ClearRenderTargetViewDispatch).
+		// Present re-checks the binding every frame like the draw hooks.
+		{
+			const auto* base = reinterpret_cast<const std::uint8_t*>(upscalerMod);
+			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+			if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+				const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+				if (nt->Signature == IMAGE_NT_SIGNATURE) {
+					g_upscalerImageBegin = reinterpret_cast<std::uintptr_t>(base);
+					g_upscalerImageEnd = g_upscalerImageBegin + nt->OptionalHeader.SizeOfImage;
+				}
+			}
+			HMODULE self = nullptr;
+			GetModuleHandleExW(
+				GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				reinterpret_cast<LPCWSTR>(&InstallPreUpsampleCaptureHook),
+				&self);
+			g_clearAttributionPassthrough = {
+				static_cast<void*>(self),
+				static_cast<void*>(GetModuleHandleW(L"d3d11.dll")),
+				static_cast<void*>(GetModuleHandleW(L"ShaderEngineCL.dll")),
+				nullptr
+			};
+			logger::info(
+				"[upscaler] module image range {:#x}-{:#x} used to attribute render-target clears "
+				"(logical-caller rule; pass-through: self {:p}, d3d11 {:p}, ShaderEngineCL {:p})",
+				g_upscalerImageBegin,
+				g_upscalerImageEnd,
+				g_clearAttributionPassthrough[0],
+				g_clearAttributionPassthrough[1],
+				g_clearAttributionPassthrough[2]);
+		}
+		if (g_deviceContextVTable) {
+			BindDrawHookTarget(
+				g_deviceContextVTable,
+				50U,
+				D3D::ClearRenderTargetViewDetourSlots(),
+				D3D::ClearRenderTargetViewOriginalSlots(),
+				g_clearRenderTargetViewBinding,
+				"ClearRenderTargetViewHook");
+			BindDrawHookTarget(
+				g_deviceContextVTable,
+				47U,
+				D3D::CopyResourceDetourSlots(),
+				D3D::CopyResourceOriginalSlots(),
+				g_copyResourceBinding,
+				"CopyResourceHook");
+		}
+		// Secondary anchor + diagnostic: the engine's own upsample effect.
+		const REL::Relocation<std::uintptr_t> renderEffect{ REL::ID(325252) };
+		void* target = reinterpret_cast<void*>(renderEffect.address());
+		if (MH_CreateHook(
+				target,
+				reinterpret_cast<void*>(&HookedImageSpaceRenderEffect),
+				reinterpret_cast<void**>(&g_origImageSpaceRenderEffect)) != MH_OK ||
+			MH_EnableHook(target) != MH_OK) {
+			logger::error(
+				"[upscaler] failed to hook ImageSpaceManager::RenderEffect at {:p}; "
+				"the scope keeps the Present-time back-buffer source",
+				target);
+			return;
+		}
+		logger::info(
+			"[upscaler] ImageSpaceManager::RenderEffect hooked at {:p} for the "
+			"pre-upsample scene capture (upscaler module detected)",
+			target);
+	}
+
+	void D3D::CapturePreUpsampleFrame(
+		ID3D11DeviceContext* context,
+		ID3D11Texture2D* frameBuffer,
+		float widthRatio,
+		float heightRatio)
+	{
+		if (!context || !frameBuffer || !g_Device.Get()) {
+			static std::once_flag logged;
+			std::call_once(logged, [] {
+				logger::warn("[upscaler] pre-upsample capture skipped: no context/texture/device");
+			});
+			return;
+		}
+		D3D11_TEXTURE2D_DESC sourceDesc{};
+		frameBuffer->GetDesc(&sourceDesc);
+		if (sourceDesc.SampleDesc.Count != 1 || sourceDesc.ArraySize != 1) {
+			static std::once_flag logged;
+			std::call_once(logged, [&] {
+				logger::warn(
+					"[upscaler] pre-upsample capture skipped: unsupported source (samples {}, array {})",
+					sourceDesc.SampleDesc.Count,
+					sourceDesc.ArraySize);
+			});
+			return;
+		}
+
+		bool recreate = !mPreUpsampleTexture.Get() || !mPreUpsampleSRV.Get();
+		if (!recreate) {
+			D3D11_TEXTURE2D_DESC have{};
+			mPreUpsampleTexture->GetDesc(&have);
+			recreate = have.Width != sourceDesc.Width ||
+			           have.Height != sourceDesc.Height ||
+			           have.Format != sourceDesc.Format;
+		}
+		if (recreate) {
+			mPreUpsampleSRV.Reset();
+			mPreUpsampleTexture.Reset();
+			D3D11_TEXTURE2D_DESC copyDesc = sourceDesc;
+			copyDesc.MipLevels = 1;
+			copyDesc.Usage = D3D11_USAGE_DEFAULT;
+			copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			copyDesc.CPUAccessFlags = 0;
+			copyDesc.MiscFlags = 0;
+			if (const auto hr = g_Device->CreateTexture2D(
+					&copyDesc, nullptr, mPreUpsampleTexture.GetAddressOf());
+				FAILED(hr)) {
+				static std::once_flag logged;
+				std::call_once(logged, [&] {
+					logger::warn(
+						"[upscaler] pre-upsample capture texture creation failed ({:#x}): "
+						"{}x{} format {}",
+						static_cast<unsigned>(hr),
+						copyDesc.Width,
+						copyDesc.Height,
+						static_cast<int>(copyDesc.Format));
+				});
+				return;
+			}
+			// A typeless frame buffer needs an explicit view format; the
+			// 8-bit UNORM family is what Fallout uses here.
+			D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc{};
+			const D3D11_SHADER_RESOURCE_VIEW_DESC* viewDescPtr = nullptr;
+			if (sourceDesc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+				sourceDesc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS) {
+				viewDesc.Format = sourceDesc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ?
+				                      DXGI_FORMAT_R8G8B8A8_UNORM :
+				                      DXGI_FORMAT_B8G8R8A8_UNORM;
+				viewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+				viewDesc.Texture2D.MipLevels = 1;
+				viewDescPtr = &viewDesc;
+			}
+			if (const auto hr = g_Device->CreateShaderResourceView(
+					mPreUpsampleTexture.Get(), viewDescPtr, mPreUpsampleSRV.GetAddressOf());
+				FAILED(hr)) {
+				static std::once_flag logged;
+				std::call_once(logged, [&] {
+					logger::warn(
+						"[upscaler] pre-upsample capture view creation failed ({:#x}): format {}",
+						static_cast<unsigned>(hr),
+						static_cast<int>(sourceDesc.Format));
+				});
+				mPreUpsampleTexture.Reset();
+				return;
+			}
+			logger::info(
+				"[upscaler] pre-upsample scene capture created: {}x{}, format {}",
+				sourceDesc.Width,
+				sourceDesc.Height,
+				static_cast<int>(sourceDesc.Format));
+		}
+
+		context->CopyResource(mPreUpsampleTexture.Get(), frameBuffer);
+		if (std::fabs(mPreUpsampleRatio[0] - widthRatio) > 0.01F ||
+			std::fabs(mPreUpsampleRatio[1] - heightRatio) > 0.01F) {
+			static unsigned ratioLogs = 0;
+			if (ratioLogs < 40) {
+				++ratioLogs;
+				logger::info(
+					"[upscaler] DRS ratio now {:.3f}x{:.3f} (was {:.3f}x{:.3f})",
+					widthRatio,
+					heightRatio,
+					mPreUpsampleRatio[0],
+					mPreUpsampleRatio[1]);
+				// Content check for the assumption behind the ratio: a subrect
+				// capture is empty at the far corner, a native one is not.
+				LogRegionMean(context, mPreUpsampleTexture.Get(),
+					static_cast<int>(sourceDesc.Width / 2), static_cast<int>(sourceDesc.Height / 2),
+					"pre-upsample capture CENTRE");
+				LogRegionMean(context, mPreUpsampleTexture.Get(),
+					static_cast<int>(sourceDesc.Width * 0.95F), static_cast<int>(sourceDesc.Height * 0.95F),
+					"pre-upsample capture FAR CORNER (95%,95%)");
+			}
+		}
+		mPreUpsampleRatio[0] = widthRatio;
+		mPreUpsampleRatio[1] = heightRatio;
+		mPreUpsampleCaptured = true;
+		if (g_captureProbeArmed.exchange(false, std::memory_order_acq_rel)) {
+			// The scene as the upscaler receives it, off-lens. Non-scene
+			// content here means an in-scene pass of ours has painted it.
+			LogRegionMean(
+				context,
+				mPreUpsampleTexture.Get(),
+				static_cast<int>(sourceDesc.Width * 0.15F * widthRatio),
+				static_cast<int>(sourceDesc.Height * 0.15F * heightRatio),
+				"pre-upsample capture OFF-LENS (15%,15% of the subrect)");
+		}
+
+		static std::once_flag loggedEngaged;
+		std::call_once(loggedEngaged, [&] {
+			logger::info(
+				"[upscaler] pre-upsample scene source engaged (DRS ratio "
+				"{:.3f}x{:.3f}, anchor: {}): the scope samples the frame "
+				"buffer before the upscaler consumes it instead of the "
+				"Present-time back buffer, which is UI-only under a D3D12 "
+				"present override",
+				widthRatio,
+				heightRatio,
+				g_preUpsampleAnchor);
+		});
+	}
+
+	bool D3D::PreUpsampleSourceActive() const
+	{
+		return mPreUpsampleCaptured && upscalerMod != nullptr;
+	}
+
+	void D3D::EndFramePreUpsample()
+	{
+		mPreUpsampleCaptured = false;
+		mHeatStencilResolvedThisFrame = false;
+	}
+
+	ID3D11DeviceContext* D3D::NativeContextForEnbBypass()
+	{
+		if (mNativeContextResolved) {
+			return mNativeContext.Get();
+		}
+		mNativeContextResolved = true;
+		const auto enbModule = FindEnbModule();
+		if (!enbModule || !mHeatMaskTexture.Get()) {
+			return nullptr;
+		}
+		ComPtr<ID3D11Device> device;
+		mHeatMaskTexture->GetDevice(device.GetAddressOf());
+		if (!device.Get()) {
+			return nullptr;
+		}
+		ComPtr<ID3D11DeviceContext> context;
+		device->GetImmediateContext(context.GetAddressOf());
+		if (!context.Get() || context.Get() == g_Context.Get()) {
+			return nullptr;
+		}
+		// The bypass is only meaningful if this context's code does not live
+		// in the ENB module (i.e. it really is the runtime's own object).
+		auto*** const object = reinterpret_cast<void***>(context.Get());
+		MEMORY_BASIC_INFORMATION memory{};
+		if (!object || !*object || !**object ||
+			VirtualQuery(**object, &memory, sizeof(memory)) != sizeof(memory) ||
+			memory.AllocationBase == static_cast<void*>(enbModule)) {
+			logger::info("[enb] native context bypass unavailable; heat-mask pass stays on the wrapped context");
+			return nullptr;
+		}
+		mNativeDevice = device;
+		mNativeContext = context;
+		logger::info(
+			"[enb] ENB module {:p} detected; heat-mask pass will use the native immediate context {:p} "
+			"(wrapped {:p}) so its full-window viewport is invisible to ENB",
+			static_cast<void*>(enbModule),
+			static_cast<void*>(context.Get()),
+			static_cast<void*>(g_Context.Get()));
+		return mNativeContext.Get();
+	}
+
+	ID3D11BlendState* D3D::ActiveScopeFadeReplaceBlend()
+	{
+		return (PreUpsampleSourceActive() && BSScopeFadeReplaceRGBA.Get()) ?
+		           BSScopeFadeReplaceRGBA.Get() :
+		           BSScopeFadeReplaceRGB.Get();
+	}
+
+	ID3D11BlendState* D3D::ActiveTransparentBlend()
+	{
+		return (PreUpsampleSourceActive() && BSTransparentWriteAlpha.Get()) ?
+		           BSTransparentWriteAlpha.Get() :
+		           BSTransparent.Get();
+	}
+
+	bool D3D::StretchPreUpsampleInto(
+		ID3D11DeviceContext* context,
+		ID3D11RenderTargetView* target,
+		UINT targetWidth,
+		UINT targetHeight)
+	{
+		if (!PreUpsampleSourceActive() || !context || !target ||
+			!mPreUpsampleSRV.Get() || !mFullscreenTriangleVS.Get() ||
+			!mSubrectStretchPS.Get() || !mSubrectStretchCB.Get() ||
+			targetWidth == 0 || targetHeight == 0) {
+			return false;
+		}
+
+		const float params[4] = { mPreUpsampleRatio[0], mPreUpsampleRatio[1], 0.0F, 0.0F };
+		context->UpdateSubresource(mSubrectStretchCB.Get(), 0, nullptr, params, 0, 0);
+
+		ScopedContextState saved(context);
+		ID3D11RenderTargetView* targets[1] = { target };
+		context->OMSetRenderTargets(1, targets, nullptr);
+		D3D11_VIEWPORT viewport{};
+		viewport.Width = static_cast<float>(targetWidth);
+		viewport.Height = static_cast<float>(targetHeight);
+		viewport.MaxDepth = 1.0F;
+		context->RSSetViewports(1, &viewport);
+		// Scissor off: at Present the game leaves a stale UI scissor bound.
+		context->RSSetState(mCompositeRasterizerState.Get());
+		context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFU);
+		context->OMSetDepthStencilState(nullptr, 0);
+		context->IASetInputLayout(nullptr);
+		context->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
+		context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		context->VSSetShader(mFullscreenTriangleVS.Get(), nullptr, 0);
+		context->GSSetShader(nullptr, nullptr, 0);
+		context->PSSetShader(mSubrectStretchPS.Get(), nullptr, 0);
+		ID3D11ShaderResourceView* source = mPreUpsampleSRV.Get();
+		context->PSSetShaderResources(0, 1, &source);
+		ID3D11SamplerState* sampler = mScopeFadeSampler.Get();
+		context->PSSetSamplers(0, 1, &sampler);
+		ID3D11Buffer* constants = mSubrectStretchCB.Get();
+		context->PSSetConstantBuffers(0, 1, &constants);
+		context->Draw(3, 0);
+		ID3D11ShaderResourceView* nullSource = nullptr;
+		context->PSSetShaderResources(0, 1, &nullSource);
+		return true;
+	}
+
+	// Copies the engine's main scene depth into a private texture once per
+	// frame so the mask fill can read depth without ever binding the engine's
+	// own depth view (see mHeatMaskDepthCopy). Occluders drawn after this
+	// point in the frame are not seen by later actor draws; the game draws
+	// world geometry before characters as a rule, so the loss is small.
+	void D3D::RefreshHeatMaskDepthCopy(ID3D11DeviceContext* context)
+	{
+		auto* rendererData = RE::BSGraphics::GetRendererData();
+		if (!context || !rendererData || !g_Device.Get()) {
+			return;
+		}
+		auto* depthTexture = reinterpret_cast<ID3D11Texture2D*>(
+			rendererData->depthStencilTargets[2].texture);
+		auto* depthSRV = reinterpret_cast<ID3D11ShaderResourceView*>(
+			rendererData->depthStencilTargets[2].srViewDepth);
+		if (!depthTexture || !depthSRV) {
+			return;
+		}
+		D3D11_TEXTURE2D_DESC sourceDesc{};
+		depthTexture->GetDesc(&sourceDesc);
+		bool recreate = !mHeatMaskDepthCopy.Get() || !mHeatMaskDepthCopySRV.Get();
+		if (!recreate) {
+			D3D11_TEXTURE2D_DESC have{};
+			mHeatMaskDepthCopy->GetDesc(&have);
+			recreate = have.Width != sourceDesc.Width || have.Height != sourceDesc.Height ||
+			           have.Format != sourceDesc.Format || have.SampleDesc.Count != sourceDesc.SampleDesc.Count;
+		}
+		if (recreate) {
+			mHeatMaskDepthCopySRV.Reset();
+			mHeatMaskDepthCopy.Reset();
+			D3D11_TEXTURE2D_DESC copyDesc = sourceDesc;
+			copyDesc.MipLevels = 1;
+			copyDesc.ArraySize = 1;
+			copyDesc.Usage = D3D11_USAGE_DEFAULT;
+			copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			copyDesc.CPUAccessFlags = 0;
+			copyDesc.MiscFlags = 0;
+			if (FAILED(g_Device->CreateTexture2D(&copyDesc, nullptr, mHeatMaskDepthCopy.GetAddressOf()))) {
+				static std::once_flag logged;
+				std::call_once(logged, [&] {
+					logger::warn("[heat] depth copy texture creation failed (format {}); mask occlusion disabled",
+						static_cast<int>(copyDesc.Format));
+				});
+				return;
+			}
+			// Same view format the engine uses for its own depth read.
+			D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc{};
+			depthSRV->GetDesc(&viewDesc);
+			viewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			viewDesc.Texture2D.MostDetailedMip = 0;
+			viewDesc.Texture2D.MipLevels = 1;
+			if (FAILED(g_Device->CreateShaderResourceView(
+					mHeatMaskDepthCopy.Get(), &viewDesc, mHeatMaskDepthCopySRV.GetAddressOf()))) {
+				mHeatMaskDepthCopy.Reset();
+				static std::once_flag logged;
+				std::call_once(logged, [&] {
+					logger::warn("[heat] depth copy view creation failed (view format {}); mask occlusion disabled",
+						static_cast<int>(viewDesc.Format));
+				});
+				return;
+			}
+			logger::info(
+				"[heat] private depth copy created {}x{} (resource format {}, view format {}) for mask occlusion",
+				copyDesc.Width, copyDesc.Height, static_cast<int>(copyDesc.Format), static_cast<int>(viewDesc.Format));
+		}
+		context->CopyResource(mHeatMaskDepthCopy.Get(), depthTexture);
+	}
+
+	ID3D11DepthStencilState* D3D::HeatStencilStateFor(
+		ID3D11DepthStencilState* gameState, UINT& ref)
+	{
+		auto it = mHeatStencilStates.find(gameState);
+		if (it == mHeatStencilStates.end()) {
+			D3D11_DEPTH_STENCIL_DESC desc{};
+			if (gameState) {
+				gameState->GetDesc(&desc);
+			} else {
+				// D3D11 default state.
+				desc.DepthEnable = TRUE;
+				desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+				desc.DepthFunc = D3D11_COMPARISON_LESS;
+				desc.StencilEnable = FALSE;
+				desc.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+				desc.StencilWriteMask = D3D11_DEFAULT_STENCIL_WRITE_MASK;
+				const D3D11_DEPTH_STENCILOP_DESC op{
+					D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP,
+					D3D11_STENCIL_OP_KEEP, D3D11_COMPARISON_ALWAYS
+				};
+				desc.FrontFace = op;
+				desc.BackFace = op;
+			}
+			static unsigned described = 0;
+			if (described < 12) {
+				++described;
+				logger::info(
+					"[heat] actor depth-stencil state {:p} (game ref {:#x}, mark bit {:#x}): depth {} func {} write {}; stencil {} "
+					"read {:#x} write {:#x} front(pass {} fail {} zfail {} func {}) back(pass {} "
+					"fail {} zfail {} func {})",
+					static_cast<void*>(gameState),
+					ref,
+					mHeatStencilBit,
+					desc.DepthEnable != 0, static_cast<int>(desc.DepthFunc),
+					static_cast<int>(desc.DepthWriteMask), desc.StencilEnable != 0,
+					desc.StencilReadMask, desc.StencilWriteMask,
+					static_cast<int>(desc.FrontFace.StencilPassOp),
+					static_cast<int>(desc.FrontFace.StencilFailOp),
+					static_cast<int>(desc.FrontFace.StencilDepthFailOp),
+					static_cast<int>(desc.FrontFace.StencilFunc),
+					static_cast<int>(desc.BackFace.StencilPassOp),
+					static_cast<int>(desc.BackFace.StencilFailOp),
+					static_cast<int>(desc.BackFace.StencilDepthFailOp),
+					static_cast<int>(desc.BackFace.StencilFunc));
+			}
+			ComPtr<ID3D11DepthStencilState> clone;
+			bool usable = true;
+			bool reuseGameState = false;
+			if (desc.StencilEnable) {
+				// The game already drives stencil on this draw. A REPLACE pass
+				// op carries our bit through the reference value: with the bit
+				// already inside the write mask (Fallout's actor states write
+				// the full byte) the game's own state object is used unchanged
+				// and only the reference gains the bit; otherwise a clone with
+				// the bit added to the write mask is needed.
+				const bool replaceFront = desc.FrontFace.StencilPassOp == D3D11_STENCIL_OP_REPLACE;
+				const bool replaceBack = desc.BackFace.StencilPassOp == D3D11_STENCIL_OP_REPLACE;
+				if (!(replaceFront && replaceBack)) {
+					usable = false;
+				} else if ((desc.StencilWriteMask & mHeatStencilBit) != 0) {
+					reuseGameState = gameState != nullptr;
+				}
+			} else {
+				desc.StencilEnable = TRUE;
+				const D3D11_DEPTH_STENCILOP_DESC mark{
+					D3D11_STENCIL_OP_KEEP,     // fail
+					D3D11_STENCIL_OP_KEEP,     // depth fail
+					D3D11_STENCIL_OP_REPLACE,  // pass
+					D3D11_COMPARISON_ALWAYS
+				};
+				desc.FrontFace = mark;
+				desc.BackFace = mark;
+				desc.StencilReadMask = 0;
+				desc.StencilWriteMask = 0;
+			}
+			if (usable && reuseGameState) {
+				clone = gameState;
+			} else if (usable) {
+				desc.StencilWriteMask |= static_cast<UINT8>(mHeatStencilBit);
+				if (FAILED(g_Device->CreateDepthStencilState(&desc, clone.GetAddressOf()))) {
+					clone.Reset();
+					usable = false;
+				}
+			}
+			if (!usable) {
+				static std::once_flag logged;
+				std::call_once(logged, [&] {
+					logger::warn(
+						"[heat] some actor draws use a stencil configuration the mask cannot "
+						"piggyback on (state {:p}); those draws are not marked",
+						static_cast<void*>(gameState));
+				});
+			}
+			ComPtr<ID3D11DepthStencilState> keepAlive;
+			if (gameState) {
+				keepAlive = gameState;
+			}
+			it = mHeatStencilStates.emplace(gameState, std::make_pair(keepAlive, clone)).first;
+		}
+		if (!it->second.second.Get()) {
+			return nullptr;
+		}
+		const UINT low = ref & 0x7FU;
+		if (low != mHeatStencilActorRefLow) {
+			static unsigned changes = 0;
+			if (changes < 8) {
+				++changes;
+				logger::info("[heat] actor stencil reference low bits {:#x} -> {:#x}",
+					mHeatStencilActorRefLow, low);
+			}
+			mHeatStencilActorRefLow = low;
+		}
+		ref = mHeatStencilBit | low;
+		return it->second.second.Get();
+	}
+
+	void D3D::NoteGameStencilRef(UINT ref)
+	{
+		const UINT before = mHeatStencilRefUnion;
+		mHeatStencilRefUnion |= (ref & 0xFFU);
+		if (mHeatStencilRefUnion == before) {
+			return;
+		}
+		// Informational only: Fallout writes whole stencil bytes (one pass
+		// uses 0xFF), so no single bit is free and the mask is resolved by
+		// exact value instead. Log what was seen and keep the bit fixed.
+		static unsigned unionLogs = 0;
+		if (unionLogs < 8) {
+			++unionLogs;
+			logger::info("[heat] game stencil references seen so far: {:#x}", mHeatStencilRefUnion);
+		}
+		return;
+		// Highest bit no observed game reference uses; the cache of marked
+		// states depends on the bit, so it is rebuilt when the bit moves.
+		UINT chosen = 0;
+		for (UINT bit = 0x80U; bit != 0; bit >>= 1) {
+			if ((mHeatStencilRefUnion & bit) == 0) {
+				chosen = bit;
+				break;
+			}
+		}
+		if (chosen == 0) {
+			static std::once_flag logged;
+			std::call_once(logged, [&] {
+				logger::warn(
+					"[heat] every stencil bit appears in game references ({:#x}); keeping mark bit {:#x}",
+					mHeatStencilRefUnion, mHeatStencilBit);
+			});
+			return;
+		}
+		if (chosen != mHeatStencilBit) {
+			logger::info(
+				"[heat] game stencil references seen {:#x}; actor mark bit {:#x} -> {:#x}",
+				mHeatStencilRefUnion, mHeatStencilBit, chosen);
+			mHeatStencilBit = chosen;
+			mHeatStencilStates.clear();
+		}
+	}
+
+	void D3D::ResolveHeatMaskFromStencil(
+		ID3D11DeviceContext* context, float widthRatio, float heightRatio)
+	{
+		if (!context || !mHeatMaskRTV.Get()) {
+			return;
+		}
+		const float zero[4] = { 0.0F, 0.0F, 0.0F, 0.0F };
+		if (mHeatStencilResolvedThisFrame) {
+			return;
+		}
+		if (!mHeatStencilMarkedThisFrame) {
+			context->ClearRenderTargetView(mHeatMaskRTV.Get(), zero);
+			return;
+		}
+		mHeatStencilMarkedThisFrame = false;
+		mHeatStencilResolvedThisFrame = true;
+		widthRatio = mHeatStencilMarkRatio[0];
+		heightRatio = mHeatStencilMarkRatio[1];
+		auto* rendererData = RE::BSGraphics::GetRendererData();
+		auto* stencilSRV = rendererData ?
+		                       reinterpret_cast<ID3D11ShaderResourceView*>(
+		                           rendererData->depthStencilTargets[2].srViewStencil) :
+		                       nullptr;
+		if (!stencilSRV || !mHeatStencilResolvePS.Get() || !mFullscreenTriangleVS.Get() ||
+			!mHeatStencilResolveCB.Get() || !mCompositeRasterizerState.Get()) {
+			static std::once_flag logged;
+			std::call_once(logged, [&] {
+				logger::warn(
+					"[heat] stencil resolve unavailable (stencil view {}, shader {}); mask stays empty",
+					stencilSRV != nullptr,
+					mHeatStencilResolvePS.Get() != nullptr);
+			});
+			context->ClearRenderTargetView(mHeatMaskRTV.Get(), zero);
+			return;
+		}
+		if (!(widthRatio > 0.0F && widthRatio <= 1.0F)) {
+			widthRatio = 1.0F;
+		}
+		if (!(heightRatio > 0.0F && heightRatio <= 1.0F)) {
+			heightRatio = 1.0F;
+		}
+		ScopedContextState saved(context);
+		ID3D11RenderTargetView* targets[1] = { mHeatMaskRTV.Get() };
+		context->OMSetRenderTargets(1, targets, nullptr);
+		D3D11_VIEWPORT viewport{};
+		viewport.Width = static_cast<float>(windowWidth);
+		viewport.Height = static_cast<float>(windowHeight);
+		viewport.MaxDepth = 1.0F;
+		context->RSSetViewports(1, &viewport);
+		context->RSSetState(mCompositeRasterizerState.Get());
+		context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFU);
+		context->OMSetDepthStencilState(nullptr, 0);
+		context->IASetInputLayout(nullptr);
+		context->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
+		context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		context->VSSetShader(mFullscreenTriangleVS.Get(), nullptr, 0);
+		context->GSSetShader(nullptr, nullptr, 0);
+		context->PSSetShader(mHeatStencilResolvePS.Get(), nullptr, 0);
+		struct
+		{
+			float uvScale[2];
+			UINT matchValue;
+			UINT matchMask;
+		} params{ { widthRatio, heightRatio }, mHeatStencilBit | mHeatStencilActorRefLow, 0xFFU };
+		context->UpdateSubresource(mHeatStencilResolveCB.Get(), 0, nullptr, &params, 0, 0);
+		ID3D11Buffer* constants = mHeatStencilResolveCB.Get();
+		context->PSSetConstantBuffers(0, 1, &constants);
+		context->PSSetShaderResources(0, 1, &stencilSRV);
+		context->Draw(3, 0);
+		ID3D11ShaderResourceView* nullSource = nullptr;
+		context->PSSetShaderResources(0, 1, &nullSource);
+		static std::once_flag loggedResolve;
+		std::call_once(loggedResolve, [&] {
+			logger::info(
+				"[heat] stencil-marked actor mask resolved (exact value {:#x}, ratio {:.3f}x{:.3f}); "
+				"no per-actor render-target switching remains in the scene pass",
+				mHeatStencilBit | mHeatStencilActorRefLow, widthRatio, heightRatio);
+		});
+	}
+
+	void D3D::LogStencilHistogram(ID3D11DeviceContext* context, const char* label)
+	{
+		auto* rendererData = RE::BSGraphics::GetRendererData();
+		auto* depthTexture = rendererData ?
+		                         reinterpret_cast<ID3D11Texture2D*>(rendererData->depthStencilTargets[2].texture) :
+		                         nullptr;
+		if (!context || !depthTexture || !g_Device.Get()) {
+			return;
+		}
+		D3D11_TEXTURE2D_DESC desc{};
+		depthTexture->GetDesc(&desc);
+		std::uint32_t bytesPerTexel = 0;
+		std::uint32_t stencilByte = 0;
+		switch (desc.Format) {
+		case DXGI_FORMAT_R24G8_TYPELESS:
+		case DXGI_FORMAT_D24_UNORM_S8_UINT:
+			bytesPerTexel = 4; stencilByte = 3; break;
+		case DXGI_FORMAT_R32G8X24_TYPELESS:
+		case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+			bytesPerTexel = 8; stencilByte = 4; break;
+		default:
+			logger::info("[heat] stencil histogram: unsupported depth format {}", static_cast<int>(desc.Format));
+			return;
+		}
+		D3D11_TEXTURE2D_DESC stagingDesc = desc;
+		stagingDesc.Usage = D3D11_USAGE_STAGING;
+		stagingDesc.BindFlags = 0;
+		stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		stagingDesc.MiscFlags = 0;
+		stagingDesc.MipLevels = 1;
+		stagingDesc.ArraySize = 1;
+		ComPtr<ID3D11Texture2D> staging;
+		if (FAILED(g_Device->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf()))) {
+			logger::info("[heat] stencil histogram: staging creation failed (format {})", static_cast<int>(desc.Format));
+			return;
+		}
+		context->CopyResource(staging.Get(), depthTexture);
+		D3D11_MAPPED_SUBRESOURCE mapped{};
+		if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+			logger::info("[heat] stencil histogram: map failed");
+			return;
+		}
+		// 128x128 block around the lens centre, in subrect coordinates.
+		const int cx = static_cast<int>(g_finalLayerProbeX * mHeatStencilMarkRatio[0]);
+		const int cy = static_cast<int>(g_finalLayerProbeY * mHeatStencilMarkRatio[1]);
+		const int x0 = std::clamp(cx - 64, 0, static_cast<int>(desc.Width) - 128);
+		const int y0 = std::clamp(cy - 64, 0, static_cast<int>(desc.Height) - 128);
+		std::array<std::uint32_t, 256> histogram{};
+		const auto* base = static_cast<const std::uint8_t*>(mapped.pData);
+		for (int y = 0; y < 128; ++y) {
+			const auto* row = base + static_cast<std::size_t>(y0 + y) * mapped.RowPitch;
+			for (int x = 0; x < 128; ++x) {
+				++histogram[row[static_cast<std::size_t>(x0 + x) * bytesPerTexel + stencilByte]];
+			}
+		}
+		context->Unmap(staging.Get(), 0);
+		std::string summary;
+		for (int pass = 0; pass < 6; ++pass) {
+			std::uint32_t best = 0;
+			int bestValue = -1;
+			for (int v = 0; v < 256; ++v) {
+				if (histogram[v] > best) {
+					best = histogram[v];
+					bestValue = v;
+				}
+			}
+			if (bestValue < 0 || best == 0) {
+				break;
+			}
+			summary += std::format(" {:#x}:{}", bestValue, best);
+			histogram[bestValue] = 0;
+		}
+		logger::info(
+			"[heat] stencil histogram {} around ({}, {}) fmt {}:{} (marked value {:#x})",
+			label, cx, cy, static_cast<int>(desc.Format), summary, mHeatStencilBit | mHeatStencilActorRefLow);
+	}
+
+	void D3D::EarlyHeatStencilResolve(ID3D11DeviceContext* context, std::atomic<bool>& histogramArmed)
+	{
+		if (!context || !mHeatStencilMarkedThisFrame || mHeatStencilResolvedThisFrame) {
+			return;
+		}
+		if (histogramArmed.exchange(false, std::memory_order_acq_rel)) {
+			LogStencilHistogram(context, "at first imagespace effect");
+			g_stencilHistogramAnchorArmed.store(true, std::memory_order_release);
+		}
+		ResolveHeatMaskFromStencil(context, 1.0F, 1.0F);
+	}
+
+	void D3D::UpdateHeatMaskParams(ID3D11DeviceContext* context)
+	{
+		if (!context || !mHeatMaskParamsCB.Get()) {
+			return;
+		}
+		// The mask depth sample happens mid-frame, so use the LIVE ratio, not
+		// the one recorded at the last upsample stage.
+		float widthRatio = 1.0F;
+		float heightRatio = 1.0F;
+		// With the game viewport inherited, SV_Position is already in subrect
+		// pixels and the window-sized depth texture holds the subrect at the
+		// same pixels, so no scale applies.
+		if (upscalerMod && !mHeatMaskInheritViewport) {
+			static REL::Relocation<RE::BSGraphics::RenderTargetManager*> targetManager{
+				RE::ID::BSGraphics::RenderTargetManager::Singleton
+			};
+			if (auto* manager = targetManager.get()) {
+				widthRatio = manager->dynamicWidthRatio;
+				heightRatio = manager->dynamicHeightRatio;
+			}
+			if (!(widthRatio > 0.0F && widthRatio <= 1.0F)) {
+				widthRatio = 1.0F;
+			}
+			if (!(heightRatio > 0.0F && heightRatio <= 1.0F)) {
+				heightRatio = 1.0F;
+			}
+		}
+		const float params[4] = {
+			windowWidth > 0 ? 1.0F / static_cast<float>(windowWidth) : 0.0F,
+			windowHeight > 0 ? 1.0F / static_cast<float>(windowHeight) : 0.0F,
+			widthRatio,
+			heightRatio
+		};
+		if (std::equal(std::begin(params), std::end(params), std::begin(mHeatMaskParamsLast))) {
+			return;
+		}
+		context->UpdateSubresource(mHeatMaskParamsCB.Get(), 0, nullptr, params, 0, 0);
+		std::copy(std::begin(params), std::end(params), mHeatMaskParamsLast);
+	}
 
 	bool InstallGuardedTAAHook()
 	{
@@ -10088,6 +11749,7 @@ namespace Hook
 				"no TAA callback is required");
 		}
 
+		InstallPreUpsampleCaptureHook();
 		logger::info("Install Hook");
 
 #ifdef _DEBUG
