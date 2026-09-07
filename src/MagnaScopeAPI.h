@@ -71,7 +71,7 @@ namespace MagnaScopeAPI
 
 	struct InterfaceV1
 	{
-		std::uint32_t version;  // 1
+		std::uint32_t version;  // 1, or 2 when the members marked v2 exist
 
 		// --- retarget ---------------------------------------------------
 		// Override which shape MagnaScope treats as the aperture. Pass nullptr
@@ -99,6 +99,26 @@ namespace MagnaScopeAPI
 		std::uint32_t (*SnapshotNodeTree)(
 			NodeInfoV1* out,
 			std::uint32_t maxNodes);
+
+		// --- v2: upscaler / frame-generation cooperation ------------------
+		// Only present when version >= 2. Appended after the v1 members so a
+		// v1 consumer sees an unchanged layout.
+		//
+		// True while MagnaScope will draw a lens this frame: aimed through a
+		// MagnaScope-managed scope with the effect enabled. Any thread.
+		//
+		// Intended consumer: an upscaler that presents through D3D12 with the
+		// D3D11 back buffer as a UI layer. While this is true it should take
+		// the same path it takes for the vanilla ScopeMenu (copy the finished
+		// output back into the D3D11 chain and skip its present override), so
+		// the lens magnifies the reconstructed frame rather than the
+		// render-resolution one.
+		bool (*IsOpticalEffectActive)();
+		// The upscaler reports whether it took that copy-back path. Cheap;
+		// call every frame, or on each change. While active MagnaScope uses
+		// the D3D11 back buffer as its scene source instead of its own
+		// pre-upsample capture.
+		void (*NotifyPresentCopyBack)(bool active);
 	};
 }
 
@@ -116,5 +136,9 @@ namespace MagnaScopeAPI
 	// Empty means the profile's own pin is in force.
 	[[nodiscard]] std::string GetApertureOverride();
 	[[nodiscard]] std::string GetReticleOverride();
+	// v2 backends, implemented next to the render state they read/write.
+	[[nodiscard]] bool QueryOpticalEffectActive();
+	void SetPresentCopyBack(bool active);
+	[[nodiscard]] bool PresentCopyBackActive();
 }
 #endif

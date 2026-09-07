@@ -1438,6 +1438,10 @@ namespace Hook
 		ComPtr<ID3D11ShaderResourceView> mPreUpsampleSRV;
 		bool mPreUpsampleCaptured = false;
 		float mPreUpsampleRatio[2] = { 1.0F, 1.0F };
+		// Renderer-state projection offset (NDC) at capture time: the
+		// upscaler's per-frame jitter. The stretch shifts its lookup by it so
+		// the magnified image does not wobble at zoom times the jitter.
+		float mPreUpsampleJitterNdc[2] = { 0.0F, 0.0F };
 		ComPtr<ID3D11Device> mNativeDevice;
 		ComPtr<ID3D11DeviceContext> mNativeContext;
 		bool mNativeContextResolved = false;
@@ -1473,6 +1477,12 @@ namespace Hook
 		// upscaler may already have forced the ratio to 1 (ENB path).
 		float mHeatStencilMarkRatio[2] = { 1.0F, 1.0F };
 		bool mHeatStencilResolvedThisFrame = false;
+		// The engine's real stencil view, taken at mark time while the
+		// geometry pass still holds the untouched depth record. The upscaler
+		// swaps that record for a proxy around its imagespace ranges (before
+		// the first effect on the ENB path), so re-reading the record at
+		// resolve time can hand back a buffer that never received the marks.
+		ComPtr<ID3D11ShaderResourceView> mHeatStencilSourceSRV;
 		ComPtr<ID3D11VertexShader> mFullscreenTriangleVS;
 		ComPtr<ID3D11PixelShader> mSubrectStretchPS;
 		ComPtr<ID3D11Buffer> mSubrectStretchCB;

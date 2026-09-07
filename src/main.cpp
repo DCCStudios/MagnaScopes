@@ -17,7 +17,7 @@ using namespace std;
 namespace Plugin
 {
 	static constexpr auto NAME = "MagnaScope"sv;
-	static constexpr auto VERSION = REL::Version{ 0, 12, 0 };
+	static constexpr auto VERSION = REL::Version{ 0, 12, 1 };
 }
 
 namespace

@@ -12,8 +12,8 @@ SamplerState sLinear : register(s0);
 
 cbuffer StretchParams : register(b0)
 {
-	float2 UvScale;  // dynamic width/height ratio (1,1 = no subrect)
-	float2 Pad;
+	float2 UvScale;       // dynamic width/height ratio (1,1 = no subrect)
+	float2 JitterOffset;  // un-jitter shift in full-frame uv (see hooking.cpp)
 };
 
 float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
@@ -24,6 +24,9 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 	uint height = 0;
 	tSource.GetDimensions(width, height);
 	const float2 halfTexel = 0.5f / float2(max(width, 1u), max(height, 1u));
-	const float2 scaled = min(uv * UvScale, UvScale - halfTexel);
+	// The upscaler jitters the projection each frame; a 4x magnifier turns
+	// that into a visible wobble, so the lookup is shifted back by it.
+	const float2 unjittered = saturate(uv + JitterOffset);
+	const float2 scaled = min(unjittered * UvScale, UvScale - halfTexel);
 	return float4(tSource.Sample(sLinear, scaled).rgb, 1.0f);
 }

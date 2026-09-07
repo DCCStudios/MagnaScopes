@@ -1,5 +1,8 @@
 #include "hooking.h"
 
+#define MAGNASCOPE_INTERNAL
+#include "MagnaScopeAPI.h"
+
 #include <Psapi.h>
 #pragma comment(lib, "Psapi.lib")
 #include "DDSTextureLoader11.h"
@@ -1173,6 +1176,34 @@ ID3D11Buffer* gdc_pVertexBuffer = NULL;
 ID3D11InputLayout* gdc_pVertexLayout = NULL;
 ID3D11Buffer* gdc_pIndexBuffer = NULL;
 HMODULE upscalerMod;
+// Set by the upscaler through MagnaScopeAPI v2 while it takes its ScopeMenu
+// copy-back path: the D3D11 back buffer then holds the finished frame and the
+// pre-upsample capture must not replace it.
+std::atomic<bool> g_presentCopyBack{ false };
+
+namespace MagnaScopeAPI
+{
+	bool QueryOpticalEffectActive()
+	{
+		return Hook::D3D::isEnableRender.load(std::memory_order_relaxed);
+	}
+
+	void SetPresentCopyBack(bool active)
+	{
+		const bool previous = g_presentCopyBack.exchange(active, std::memory_order_acq_rel);
+		if (previous != active) {
+			logger::info(
+				"[upscaler] present copy-back {} (reported through MagnaScopeAPI v2): scene source is the {}",
+				active ? "ON" : "OFF",
+				active ? "D3D11 back buffer (upscaler output)" : "pre-upsample capture");
+		}
+	}
+
+	bool PresentCopyBackActive()
+	{
+		return g_presentCopyBack.load(std::memory_order_acquire);
+	}
+}
 // Diagnostic: armed by a scope diag frame; the upscaler's back-buffer copy
 // (its present staging) then reads back the lens region as the composite
 // will see it. See D3D::CopyResourceDispatch.
@@ -1277,6 +1308,7 @@ namespace Hook
 		// Heat-mask stencil histogram diagnostics, armed by a scoped diag frame.
 		std::atomic<bool> g_stencilHistogramArmed{ false };
 		std::atomic<bool> g_stencilHistogramAnchorArmed{ false };
+		std::atomic<bool> g_reticleProbeArmed{ false };
 	}
 	namespace HangDiag
 	{
@@ -3610,15 +3642,31 @@ namespace Hook
 				reticleCaptureViewportWidth.load(std::memory_order_acquire);
 			const float captureHeight =
 				reticleCaptureViewportHeight.load(std::memory_order_acquire);
+			// The scale maps output UV into the LAYER, so the divisor is the
+			// layer's own size, not the composite target's. They differ when
+			// an upscaler runs the engine at a smaller resolution than the
+			// output (jarari tree: 2560x1440 targets under a 3840x2160 back
+			// buffer); dividing by the target then sampled the layer's
+			// top-left two thirds and put the reticle outside the lens.
+			float layerWidth = renderWidth;
+			float layerHeight = renderHeight;
+			if (mAutomaticSTSReticleLayerTexture.Get()) {
+				D3D11_TEXTURE2D_DESC layerDesc{};
+				mAutomaticSTSReticleLayerTexture->GetDesc(&layerDesc);
+				if (layerDesc.Width > 1U && layerDesc.Height > 1U) {
+					layerWidth = static_cast<float>(layerDesc.Width);
+					layerHeight = static_cast<float>(layerDesc.Height);
+				}
+			}
 			if (std::isfinite(captureWidth) && captureWidth > 1.0F &&
-				renderWidth > 1.0F) {
+				layerWidth > 1.0F) {
 				resolution.reticleCaptureScaleX =
-					std::clamp(captureWidth / renderWidth, 0.05F, 1.0F);
+					std::clamp(captureWidth / layerWidth, 0.05F, 1.0F);
 			}
 			if (std::isfinite(captureHeight) && captureHeight > 1.0F &&
-				renderHeight > 1.0F) {
+				layerHeight > 1.0F) {
 				resolution.reticleCaptureScaleY =
-					std::clamp(captureHeight / renderHeight, 0.05F, 1.0F);
+					std::clamp(captureHeight / layerHeight, 0.05F, 1.0F);
 			}
 		}
 		resolution.reticleOffsetX = std::clamp(
@@ -5246,6 +5294,25 @@ namespace Hook
 				mScopeFadeResourceGeneration.load(std::memory_order_acquire) &&
 			mAutomaticSTSReticleLayerSRV.Get() &&
 			mAutomaticSTSReticleLayerWhiteSRV.Get();
+		{
+			static unsigned usableLogs = 0;
+			static bool lastUsable = true;
+			if (capturedLayerUsable != lastUsable || (usableLogs < 4 && !capturedLayerUsable)) {
+				lastUsable = capturedLayerUsable;
+				++usableLogs;
+				logger::info(
+					"[reticle] composite: capturedLayerUsable={} (ready={} layerGen={} frameGen={} "
+					"resourceGen={} scopeFadeResourceGen={} srv={} whiteSrv={})",
+					capturedLayerUsable,
+					mAutomaticSTSReticleLayerReady,
+					mAutomaticSTSReticleLayerGeneration,
+					automaticSTSReplayFrameGeneration.load(std::memory_order_acquire),
+					mAutomaticSTSReticleLayerResourceGeneration,
+					mScopeFadeResourceGeneration.load(std::memory_order_acquire),
+					mAutomaticSTSReticleLayerSRV.Get() != nullptr,
+					mAutomaticSTSReticleLayerWhiteSRV.Get() != nullptr);
+			}
+		}
 
 		// A custom reticle needs no capture at all. Requiring one would leave
 		// every scope without an authored Reticle node -- and there are plenty
@@ -6779,9 +6846,34 @@ namespace Hook
 					nullptr,
 					compositeTarget);
 				if (replayed) {
+					const bool probeReticle =
+						g_reticleProbeArmed.exchange(false, std::memory_order_acq_rel);
+					if (probeReticle && mBackBuffer.Get()) {
+						LogRegionMean(g_Context.Get(), mBackBuffer.Get(),
+							g_finalLayerProbeX, g_finalLayerProbeY, "back buffer BEFORE reticle composite (lens centre)");
+						const float sx = reticleCaptureViewportWidth.load(std::memory_order_acquire);
+						const float sy = reticleCaptureViewportHeight.load(std::memory_order_acquire);
+						const float scaleX = (sx > 0.0F && windowWidth > 0) ? sx / static_cast<float>(windowWidth) : 1.0F;
+						const float scaleY = (sy > 0.0F && windowHeight > 0) ? sy / static_cast<float>(windowHeight) : 1.0F;
+						if (mAutomaticSTSReticleLayerTexture.Get()) {
+							LogRegionMean(g_Context.Get(), mAutomaticSTSReticleLayerTexture.Get(),
+								static_cast<int>(g_finalLayerProbeX * scaleX), static_cast<int>(g_finalLayerProbeY * scaleY),
+								"reticle layer BLACK capture (lens centre, capture space)");
+						}
+						if (mAutomaticSTSReticleLayerWhiteTexture.Get()) {
+							LogRegionMean(g_Context.Get(), mAutomaticSTSReticleLayerWhiteTexture.Get(),
+								static_cast<int>(g_finalLayerProbeX * scaleX), static_cast<int>(g_finalLayerProbeY * scaleY),
+								"reticle layer WHITE capture (lens centre, capture space)");
+						}
+					}
 					const bool reticleComposited =
 						CompositeAutomaticSTSReticleLayer(
 							compositeTarget);
+					if (probeReticle && mBackBuffer.Get()) {
+						logger::info("[reticle] composite call returned {}", reticleComposited);
+						LogRegionMean(g_Context.Get(), mBackBuffer.Get(),
+							g_finalLayerProbeX, g_finalLayerProbeY, "back buffer AFTER reticle composite (lens centre)");
+					}
 					static std::once_flag loggedLateScopeFadeReplay;
 					std::call_once(loggedLateScopeFadeReplay, [] {
 						logger::info(
@@ -7151,19 +7243,51 @@ namespace Hook
 					bSelfDraw = false;
 					pContext->OMSetDepthStencilState(gameState.Get(), gameRef);
 					if (!D3DInstance->mHeatStencilMarkedThisFrame) {
+						// The stencil subrect is whatever viewport this actor draw
+						// rasterized with; read that rather than the manager's
+						// ratio field, which mid-geometry has produced values too
+						// small to be real (the resolve then looked at the corner).
 						float wr = 1.0F;
 						float hr = 1.0F;
+						UINT viewportCount = 1U;
+						D3D11_VIEWPORT gameVp{};
+						pContext->RSGetViewports(&viewportCount, &gameVp);
+						float managerW = 0.0F;
+						float managerH = 0.0F;
 						if (upscalerMod) {
 							static REL::Relocation<RE::BSGraphics::RenderTargetManager*> targetManager{
 								RE::ID::BSGraphics::RenderTargetManager::Singleton
 							};
 							if (auto* manager = targetManager.get()) {
-								wr = manager->dynamicWidthRatio;
-								hr = manager->dynamicHeightRatio;
+								managerW = manager->dynamicWidthRatio;
+								managerH = manager->dynamicHeightRatio;
 							}
 						}
-						D3DInstance->mHeatStencilMarkRatio[0] = (wr > 0.0F && wr <= 1.0F) ? wr : 1.0F;
-						D3DInstance->mHeatStencilMarkRatio[1] = (hr > 0.0F && hr <= 1.0F) ? hr : 1.0F;
+						if (viewportCount > 0U && windowWidth > 0 && windowHeight > 0 &&
+							gameVp.Width > 0.0F && gameVp.Height > 0.0F) {
+							wr = gameVp.Width / static_cast<float>(windowWidth);
+							hr = gameVp.Height / static_cast<float>(windowHeight);
+						}
+						const bool plausible = wr >= 0.25F && wr <= 1.0F && hr >= 0.25F && hr <= 1.0F;
+						D3DInstance->mHeatStencilMarkRatio[0] = plausible ? wr : 1.0F;
+						D3DInstance->mHeatStencilMarkRatio[1] = plausible ? hr : 1.0F;
+						static unsigned ratioLogs = 0;
+						static float lastLoggedW = -1.0F;
+						if (ratioLogs < 8 && std::fabs(D3DInstance->mHeatStencilMarkRatio[0] - lastLoggedW) > 0.01F) {
+							++ratioLogs;
+							lastLoggedW = D3DInstance->mHeatStencilMarkRatio[0];
+							logger::info(
+								"[heat] mark ratio {:.3f}x{:.3f} from viewport {:.0f}x{:.0f} at ({:.0f},{:.0f}); "
+								"manager field read {:.6f}x{:.6f}",
+								D3DInstance->mHeatStencilMarkRatio[0], D3DInstance->mHeatStencilMarkRatio[1],
+								gameVp.Width, gameVp.Height, gameVp.TopLeftX, gameVp.TopLeftY,
+								managerW, managerH);
+						}
+						if (auto* rendererData = RE::BSGraphics::GetRendererData()) {
+							D3DInstance->mHeatStencilSourceSRV =
+								reinterpret_cast<ID3D11ShaderResourceView*>(
+									rendererData->depthStencilTargets[2].srViewStencil);
+						}
 					}
 					D3DInstance->mHeatStencilMarkedThisFrame = true;
 					return;
@@ -7485,6 +7609,30 @@ namespace Hook
 									StartIndexLocation,
 									BaseVertexLocation);
 								bSelfDraw = false;
+							}
+						}
+						{
+							// Diagnostic: which step of the reticle capture declined.
+							// Under a D3D12 present override the lens hides the
+							// scene's own reticle, so a failed capture means no
+							// reticle at all; this names the failing step.
+							static unsigned chainLogs = 0;
+							static bool lastCaptured = true;
+							if (captured != lastCaptured || (chainLogs < 6 && !captured)) {
+								lastCaptured = captured;
+								++chainLogs;
+								ComPtr<ID3D11RenderTargetView> engineRT0;
+								if (auto* rd = RE::BSGraphics::GetRendererData()) {
+									engineRT0 = reinterpret_cast<ID3D11RenderTargetView*>(rd->renderTargets[0].rtView);
+								}
+								logger::info(
+									"[reticle] capture chain: suppressionReady={} capturedBlack={} capturedWhite={} "
+									"final={} (sourceTarget {:p}, engine RT0 {:p}, depth bound {}, index {} count {})",
+									suppressionReady, capturedBlack, capturedWhite, captured,
+									static_cast<void*>(sourceTarget.Get()),
+									static_cast<void*>(engineRT0.Get()),
+									sourceDepth.Get() != nullptr,
+									StartIndexLocation, IndexCount);
 							}
 						}
 						D3DInstance->CompleteAutomaticSTSReticleLayerCapture(
@@ -8982,6 +9130,7 @@ namespace Hook
 						g_finalLayerProbeArmed.store(true, std::memory_order_release);
 						g_captureProbeArmed.store(true, std::memory_order_release);
 						g_stencilHistogramArmed.store(true, std::memory_order_release);
+						g_reticleProbeArmed.store(true, std::memory_order_release);
 					}
 					if (sourceProbe.valid && targetProbe.valid) {
 						logger::info(
@@ -10685,11 +10834,35 @@ namespace Hook
 			}
 			std::uint64_t sums[4]{};
 			const auto* base = static_cast<const std::uint8_t*>(mapped.pData);
-			for (int y = 0; y < 16; ++y) {
-				const auto* row = base + y * mapped.RowPitch;
-				for (int x = 0; x < 16; ++x) {
-					for (int ch = 0; ch < 4; ++ch) {
-						sums[ch] += row[x * 4 + ch];
+			if (desc.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
+				// 11/11/10 packed floats (5-bit exponent, 6/6/5-bit mantissa);
+				// summed as 0..255 equivalents so the log reads like the others.
+				auto unpack = [](std::uint32_t bits, int mantissaBits) {
+					const std::uint32_t exponent = (bits >> mantissaBits) & 0x1FU;
+					const std::uint32_t mantissa = bits & ((1U << mantissaBits) - 1U);
+					const float m = static_cast<float>(mantissa) / static_cast<float>(1U << mantissaBits);
+					if (exponent == 0) {
+						return std::ldexp(m, -14);
+					}
+					return std::ldexp(1.0F + m, static_cast<int>(exponent) - 15);
+				};
+				for (int y = 0; y < 16; ++y) {
+					const auto* row = reinterpret_cast<const std::uint32_t*>(base + y * mapped.RowPitch);
+					for (int x = 0; x < 16; ++x) {
+						const std::uint32_t v = row[x];
+						sums[0] += static_cast<std::uint64_t>(std::clamp(unpack(v & 0x7FFU, 6) * 255.0F, 0.0F, 255.0F));
+						sums[1] += static_cast<std::uint64_t>(std::clamp(unpack((v >> 11) & 0x7FFU, 6) * 255.0F, 0.0F, 255.0F));
+						sums[2] += static_cast<std::uint64_t>(std::clamp(unpack((v >> 22) & 0x3FFU, 5) * 255.0F, 0.0F, 255.0F));
+						sums[3] += 255U;
+					}
+				}
+			} else {
+				for (int y = 0; y < 16; ++y) {
+					const auto* row = base + y * mapped.RowPitch;
+					for (int x = 0; x < 16; ++x) {
+						for (int ch = 0; ch < 4; ++ch) {
+							sums[ch] += row[x * 4 + ch];
+						}
 					}
 				}
 			}
@@ -10957,6 +11130,23 @@ namespace Hook
 		}
 
 		context->CopyResource(mPreUpsampleTexture.Get(), frameBuffer);
+		{
+			// Projection offset the upscaler applied this frame (NDC; it sets
+			// offsetX = -2*jitter.x/renderW, offsetY = 2*jitter.y/renderH).
+			const auto state = RE::BSGraphics::State::GetSingleton();
+			const float ox = std::isfinite(state.offsetX) ? state.offsetX : 0.0F;
+			const float oy = std::isfinite(state.offsetY) ? state.offsetY : 0.0F;
+			mPreUpsampleJitterNdc[0] = std::clamp(ox, -0.01F, 0.01F);
+			mPreUpsampleJitterNdc[1] = std::clamp(oy, -0.01F, 0.01F);
+			static std::once_flag loggedJitter;
+			if (ox != 0.0F || oy != 0.0F) {
+				std::call_once(loggedJitter, [&] {
+					logger::info(
+						"[upscaler] projection jitter compensation engaged (first offset {:.5f}, {:.5f} NDC)",
+						ox, oy);
+				});
+			}
+		}
 		if (std::fabs(mPreUpsampleRatio[0] - widthRatio) > 0.01F ||
 			std::fabs(mPreUpsampleRatio[1] - heightRatio) > 0.01F) {
 			static unsigned ratioLogs = 0;
@@ -11008,7 +11198,8 @@ namespace Hook
 
 	bool D3D::PreUpsampleSourceActive() const
 	{
-		return mPreUpsampleCaptured && upscalerMod != nullptr;
+		return mPreUpsampleCaptured && upscalerMod != nullptr &&
+		       !MagnaScopeAPI::PresentCopyBackActive();
 	}
 
 	void D3D::EndFramePreUpsample()
@@ -11085,7 +11276,14 @@ namespace Hook
 			return false;
 		}
 
-		const float params[4] = { mPreUpsampleRatio[0], mPreUpsampleRatio[1], 0.0F, 0.0F };
+		// Un-jitter: content that belongs at uv was rasterized at
+		// uv + (offsetX, -offsetY)/2 (NDC spans 2 uv units; screen y is down).
+		const float params[4] = {
+			mPreUpsampleRatio[0],
+			mPreUpsampleRatio[1],
+			mPreUpsampleJitterNdc[0] * 0.5F,
+			-mPreUpsampleJitterNdc[1] * 0.5F
+		};
 		context->UpdateSubresource(mSubrectStretchCB.Get(), 0, nullptr, params, 0, 0);
 
 		ScopedContextState saved(context);
@@ -11363,11 +11561,15 @@ namespace Hook
 		mHeatStencilResolvedThisFrame = true;
 		widthRatio = mHeatStencilMarkRatio[0];
 		heightRatio = mHeatStencilMarkRatio[1];
+		// The view recorded at mark time, never the live record (see
+		// mHeatStencilSourceSRV); the record fallback covers a mark that
+		// somehow happened without a renderer.
 		auto* rendererData = RE::BSGraphics::GetRendererData();
-		auto* stencilSRV = rendererData ?
-		                       reinterpret_cast<ID3D11ShaderResourceView*>(
-		                           rendererData->depthStencilTargets[2].srViewStencil) :
-		                       nullptr;
+		ID3D11ShaderResourceView* stencilSRV = mHeatStencilSourceSRV.Get();
+		if (!stencilSRV && rendererData) {
+			stencilSRV = reinterpret_cast<ID3D11ShaderResourceView*>(
+				rendererData->depthStencilTargets[2].srViewStencil);
+		}
 		if (!stencilSRV || !mHeatStencilResolvePS.Get() || !mFullscreenTriangleVS.Get() ||
 			!mHeatStencilResolveCB.Get() || !mCompositeRasterizerState.Get()) {
 			static std::once_flag logged;

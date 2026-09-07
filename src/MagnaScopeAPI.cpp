@@ -225,8 +225,18 @@ namespace MagnaScopeAPI
 			return static_cast<std::uint32_t>(copied);
 		}
 
+		bool IsOpticalEffectActiveImpl()
+		{
+			return QueryOpticalEffectActive();
+		}
+
+		void NotifyPresentCopyBackImpl(bool active)
+		{
+			SetPresentCopyBack(active);
+		}
+
 		InterfaceV1 theInterface{
-			1U,
+			2U,
 			SetApertureOverrideImpl,
 			SetApertureOverrideByNameImpl,
 			SetReticleOverrideImpl,
@@ -235,6 +245,8 @@ namespace MagnaScopeAPI
 			TriggerSightSwapImpl,
 			GetEquippedScopeImpl,
 			SnapshotNodeTreeImpl,
+			IsOpticalEffectActiveImpl,
+			NotifyPresentCopyBackImpl,
 		};
 	}
 

@@ -3,7 +3,7 @@
 includes("lib/commonlibf4")
 
 set_project("MagnaScope")
-set_version("0.12.0")
+set_version("0.12.1")
 set_license("MIT")
 set_languages("c++23")
 set_warnings("allextra")
